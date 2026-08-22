@@ -358,10 +358,37 @@ def _merge_group(
         )
         book_id = cb[0]["book_id"] if cb else None
 
+    # A book-scoped merge may only enrich the canonical identity globally when
+    # that identity belongs to this book.  Otherwise the enrichment is kept in
+    # the merge projection below so another book cannot observe it.
+    canonical_books = storage.execute_query(
+        "SELECT COUNT(*) AS book_count FROM character_book WHERE character_id = ?",
+        (canonical_id,),
+    )
+    persist_global_aliases = (
+        book_id is None or not canonical_books or canonical_books[0]["book_count"] <= 1
+    )
+    alias_projection = _consolidate_aliases(
+        canonical_id=canonical_id,
+        non_canonical_ids=non_canonical_ids,
+        canonical_name=canonical_name,
+        all_characters=all_characters,
+        storage=storage,
+        persist_global=False,
+    )
+
     conn = storage.get_connection()
     conn.execute("SAVEPOINT merge_group")
     try:
         decision_id = None
+        if persist_global_aliases:
+            _consolidate_aliases(
+                canonical_id=canonical_id,
+                non_canonical_ids=non_canonical_ids,
+                canonical_name=canonical_name,
+                all_characters=all_characters,
+                storage=storage,
+            )
         if book_id is not None:
             decision_id = _record_merge_decision(
                 storage, book_id, canonical_id, non_canonical_ids, result
@@ -373,19 +400,17 @@ def _merge_group(
             # Record before junction redirect so member_scene consequences are
             # captured from the member's own junctions.
             if book_id is not None:
-                _record_member_merge(storage, book_id, canonical_id, nc_id, decision_id)
+                _record_member_merge(
+                    storage,
+                    book_id,
+                    canonical_id,
+                    nc_id,
+                    decision_id,
+                    alias_projection,
+                )
             _redirect_junctions(storage, canonical_id, nc_id, book_id)
             merged_ids.add(nc_id)
             result["characters_merged"] += 1
-
-        # Consolidate aliases on canonical character
-        _consolidate_aliases(
-            canonical_id=canonical_id,
-            non_canonical_ids=non_canonical_ids,
-            canonical_name=canonical_name,
-            all_characters=all_characters,
-            storage=storage,
-        )
 
         conn.execute("RELEASE SAVEPOINT merge_group")
     except Exception:
@@ -450,7 +475,9 @@ def _record_merge_decision(storage, book_id, canonical_id, member_ids, result):
     return decision_id
 
 
-def _record_member_merge(storage, book_id, canonical_id, member_id, decision_id):
+def _record_member_merge(
+    storage, book_id, canonical_id, member_id, decision_id, alias_projection="[]"
+):
     """Record one ``character_alias_merge`` relation for a merged member.
 
     Captures the member's prior name, aliases and voice assignment so the
@@ -472,7 +499,8 @@ def _record_member_merge(storage, book_id, canonical_id, member_id, decision_id)
         {
             "downstream_invalidations": {
                 "walk_2d_scene_presence": sorted({r["scene_id"] for r in member_scenes})
-            }
+            },
+            "alias_projection": json.loads(alias_projection),
         }
     )
 
@@ -581,7 +609,8 @@ def _consolidate_aliases(
     canonical_name: str,
     all_characters: list[dict],
     storage: PipelineStorage,
-) -> None:
+    persist_global: bool = True,
+) -> str:
     """Merge aliases from all non-canonical characters onto the canonical.
 
     Also adds the canonical_name from the LLM (if different from the
@@ -593,7 +622,7 @@ def _consolidate_aliases(
     # Start with canonical's existing aliases
     canonical_char = id_to_char.get(canonical_id)
     if not canonical_char:
-        return
+        return "[]"
 
     existing_aliases_raw = canonical_char.get("aliases", "[]")
     if isinstance(existing_aliases_raw, str):
@@ -640,9 +669,10 @@ def _consolidate_aliases(
     # (it's the primary name, not an alias)
     alias_set.discard(current_name)
 
-    # Update canonical character's aliases
     aliases_json = json.dumps(sorted(alias_set))
-    storage.execute_update(
-        "UPDATE character SET aliases = ? WHERE id = ?",
-        (aliases_json, canonical_id),
-    )
+    if persist_global:
+        storage.execute_update(
+            "UPDATE character SET aliases = ? WHERE id = ?",
+            (aliases_json, canonical_id),
+        )
+    return aliases_json

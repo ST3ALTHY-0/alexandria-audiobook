@@ -909,6 +909,46 @@ class TestNonCanonicalDeletion:
 
 
 class TestAliasConsolidation:
+    def test_book_scoped_merge_keeps_shared_canonical_aliases_global(self):
+        """Aliases inferred in one book must not leak through a shared identity."""
+        storage = InMemorySQLiteAdapter()
+        storage.init_db()
+        storage.execute_insert("INSERT INTO series (id) VALUES ('s1')")
+        storage.execute_insert("INSERT INTO book (id, series_id) VALUES ('b1', 's1')")
+        storage.execute_insert("INSERT INTO book (id, series_id) VALUES ('b2', 's1')")
+        _insert_character(storage, "canon", "Alice", '["Ally"]')
+        _insert_character(storage, "noncanon", "Alicia")
+        _insert_char_book(storage, "canon", "b1", 0.9)
+        _insert_char_book(storage, "canon", "b2", 0.9)
+        _insert_char_book(storage, "noncanon", "b1", 0.8)
+
+        _merge_group(
+            character_ids=["canon", "noncanon"],
+            canonical_name="Alice",
+            all_characters=[
+                {"id": "canon", "name": "Alice", "aliases": '["Ally"]'},
+                {"id": "noncanon", "name": "Alicia", "aliases": "[]"},
+            ],
+            storage=storage,
+            merged_ids=set(),
+            result={"characters_merged": 0},
+            is_review=False,
+            book_id="b1",
+        )
+
+        row = storage.execute_query(
+            "SELECT aliases FROM character WHERE id = ?", ("canon",)
+        )[0]
+        assert json.loads(row["aliases"]) == ["Ally"]
+        merge = storage.execute_query(
+            "SELECT consequence_json FROM character_alias_merge WHERE book_id = ?",
+            ("b1",),
+        )[0]
+        assert json.loads(merge["consequence_json"])["alias_projection"] == [
+            "Alicia",
+            "Ally",
+        ]
+
     def test_adds_non_canonical_name_to_canonical_aliases(self):
         """When a non-canonical character is merged, its name is added to the
         canonical character's aliases list."""
