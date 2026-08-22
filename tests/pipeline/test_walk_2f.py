@@ -9,6 +9,7 @@ from app.pipeline.adapter import InMemorySQLiteAdapter
 from app.pipeline.populate import populate_initial_spine
 from app.pipeline.walks.walk_2f_character_description import (
     _build_description_prompt,
+    _collect_character_spans,
     _parse_llm_response,
     _sample_spans,
     execute,
@@ -37,20 +38,36 @@ def sample_chapters():
                 {
                     "id": "para-1",
                     "spans": [
-                        {"id": "span-1a", "span_type": "sentence", "text": "The sun rose over the mountains."},
-                        {"id": "span-1b", "span_type": "quotation", "text": '"Good morning," said John.'},
+                        {
+                            "id": "span-1a",
+                            "span_type": "sentence",
+                            "text": "The sun rose over the mountains.",
+                        },
+                        {
+                            "id": "span-1b",
+                            "span_type": "quotation",
+                            "text": '"Good morning," said John.',
+                        },
                     ],
                 },
                 {
                     "id": "para-2",
                     "spans": [
-                        {"id": "span-2a", "span_type": "sentence", "text": "Mary waved from across the room."},
+                        {
+                            "id": "span-2a",
+                            "span_type": "sentence",
+                            "text": "Mary waved from across the room.",
+                        },
                     ],
                 },
                 {
                     "id": "para-3",
                     "spans": [
-                        {"id": "span-3a", "span_type": "quotation", "text": '"Hello everyone," she said.'},
+                        {
+                            "id": "span-3a",
+                            "span_type": "quotation",
+                            "text": '"Hello everyone," she said.',
+                        },
                     ],
                 },
             ],
@@ -61,13 +78,21 @@ def sample_chapters():
                 {
                     "id": "para-4",
                     "spans": [
-                        {"id": "span-4a", "span_type": "sentence", "text": "Later that day, the scene shifted to the city."},
+                        {
+                            "id": "span-4a",
+                            "span_type": "sentence",
+                            "text": "Later that day, the scene shifted to the city.",
+                        },
                     ],
                 },
                 {
                     "id": "para-5",
                     "spans": [
-                        {"id": "span-5a", "span_type": "quotation", "text": '"Welcome," said Bob.'},
+                        {
+                            "id": "span-5a",
+                            "span_type": "quotation",
+                            "text": '"Welcome," said Bob.',
+                        },
                     ],
                 },
             ],
@@ -146,7 +171,38 @@ def _insert_character_span(storage, character_id, span_id, relation_type):
 class TestExecute:
     """Test the main execute() function."""
 
-    def test_execute_returns_summary_dict(self, populated_storage, mock_llm_client, monkeypatch):
+    def test_spans_are_scoped_to_book(self, populated_storage):
+        _insert_character(populated_storage, "char-1", "John")
+        populate_initial_spine(
+            "series-1",
+            "book-2",
+            [
+                {
+                    "id": "chapter-b",
+                    "paragraphs": [
+                        {
+                            "id": "para-b",
+                            "spans": [
+                                {
+                                    "id": "span-b",
+                                    "span_type": "sentence",
+                                    "text": "Book two",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+            populated_storage,
+        )
+        _insert_character_span(populated_storage, "char-1", "span-1b", "mentioned")
+        _insert_character_span(populated_storage, "char-1", "span-b", "mentioned")
+        rows = _collect_character_spans("book-1", "char-1", populated_storage)
+        assert [row["span_id"] for row in rows] == ["span-1b"]
+
+    def test_execute_returns_summary_dict(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
         """execute() returns a summary dict with expected keys."""
         # Set up a character with spans
         _insert_character(populated_storage, "char-1", "John")
@@ -164,25 +220,33 @@ class TestExecute:
         assert "errors" in result
         assert result["book_id"] == "book-1"
 
-    def test_description_stored_in_metadata(self, populated_storage, mock_llm_client, monkeypatch):
-        """Description is stored in character_metadata with key='description'."""
+    def test_description_stored_in_persona_revision(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
+        """Description is stored in a book-scoped persona revision."""
         _insert_character(populated_storage, "char-1", "John")
         _insert_character_span(populated_storage, "char-1", "span-1b", "speaker")
 
-        response = json.dumps({"description": "John is a stern mentor.", "confidence": 0.9})
+        response = json.dumps(
+            {"description": "John is a stern mentor.", "confidence": 0.9}
+        )
         _patch_llm(monkeypatch, mock_llm_client, response)
 
         execute("book-1", populated_storage, {})
 
         rows = populated_storage.execute_query(
-            "SELECT key, value FROM character_metadata WHERE character_id = ?",
+            "SELECT book_id, fields_json FROM persona_revision WHERE character_id = ?",
             ("char-1",),
         )
         assert len(rows) == 1
-        assert rows[0]["key"] == "description"
-        assert rows[0]["value"] == "John is a stern mentor."
+        assert rows[0]["book_id"] == "book-1"
+        assert (
+            json.loads(rows[0]["fields_json"])["identity"] == "John is a stern mentor."
+        )
 
-    def test_confidence_filter_high_accepted(self, populated_storage, mock_llm_client, monkeypatch):
+    def test_confidence_filter_high_accepted(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
         """Descriptions with confidence >= 0.7 are auto-accepted."""
         _insert_character(populated_storage, "char-1", "John")
         _insert_character_span(populated_storage, "char-1", "span-1b", "speaker")
@@ -195,7 +259,9 @@ class TestExecute:
         assert result["descriptions_generated"] == 1
         assert result["descriptions_for_review"] == 0
 
-    def test_confidence_filter_low_rejected(self, populated_storage, mock_llm_client, monkeypatch):
+    def test_confidence_filter_low_rejected(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
         """Descriptions with confidence < 0.5 are auto-rejected."""
         _insert_character(populated_storage, "char-1", "John")
         _insert_character_span(populated_storage, "char-1", "span-1b", "speaker")
@@ -208,12 +274,14 @@ class TestExecute:
         assert result["descriptions_generated"] == 0
         # Verify no metadata was stored
         rows = populated_storage.execute_query(
-            "SELECT COUNT(*) AS cnt FROM character_metadata WHERE character_id = ?",
+            "SELECT COUNT(*) AS cnt FROM persona_revision WHERE character_id = ?",
             ("char-1",),
         )
         assert rows[0]["cnt"] == 0
 
-    def test_confidence_filter_medium_review(self, populated_storage, mock_llm_client, monkeypatch):
+    def test_confidence_filter_medium_review(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
         """Descriptions with 0.5 <= confidence < 0.7 are flagged for review."""
         _insert_character(populated_storage, "char-1", "John")
         _insert_character_span(populated_storage, "char-1", "span-1b", "speaker")
@@ -227,15 +295,17 @@ class TestExecute:
         assert result["descriptions_generated"] == 1
         assert result["descriptions_for_review"] == 1
 
-        # Verify metadata was stored
+        # Verify the book-scoped revision was stored
         rows = populated_storage.execute_query(
-            "SELECT key, value FROM character_metadata WHERE character_id = ?",
+            "SELECT review_state FROM persona_revision WHERE character_id = ?",
             ("char-1",),
         )
         assert len(rows) == 1
-        assert rows[0]["key"] == "description"
+        assert rows[0]["review_state"] == "needs_review"
 
-    def test_skip_character_with_no_spans(self, populated_storage, mock_llm_client, monkeypatch):
+    def test_skip_character_with_no_spans(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
         """Character with no spans is skipped (no LLM call, no metadata stored)."""
         _insert_character(populated_storage, "char-1", "John")
         # No character_span junctions inserted
@@ -251,7 +321,7 @@ class TestExecute:
 
         # Verify no metadata was stored
         rows = populated_storage.execute_query(
-            "SELECT COUNT(*) AS cnt FROM character_metadata WHERE character_id = ?",
+            "SELECT COUNT(*) AS cnt FROM persona_revision WHERE character_id = ?",
             ("char-1",),
         )
         assert rows[0]["cnt"] == 0
@@ -259,8 +329,73 @@ class TestExecute:
         # Verify LLM was NOT called
         assert mock_llm_client.chat.completions.create.call_count == 0
 
-    def test_description_update_existing(self, populated_storage, mock_llm_client, monkeypatch):
-        """If metadata key='description' already exists, it gets updated (not duplicated)."""
+    def test_protected_persona_is_not_replaced(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
+        _insert_character(populated_storage, "char-1", "John")
+        _insert_character_span(populated_storage, "char-1", "span-1b", "speaker")
+        populated_storage.insert_persona_revision(
+            {
+                "persona_id": "persona-old",
+                "character_id": "char-1",
+                "book_id": "book-1",
+                "revision": 1,
+                "fields_json": json.dumps({"identity": "Human"}),
+                "evidence_json": "[]",
+                "aliases_json": "[]",
+                "scene_scope": "book",
+                "review_state": "accepted",
+                "protected": 1,
+                "voice_consequences_json": "{}",
+                "author_id": "human",
+                "created_ms": 1,
+                "superseded_by": None,
+            }
+        )
+        _patch_llm(
+            monkeypatch,
+            mock_llm_client,
+            json.dumps({"description": "Generated", "confidence": 0.9}),
+        )
+        result = execute("book-1", populated_storage, {})
+        assert result["descriptions_generated"] == 0
+        assert (
+            populated_storage.execute_query(
+                "SELECT COUNT(*) AS cnt FROM persona_revision", ()
+            )[0]["cnt"]
+            == 1
+        )
+
+    def test_rerun_supersedes_book_revision(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
+        _insert_character(populated_storage, "char-1", "John")
+        _insert_character_span(populated_storage, "char-1", "span-1b", "speaker")
+        _patch_llm(
+            monkeypatch,
+            mock_llm_client,
+            json.dumps({"description": "First", "confidence": 0.9}),
+        )
+        execute("book-1", populated_storage, {})
+        _patch_llm(
+            monkeypatch,
+            mock_llm_client,
+            json.dumps({"description": "Second", "confidence": 0.9}),
+        )
+        execute("book-1", populated_storage, {})
+        rows = populated_storage.execute_query(
+            "SELECT persona_id, fields_json, superseded_by FROM persona_revision "
+            "WHERE character_id = ? ORDER BY revision",
+            ("char-1",),
+        )
+        assert len(rows) == 2
+        assert rows[0]["superseded_by"] == rows[1]["persona_id"]
+        assert json.loads(rows[1]["fields_json"])["identity"] == "Second"
+
+    def test_description_does_not_update_global_metadata(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
+        """A book run leaves pre-existing global metadata unchanged."""
         _insert_character(populated_storage, "char-1", "John")
         _insert_character_span(populated_storage, "char-1", "span-1b", "speaker")
 
@@ -275,15 +410,22 @@ class TestExecute:
 
         execute("book-1", populated_storage, {})
 
-        # Verify only one row exists with the new value
+        # The global value is not overwritten by book-scoped evidence.
         rows = populated_storage.execute_query(
             "SELECT key, value FROM character_metadata WHERE character_id = ? AND key = 'description'",
             ("char-1",),
         )
         assert len(rows) == 1
-        assert rows[0]["value"] == "New description"
+        assert rows[0]["value"] == "Old description"
+        revisions = populated_storage.execute_query(
+            "SELECT fields_json FROM persona_revision WHERE character_id = ? AND book_id = ?",
+            ("char-1", "book-1"),
+        )
+        assert json.loads(revisions[0]["fields_json"])["identity"] == "New description"
 
-    def test_nonexistent_book_returns_error(self, storage, mock_llm_client, monkeypatch):
+    def test_nonexistent_book_returns_error(
+        self, storage, mock_llm_client, monkeypatch
+    ):
         """execute() returns error for nonexistent book."""
         _patch_llm(monkeypatch, mock_llm_client, "{}")
 
@@ -292,13 +434,13 @@ class TestExecute:
         assert len(result["errors"]) > 0
         assert result["descriptions_generated"] == 0
 
+    # ---------------------------------------------------------------------------
+    # Tests: _build_description_prompt()
+    # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Tests: _build_description_prompt()
-# ---------------------------------------------------------------------------
-
-
-    def test_walk_override_drives_llm_config(self, populated_storage, monkeypatch, tmp_path):
+    def test_walk_override_drives_llm_config(
+        self, populated_storage, monkeypatch, tmp_path
+    ):
         """A walk_override row for (book, task) overrides the walk's LLM config.
 
         Phase 3 (Plan G): the walk resolves its LLM config via
@@ -321,7 +463,12 @@ class TestExecute:
         populated_storage.execute_insert(
             "INSERT INTO walk_override (book_id, walk_name, key, value_json)"
             " VALUES (?, ?, ?, ?)",
-            ("book-1", "character_description", "model_name", json.dumps("gpt-4o-mini")),
+            (
+                "book-1",
+                "character_description",
+                "model_name",
+                json.dumps("gpt-4o-mini"),
+            ),
         )
 
         monkeypatch.setattr(
@@ -331,7 +478,12 @@ class TestExecute:
         captured = {}
 
         def mock_call_llm(
-            client, model_name, temperature, reasoning_effort, system_prompt, user_prompt
+            client,
+            model_name,
+            temperature,
+            reasoning_effort,
+            system_prompt,
+            user_prompt,
         ):
             captured["temperature"] = temperature
             captured["model_name"] = model_name
@@ -372,7 +524,12 @@ class TestExecute:
         captured = {}
 
         def mock_call_llm(
-            client, model_name, temperature, reasoning_effort, system_prompt, user_prompt
+            client,
+            model_name,
+            temperature,
+            reasoning_effort,
+            system_prompt,
+            user_prompt,
         ):
             captured["system_prompt"] = system_prompt
             return "[]"
@@ -412,8 +569,16 @@ class TestBuildPrompt:
     def test_prompt_includes_character_name_and_spans(self):
         """Prompt includes character name and span text."""
         sampled_spans = [
-            {"span_id": "span-1", "text": "John spoke loudly.", "relation_type": "speaker"},
-            {"span_id": "span-2", "text": "Mary listened.", "relation_type": "mentioned"},
+            {
+                "span_id": "span-1",
+                "text": "John spoke loudly.",
+                "relation_type": "speaker",
+            },
+            {
+                "span_id": "span-2",
+                "text": "Mary listened.",
+                "relation_type": "mentioned",
+            },
         ]
 
         prompt = _build_description_prompt("John", '["Mr. J"]', sampled_spans)
@@ -458,10 +623,12 @@ class TestParseResponse:
 
     def test_parse_valid_json(self):
         """Parse valid JSON response."""
-        response = json.dumps({
-            "description": "John is a stern mentor.",
-            "confidence": 0.9,
-        })
+        response = json.dumps(
+            {
+                "description": "John is a stern mentor.",
+                "confidence": 0.9,
+            }
+        )
 
         result = _parse_llm_response(response)
 
@@ -537,7 +704,10 @@ class TestSampleSpans:
 
     def _make_spans(self, n):
         """Create n span dicts with distinct span_ids."""
-        return [{"span_id": f"span-{i}", "text": f"Text {i}", "relation_type": "speaker"} for i in range(n)]
+        return [
+            {"span_id": f"span-{i}", "text": f"Text {i}", "relation_type": "speaker"}
+            for i in range(n)
+        ]
 
     def test_fewer_than_max_returns_all(self):
         """Fewer than 5 spans returns all of them."""

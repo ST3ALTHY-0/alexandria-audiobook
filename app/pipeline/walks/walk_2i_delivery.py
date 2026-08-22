@@ -208,13 +208,25 @@ def _find_speaker_character(
     return None
 
 
-def _get_character_description(character_id: str, storage: PipelineStorage) -> str:
-    """Retrieve the character description from character_metadata.
+def _get_character_description(
+    character_id: str, book_id: str, storage: PipelineStorage
+) -> str:
+    """Retrieve the latest character description.
 
     Returns the description string, or empty string if not found.
     """
     rows = storage.execute_query(
-        "SELECT value FROM character_metadata WHERE character_id = ? AND key = 'description'",
+        "SELECT json_extract(fields_json, '$.identity') AS value "
+        "FROM persona_revision WHERE character_id = ? AND book_id = ? "
+        "AND json_extract(fields_json, '$.identity') IS NOT NULL "
+        "ORDER BY revision DESC, created_ms DESC LIMIT 1",
+        (character_id, book_id),
+    )
+    if rows:
+        return rows[0]["value"] or ""
+    rows = storage.execute_query(
+        "SELECT value FROM character_metadata WHERE character_id = ? "
+        "AND key = 'description'",
         (character_id,),
     )
     if rows:
@@ -282,7 +294,9 @@ def _process_span(
     if speaker_info is not None:
         character_id = speaker_info["character_id"]
         speaker_name = _get_character_name(character_id, storage)
-        character_description = _get_character_description(character_id, storage)
+        character_description = _get_character_description(
+            character_id, book_id, storage
+        )
         voice_profile = _get_character_voice_profile(character_id, storage)
         voice_assignment = _get_character_voice_assignment(character_id, storage)
     else:

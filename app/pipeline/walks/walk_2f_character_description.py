@@ -2,15 +2,14 @@
 
 Generates concise descriptions for each character in a book by sending
 sampled text excerpts (spans where the character is speaker, mentioned, or
-present) to an LLM.  Descriptions are stored in the ``character_metadata``
-table with ``key='description'``.
+present) to an LLM.  Descriptions are stored in book-scoped persona revisions.
 
 For each character, the walk:
 1. Queries all spans where the character is speaker, mentioned, or present.
 2. Samples up to 5 representative spans spread across the book.
 3. Sends character name, aliases, and sampled span texts to the LLM.
-4. Parses the response (description + confidence).
-5. Stores the description in ``character_metadata`` (UPSERT).
+    4. Parses the response (description + confidence).
+5. Stores the description in a book-scoped ``persona_revision`` row.
 
 Confidence filter:
 - ≥0.7: auto-accept (description stored)
@@ -25,7 +24,9 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 from ._llm_helpers import chat_completion, extract_json_from_llm_response
 
@@ -45,7 +46,7 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
 
     Queries characters for the book, samples spans for each character, sends
     them to an LLM for description generation, parses the response, and stores
-    descriptions in ``character_metadata``.
+    descriptions in book-scoped ``persona_revision`` rows.
 
     Parameters
     ----------
@@ -101,6 +102,7 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
 
         try:
             _process_character(
+                book_id=book_id,
                 character_id=character_id,
                 character_name=character_name,
                 character_aliases=character_aliases,
@@ -149,7 +151,7 @@ def _load_existing_characters(
 
 
 def _collect_character_spans(
-    character_id: str, storage: PipelineStorage
+    book_id: str, character_id: str, storage: PipelineStorage
 ) -> list[dict[str, str]]:
     """Collect all spans where the character is speaker, mentioned, or present.
 
@@ -160,11 +162,16 @@ def _collect_character_spans(
         SELECT s.id AS span_id, s.text, cs.relation_type
         FROM character_span cs
         JOIN span s ON cs.span_id = s.id
+        JOIN paragraph_span ps ON ps.child_id = s.id
+        JOIN scene_paragraph sp ON sp.child_id = ps.parent_id
+        JOIN chapter_scene sc ON sc.child_id = sp.parent_id
+        JOIN book_chapter bc ON bc.child_id = sc.parent_id
         WHERE cs.character_id = ?
+          AND bc.parent_id = ?
           AND cs.relation_type IN ('speaker', 'mentioned', 'present')
-        ORDER BY s.id
+        ORDER BY bc.position, sc.position, sp.position, ps.position, s.id
         """,
-        (character_id,),
+        (character_id, book_id),
     )
     return [
         {
@@ -176,7 +183,9 @@ def _collect_character_spans(
     ]
 
 
-def _sample_spans(spans: list[dict[str, str]], max_samples: int = 5) -> list[dict[str, str]]:
+def _sample_spans(
+    spans: list[dict[str, str]], max_samples: int = 5
+) -> list[dict[str, str]]:
     """Sample up to max_samples spans spread across the book.
 
     Takes a spread from the collected spans to cover different parts of the book.
@@ -194,6 +203,7 @@ def _sample_spans(spans: list[dict[str, str]], max_samples: int = 5) -> list[dic
 
 
 def _process_character(
+    book_id: str,
     character_id: str,
     character_name: str,
     character_aliases: str,
@@ -207,10 +217,12 @@ def _process_character(
 ) -> None:
     """Process a single character: collect spans, call LLM, store description."""
     # Collect spans for this character
-    spans = _collect_character_spans(character_id, storage)
+    spans = _collect_character_spans(book_id, character_id, storage)
 
     if not spans:
-        logger.warning(f"No spans found for character {character_id} ({character_name})")
+        logger.warning(
+            f"No spans found for character {character_id} ({character_name})"
+        )
         return
 
     # Sample up to 5 representative spans
@@ -261,16 +273,28 @@ def _process_character(
 
     is_review = 0.5 <= confidence < 0.7
 
-    # Store description in character_metadata
+    # Store description in a book-scoped persona revision.
     conn = storage.get_connection()
     conn.execute("SAVEPOINT walk_2f_character")
     try:
-        _store_description(character_id, description, storage)
+        stored = _store_description(
+            book_id,
+            character_id,
+            character_aliases,
+            description,
+            sampled_spans,
+            "needs_review" if is_review else "accepted",
+            storage,
+        )
         conn.execute("RELEASE SAVEPOINT walk_2f_character")
     except Exception:
         conn.execute("ROLLBACK TO SAVEPOINT walk_2f_character")
         conn.execute("RELEASE SAVEPOINT walk_2f_character")
         raise
+
+    if not stored:
+        logger.info("Skipping protected persona for character %s", character_id)
+        return
 
     result["descriptions_generated"] += 1
 
@@ -279,20 +303,62 @@ def _process_character(
 
 
 def _store_description(
-    character_id: str, description: str, storage: PipelineStorage
-) -> None:
-    """Store description in character_metadata with key='description'.
+    book_id: str,
+    character_id: str,
+    character_aliases: str,
+    description: str,
+    sampled_spans: list[dict[str, str]],
+    review_state: str,
+    storage: PipelineStorage,
+) -> bool:
+    """Store a generated description in a book-scoped persona revision.
 
-    Uses SQLite UPSERT (INSERT OR REPLACE) to handle existing rows.
+    ``character_metadata`` is character-global and must not be overwritten by
+    evidence collected for only one book.
     """
-    storage.execute_insert(
-        """
-        INSERT INTO character_metadata (character_id, key, value)
-        VALUES (?, ?, ?)
-        ON CONFLICT(character_id, key) DO UPDATE SET value = excluded.value
-        """,
-        (character_id, "description", description),
+    previous = storage.execute_query(
+        """SELECT persona_id, fields_json, protected FROM persona_revision
+            WHERE character_id = ? AND book_id = ?
+            ORDER BY revision DESC, created_ms DESC, persona_id DESC LIMIT 1""",
+        (character_id, book_id),
     )
+    previous_id = previous[0]["persona_id"] if previous else None
+    if previous and previous[0]["protected"]:
+        return False
+    revision_rows = storage.execute_query(
+        "SELECT COALESCE(MAX(revision), 0) AS revision FROM persona_revision "
+        "WHERE character_id = ?",
+        (character_id,),
+    )
+    revision = int(revision_rows[0]["revision"]) + 1
+    persona_id = f"persona-{uuid4().hex}"
+    fields = json.loads(previous[0]["fields_json"]) if previous else {}
+    if not isinstance(fields, dict):
+        fields = {}
+    fields["identity"] = description
+    storage.insert_persona_revision(
+        {
+            "persona_id": persona_id,
+            "character_id": character_id,
+            "book_id": book_id,
+            "revision": revision,
+            "fields_json": json.dumps(fields),
+            "evidence_json": json.dumps(
+                [{"anchor": span["span_id"]} for span in sampled_spans]
+            ),
+            "aliases_json": character_aliases,
+            "scene_scope": "book",
+            "review_state": review_state,
+            "protected": 0,
+            "voice_consequences_json": "{}",
+            "author_id": "local",
+            "created_ms": int(time.time() * 1000),
+            "superseded_by": None,
+        }
+    )
+    if previous_id:
+        storage.supersede_persona_revision(previous_id, persona_id)
+    return True
 
 
 def _build_description_prompt(
@@ -352,11 +418,11 @@ def _parse_llm_response(response_text: str) -> dict:
     Returns a dict with description and confidence. If parsing fails,
     returns empty dict.
     """
-    description_data = extract_json_from_llm_response(response_text, expected_type="dict")
+    description_data = extract_json_from_llm_response(
+        response_text, expected_type="dict"
+    )
     if description_data is None:
-        logger.error(
-            f"Failed to parse LLM response as JSON: {response_text[:200]}"
-        )
+        logger.error(f"Failed to parse LLM response as JSON: {response_text[:200]}")
         return {}
 
     if not isinstance(description_data, dict):

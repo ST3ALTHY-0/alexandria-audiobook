@@ -1,13 +1,14 @@
 """Walk 2g: Voice audition.
 
 Generates voice profiles for each character in a book by sending the
-character's description (from ``character_metadata`` key='description')
+    character's description (from book-scoped ``persona_revision`` first,
+    with legacy metadata fallback)
 and sampled dialogue excerpts (spans where the character is speaker) to
 an LLM.  Voice profiles are stored in the ``character_metadata`` table
 with ``key='voice_profile'``.
 
 For each character, the walk:
-1. Queries the character's description from ``character_metadata``.
+1. Queries the character's book-scoped persona description.
 2. Collects up to 5 representative dialogue spans (``relation_type='speaker'``).
 3. Sends character name, description, and sampled dialogue to the LLM.
 4. Parses the response (voice profile dict + confidence).
@@ -175,14 +176,24 @@ def _load_existing_characters(
 
 
 def _get_character_description(
-    character_id: str, storage: PipelineStorage
+    character_id: str, book_id: str, storage: PipelineStorage
 ) -> str:
-    """Retrieve the character description from character_metadata.
+    """Retrieve the latest character description.
 
     Returns the description string, or empty string if not found.
     """
     rows = storage.execute_query(
-        "SELECT value FROM character_metadata WHERE character_id = ? AND key = 'description'",
+        "SELECT json_extract(fields_json, '$.identity') AS value "
+        "FROM persona_revision WHERE character_id = ? AND book_id = ? "
+        "AND json_extract(fields_json, '$.identity') IS NOT NULL "
+        "ORDER BY revision DESC, created_ms DESC LIMIT 1",
+        (character_id, book_id),
+    )
+    if rows:
+        return rows[0]["value"] or ""
+    rows = storage.execute_query(
+        "SELECT value FROM character_metadata WHERE character_id = ? "
+        "AND key = 'description'",
         (character_id,),
     )
     if rows:
@@ -217,7 +228,9 @@ def _collect_dialogue_spans(
     ]
 
 
-def _sample_spans(spans: list[dict[str, str]], max_samples: int = 5) -> list[dict[str, str]]:
+def _sample_spans(
+    spans: list[dict[str, str]], max_samples: int = 5
+) -> list[dict[str, str]]:
     """Sample up to max_samples spans spread across the book.
 
     Takes a spread from the collected spans to cover different parts of the book.
@@ -253,14 +266,16 @@ def _process_character(
     dialogue_spans = _collect_dialogue_spans(character_id, storage)
 
     if not dialogue_spans:
-        logger.warning(f"No dialogue spans found for character {character_id} ({character_name})")
+        logger.warning(
+            f"No dialogue spans found for character {character_id} ({character_name})"
+        )
         return
 
     # Sample up to 5 representative dialogue spans
     sampled_spans = _sample_spans(dialogue_spans, max_samples=5)
 
     # Get character description (may be empty)
-    character_description = _get_character_description(character_id, storage)
+    character_description = _get_character_description(character_id, book_id, storage)
 
     # Build LLM prompt
     prompt = _build_voice_audition_prompt(
@@ -356,9 +371,7 @@ def _store_voice_profile(
     )
 
 
-def _get_prior_voice_profile(
-    character_id: str, storage: PipelineStorage
-) -> str | None:
+def _get_prior_voice_profile(character_id: str, storage: PipelineStorage) -> str | None:
     """Return the stored voice_profile JSON for a character, or None if absent.
 
     Read OUTSIDE the savepoint so ``prior_value`` reflects the pre-write
@@ -423,7 +436,11 @@ def _build_voice_audition_prompt(
         aliases_list = []
 
     aliases_text = ", ".join(aliases_list) if aliases_list else "(none)"
-    description_text = character_description.strip() if character_description else "(no description available)"
+    description_text = (
+        character_description.strip()
+        if character_description
+        else "(no description available)"
+    )
 
     # Build dialogue excerpts
     dialogue_lines = []
@@ -470,9 +487,7 @@ def _parse_llm_response(response_text: str) -> dict:
     """
     profile_data = extract_json_from_llm_response(response_text, expected_type="dict")
     if profile_data is None:
-        logger.error(
-            f"Failed to parse LLM response as JSON: {response_text[:200]}"
-        )
+        logger.error(f"Failed to parse LLM response as JSON: {response_text[:200]}")
         return {}
 
     if not isinstance(profile_data, dict):

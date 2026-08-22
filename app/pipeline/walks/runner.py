@@ -324,8 +324,8 @@ def _verify_walk_2e(book_id: str, storage: PipelineStorage) -> bool:
 def _verify_walk_2f(book_id: str, storage: PipelineStorage) -> bool:
     """Verify that walk_2f_character_description produced character descriptions.
 
-    Checks that at least one character has a description stored in
-    character_metadata. Empty books (no characters) are acceptable.
+    Checks that at least one character has a book-scoped persona description.
+    Empty books (no characters) are acceptable.
     """
     # Check if any characters exist for this book
     character_rows = storage.execute_query(
@@ -340,9 +340,10 @@ def _verify_walk_2f(book_id: str, storage: PipelineStorage) -> bool:
 
     # If characters exist, at least one should have a description
     description_rows = storage.execute_query(
-        "SELECT COUNT(*) AS cnt FROM character_metadata cm "
-        "JOIN character_book cb ON cm.character_id = cb.character_id "
-        "WHERE cb.book_id = ? AND cm.key = 'description'",
+        "SELECT COUNT(*) AS cnt FROM persona_revision pr "
+        "JOIN character_book cb ON pr.character_id = cb.character_id "
+        "WHERE cb.book_id = ? AND pr.book_id = cb.book_id "
+        "AND json_extract(pr.fields_json, '$.identity') IS NOT NULL",
         (book_id,),
     )
     description_count = description_rows[0]["cnt"] if description_rows else 0
