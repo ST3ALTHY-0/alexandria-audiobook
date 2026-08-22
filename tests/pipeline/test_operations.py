@@ -214,6 +214,14 @@ def _get_span_instruct(conn: sqlite3.Connection, span_id: str) -> str | None:
     return row[0] if row else None
 
 
+def _get_span_pause(conn: sqlite3.Connection, span_id: str) -> int | None:
+    """Return trailing pause for a span, or None."""
+    row = conn.execute(
+        "SELECT pause_after_ms FROM span WHERE id = ?", (span_id,)
+    ).fetchone()
+    return row[0] if row else None
+
+
 # ---------------------------------------------------------------------------
 # execute_split tests
 # ---------------------------------------------------------------------------
@@ -376,6 +384,26 @@ class TestExecuteSplit:
             "SELECT id FROM span WHERE id NOT IN ('sp1', 'sp2', 'sp3', 'sp4')"
         ).fetchone()[0]
         assert _get_span_instruct(conn, new_id) is None
+
+    @pytest.mark.parametrize("pause_after_ms", [None, 0, 750])
+    def test_split_moves_trailing_pause_to_right_span(
+        self, storage, executor, pause_after_ms
+    ):
+        """Split keeps the original trailing pause after the new right span."""
+        conn = storage.get_connection()
+        _populate_test_spine(conn)
+        conn.execute(
+            "UPDATE span SET pause_after_ms = ? WHERE id = ?",
+            (pause_after_ms, "sp2"),
+        )
+
+        executor.execute_split(book_id="b1", presentation_index=2, split_point=2)
+
+        new_id = conn.execute(
+            "SELECT id FROM span WHERE id NOT IN ('sp1', 'sp2', 'sp3', 'sp4')"
+        ).fetchone()[0]
+        assert _get_span_pause(conn, "sp2") is None
+        assert _get_span_pause(conn, new_id) == pause_after_ms
 
     def test_split_invalid_offset_zero(self, storage, executor):
         """split_point=0 raises ValueError (not a strict interior offset)."""
@@ -546,6 +574,28 @@ class TestExecuteMerge:
         assert _get_span_text(conn, "sp1") == "Hello world"
         assert _get_span_text(conn, "sp2") is None
         assert _get_paragraph_text(conn, "p1") == "Hello world"
+
+    @pytest.mark.parametrize(
+        "left_pause,right_pause", [(None, None), (0, 750), (750, 0)]
+    )
+    def test_merge_moves_right_trailing_pause_to_surviving_span(
+        self, storage, executor, left_pause, right_pause
+    ):
+        """Merge removes the internal pause and keeps the right trailing pause."""
+        conn = storage.get_connection()
+        _populate_test_spine(conn)
+        conn.execute(
+            "UPDATE span SET pause_after_ms = ? WHERE id = ?", (left_pause, "sp1")
+        )
+        conn.execute(
+            "UPDATE span SET pause_after_ms = ? WHERE id = ?", (right_pause, "sp2")
+        )
+
+        executor.execute_merge(
+            book_id="b1", presentation_index_left=1, presentation_index_right=2
+        )
+
+        assert _get_span_pause(conn, "sp1") == right_pause
 
     def test_merge_confidence_tiebreak(self, storage, executor):
         """Merge keeps higher confidence for duplicate (character_id, relation_type)."""

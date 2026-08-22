@@ -282,6 +282,10 @@ class OperationExecutor:
         and its instruct value.  The right span (new) gets a copy of all
         character_span memberships and NULL instruct.
 
+        ``pause_after_ms`` is transferred to the right span: the left span's
+        trailing pause is set to NULL and the original trailing pause is
+        carried over to the new right span.
+
         Parameters
         ----------
         book_id:
@@ -305,14 +309,14 @@ class OperationExecutor:
                 conn, presentation_index, book_id=book_id
             )
 
-            # Get span details including text and instruct
+            # Get span details including text, instruct, and trailing pause.
             span_row = conn.execute(
-                "SELECT span_type, instruct, text FROM span WHERE id = ?",
+                "SELECT span_type, instruct, text, pause_after_ms FROM span WHERE id = ?",
                 (span_id,),
             ).fetchone()
             if span_row is None:
                 raise ValueError(f"Span {span_id} not found")
-            span_type, _instruct, span_text = span_row
+            span_type, _instruct, span_text, pause_after_ms = span_row
 
             # Validate split_point as a strict interior offset
             if span_text is None:
@@ -330,7 +334,7 @@ class OperationExecutor:
 
             # Update original span with left text
             conn.execute(
-                "UPDATE span SET text = ? WHERE id = ?",
+                "UPDATE span SET text = ?, pause_after_ms = NULL WHERE id = ?",
                 (left_text, span_id),
             )
 
@@ -342,9 +346,9 @@ class OperationExecutor:
             # Create new span with right text
             new_span_id = str(uuid.uuid4())
             conn.execute(
-                "INSERT INTO span (id, span_type, instruct, text) "
-                "VALUES (?, ?, NULL, ?)",
-                (new_span_id, span_type, right_text),
+                "INSERT INTO span (id, span_type, instruct, text, pause_after_ms) "
+                "VALUES (?, ?, NULL, ?, ?)",
+                (new_span_id, span_type, right_text, pause_after_ms),
             )
 
             # Insert new paragraph_span edge at old_position + 1
@@ -382,6 +386,10 @@ class OperationExecutor:
 
         Combines character_span memberships (union). For duplicate
         (character_id, relation_type) combos, keeps the one with higher confidence.
+
+        ``pause_after_ms`` semantics: the surviving left span keeps the right
+        span's trailing pause, and the old left span's trailing pause (the
+        internal pause between the merged spans) is discarded.
 
         Parameters
         ----------
@@ -441,9 +449,12 @@ class OperationExecutor:
             left_text = conn.execute(
                 "SELECT text FROM span WHERE id = ?", (left_span_id,)
             ).fetchone()[0]
-            right_text = conn.execute(
-                "SELECT text FROM span WHERE id = ?", (right_span_id,)
-            ).fetchone()[0]
+            right_row = conn.execute(
+                "SELECT text, pause_after_ms FROM span WHERE id = ?",
+                (right_span_id,),
+            ).fetchone()
+            right_text = right_row[0]
+            right_pause_after_ms = right_row[1]
             if left_text is None:
                 merged_text = right_text
             elif right_text is None:
@@ -451,8 +462,8 @@ class OperationExecutor:
             else:
                 merged_text = left_text + right_text
             conn.execute(
-                "UPDATE span SET text = ? WHERE id = ?",
-                (merged_text, left_span_id),
+                "UPDATE span SET text = ?, pause_after_ms = ? WHERE id = ?",
+                (merged_text, right_pause_after_ms, left_span_id),
             )
 
             # Build union with confidence tiebreak

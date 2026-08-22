@@ -293,7 +293,7 @@ class TestExecute:
         response = json.dumps({"character_id": "char-john", "confidence": 0.9})
         _patch_llm(monkeypatch, mock_llm_client, response)
 
-        execute("book-1", seeded_storage, {})
+        result = execute("book-1", seeded_storage, {})
 
         row = seeded_storage.execute_query(
             """SELECT character_id, source, confidence, human_override
@@ -305,6 +305,9 @@ class TestExecute:
         assert row["source"] == "human"
         assert row["confidence"] == 1.0
         assert row["human_override"] == 1
+
+        assert result["speakers_attributed"] == 2
+        assert result["attributions_for_review"] == 0
 
     def test_unknown_speaker_no_junction(
         self, seeded_storage, mock_llm_client, monkeypatch
