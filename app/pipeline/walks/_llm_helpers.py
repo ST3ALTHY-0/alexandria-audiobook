@@ -10,6 +10,7 @@ import json
 import logging
 import re
 import time
+from collections.abc import Callable
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any
 
@@ -36,6 +37,42 @@ def get_walk_log_sink() -> WalkLogSink | None:
     returns ``None``.
     """
     return WALK_LOG_SINK.get()
+
+
+class WalkCancelledError(Exception):
+    """Raised at a cancellation checkpoint when an active run is cancelled.
+
+    The runner catches this at the walk boundary and finalizes the owning run
+    to ``cancelled`` (terminalizing the row and releasing the global
+    single-active-walk gate). Checkpoints live at the top of
+    :func:`chat_completion` (the shared LLM boundary) and at HeartbeatStorage's
+    write boundary, i.e. BETWEEN non-interruptible units — so an in-flight LLM
+    call or write always completes normally before the next checkpoint observes
+    the cancel request and raises.
+    """
+
+
+#: Thread-local cancellation-probe seam. The runner sets the current run's
+#: probe on this ContextVar immediately before ``walk_module.execute(...)`` and
+#: resets it in ``finally`` on every terminal path. The probe (
+#: ``runner.WalkRunner._cancel_probe``) evaluates ``is_cancel_requested`` for the
+#: owning run and raises :class:`WalkCancelledError` when cancellation has been
+#: requested. Helpers call it at checkpoint boundaries; they never set it.
+CANCEL_CHECK: ContextVar[Callable[[], None] | None] = ContextVar(
+    "cancel_check", default=None
+)
+
+
+def cancel_checkpoint() -> None:
+    """Evaluate the active run's cancellation probe, if one is set.
+
+    No-op when the runner has not attached a probe (outside a running walk).
+    When a probe is attached and the owning run has been cancelled, raises
+    :class:`WalkCancelledError` so the run stops at the current checkpoint.
+    """
+    probe = CANCEL_CHECK.get()
+    if probe is not None:
+        probe()
 
 
 def chat_completion(
@@ -77,6 +114,11 @@ def chat_completion(
     extra_body: dict[str, str] = {}
     if reasoning_effort is not None:
         extra_body["reasoning_effort"] = reasoning_effort
+
+    # Cancellation checkpoint at the shared LLM boundary: check BEFORE the
+    # (non-interruptible) create call so an active, cancelled run stops between
+    # units rather than mid-call. The probe is a no-op outside a running walk.
+    cancel_checkpoint()
 
     response = client.chat.completions.create(
         model=model_name,

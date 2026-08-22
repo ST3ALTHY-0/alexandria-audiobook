@@ -246,20 +246,13 @@ def _process_span(
     attribution_data = _parse_llm_response(response_text)
 
     # Process attribution
-    conn = storage.get_connection()
-    conn.execute("SAVEPOINT walk_2e_span")
-    try:
+    with storage.savepoint("walk_2e_span"):
         _process_attribution(
             attribution_data=attribution_data,
             span_id=span_id,
             storage=storage,
             result=result,
         )
-        conn.execute("RELEASE SAVEPOINT walk_2e_span")
-    except Exception:
-        conn.execute("ROLLBACK TO SAVEPOINT walk_2e_span")
-        conn.execute("RELEASE SAVEPOINT walk_2e_span")
-        raise
 
 
 def _process_attribution(

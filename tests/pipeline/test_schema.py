@@ -54,6 +54,96 @@ def _index_info(conn: sqlite3.Connection, index: str) -> list[tuple]:
     return conn.execute(f"PRAGMA index_info({index})").fetchall()
 
 
+class TestRunOwnershipIndexes:
+    """P2-S1: run-owned cleanup lookup indexes + nullable run_id ownership.
+
+    Run-owned cancellation cleanup (CONTRACTS.md ownership matrix) keys on
+    run_id / source_run_id.  These additive indexes make run-owned row lookup
+    index-backed.  No hard FK is added and ``walk_review_item.run_id`` stays
+    nullable so legacy/direct-call (unprovenanced) rows remain valid.
+    """
+
+    def test_run_lookup_indexes_exist(self, conn):
+        names = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name IN ("
+                "'idx_walk_review_item_run',"
+                "'idx_character_scene_generated_source_run',"
+                "'idx_workbench_provenance_run')"
+            ).fetchall()
+        }
+        assert names == {
+            "idx_walk_review_item_run",
+            "idx_character_scene_generated_source_run",
+            "idx_workbench_provenance_run",
+        }
+
+    def test_indexes_are_additive_and_idempotent(self, conn):
+        # Re-invoking create_schema must not error or duplicate the indexes.
+        create_schema(conn)
+        count = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN ("
+            "'idx_walk_review_item_run',"
+            "'idx_character_scene_generated_source_run',"
+            "'idx_workbench_provenance_run')"
+        ).fetchone()[0]
+        assert count == 3
+
+    def test_walk_review_item_run_id_remains_nullable(self, conn):
+        cols = {r[1]: r for r in _column_info(conn, "walk_review_item")}
+        assert "run_id" in cols
+        assert cols["run_id"][3] == 0  # notnull flag: 0 => nullable
+        # A legacy/direct-call row with NULL run_id remains insertable.
+        conn.execute(
+            "INSERT INTO walk_review_item (id, book_id, run_id, kind, status) "
+            "VALUES (?, ?, NULL, 'instruction', 'pending')",
+            ("ri-1", "book-1"),
+        )
+        row = conn.execute(
+            "SELECT run_id FROM walk_review_item WHERE id = ?", ("ri-1",)
+        ).fetchone()
+        assert row[0] is None
+
+    def test_ownership_fk_columns_remain_nullable(self, conn):
+        """workbench_provenance.run_id and character_scene_generated.source_run_id
+        stay nullable so NULL-run direct-call rows remain insertable (P5-S3)."""
+        for table, col in (
+            ("workbench_provenance", "run_id"),
+            ("character_scene_generated", "source_run_id"),
+        ):
+            cols = {r[1]: r for r in _column_info(conn, table)}
+            assert col in cols, f"{table}.{col} expected"
+            assert cols[col][3] == 0, f"{table}.{col} should stay nullable"
+
+    def test_create_schema_reinvoke_preserves_all_ownership_tables(self, conn):
+        """Re-invoking create_schema is a no-op for the run-ownership schema
+        (P5-S3 schema migration idempotency)."""
+        create_schema(conn)
+        tables = _table_names(conn)
+        for t in (
+            "walk_review_item",
+            "character_scene_generated",
+            "workbench_provenance",
+            "walk_run",
+        ):
+            assert t in tables
+        names = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name IN ("
+                "'idx_walk_review_item_run',"
+                "'idx_character_scene_generated_source_run',"
+                "'idx_workbench_provenance_run')"
+            ).fetchall()
+        }
+        assert names == {
+            "idx_walk_review_item_run",
+            "idx_character_scene_generated_source_run",
+            "idx_workbench_provenance_run",
+        }
+
+
 # ---------------------------------------------------------------------------
 # Table creation
 # ---------------------------------------------------------------------------

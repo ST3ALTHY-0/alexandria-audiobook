@@ -166,13 +166,22 @@ async def run_walk(
     before the walk starts. Invalid walk names are rejected with 400 BEFORE any
     reservation (no pending row). Returns immediately with
     ``{status: 'started', started: true, walk_name: ..., run_id: ...}``; poll
-    ``GET /walk_status/{book_id}`` for progress.
+    ``GET /walk_status/{book_id}`` and ``GET /walks/{book_id}/runs`` for progress.
+
+    Global single-active-walk gate (CONTRACTS.md "Critical Walk Concurrency
+    and Cancellation Override"): the response returns immediately even when a
+    walk on ANY book is already running. The blocked reservation is NOT
+    rejected here — instead ``run_walk_reserved`` deterministically terminalizes
+    this run's own pending row to ``failed`` (error ``"Another walk is already
+    running (global single-active-walk gate)"``) WITHOUT executing the walk.
+    That terminal ``failed`` row surfaces to the frontend through
+    ``GET /walks/{book_id}/runs`` (walk_run rows = truth) and the status/SSE
+    surfaces, so global contention is observably reported rather than hanging.
     """
     if request.walk_name not in WALK_ORDER:
         raise HTTPException(
             status_code=400,
-            detail=f"Unknown walk: {request.walk_name}. "
-            f"Must be one of {WALK_ORDER}",
+            detail=f"Unknown walk: {request.walk_name}. Must be one of {WALK_ORDER}",
         )
     # One canonical run UUID per request, generated before reservation.
     run_id = str(uuid.uuid4())
@@ -198,7 +207,11 @@ async def run_walk(
             detail=f"Failed to reserve walk run: {exc}",
         ) from exc
     background_tasks.add_task(
-        runner.run_walk_reserved, run_id, request.walk_name, request.book_id, request.config
+        runner.run_walk_reserved,
+        run_id,
+        request.walk_name,
+        request.book_id,
+        request.config,
     )
     return {
         "status": "started",
@@ -229,20 +242,27 @@ async def run_all_walks(
     ``run_all_walks_reserved`` through ``BackgroundTasks`` so the response
     returns before the batch starts. Returns immediately with
     ``{status: 'started', started: true, batch_id: ..., run_ids: [...], runs: [...]}``;
-    poll ``GET /walk_status/{book_id}`` for progress.
+    poll ``GET /walk_status/{book_id}`` and ``GET /walks/{book_id}/runs`` for progress.
+
+    Global single-active-walk gate (CONTRACTS.md "Critical Walk Concurrency
+    and Cancellation Override"): the response returns immediately even when a
+    walk on ANY book is already running. The child reservations are NOT
+    rejected here — instead the reserved runner deterministically terminalizes
+    the blocked child's own pending row to ``failed`` (error ``"Another walk is
+    already running (global single-active-walk gate)"``) WITHOUT executing it,
+    and then terminalizes every remaining child. Those terminal ``failed`` rows
+    surface to the frontend through ``GET /walks/{book_id}/runs`` and the
+    status/SSE surfaces, so global contention is observably reported rather
+    than hanging.
     """
     # One canonical batch_id + nine canonical child UUIDs in WALK_ORDER.
     batch_id = str(uuid.uuid4())
-    reservations = tuple(
-        (walk_name, str(uuid.uuid4())) for walk_name in WALK_ORDER
-    )
+    reservations = tuple((walk_name, str(uuid.uuid4())) for walk_name in WALK_ORDER)
     # Clear any previous cancellation flag (existing boundary, unchanged).
     runner.clear_cancel(request.book_id)
     # Reserve all pending rows (may raise -> mark pending failed, never execute).
     try:
-        walk_runner_mod.reserve_all_walk_runs(
-            storage, request.book_id, reservations
-        )
+        walk_runner_mod.reserve_all_walk_runs(storage, request.book_id, reservations)
     except Exception as exc:
         try:
             walk_runner_mod.mark_reserved_runs_failed(
@@ -274,8 +294,7 @@ async def run_all_walks(
         "batch_id": batch_id,
         "run_ids": [rid for _, rid in reservations],
         "runs": [
-            {"walk_name": walk_name, "run_id": rid}
-            for walk_name, rid in reservations
+            {"walk_name": walk_name, "run_id": rid} for walk_name, rid in reservations
         ],
     }
 
@@ -290,13 +309,25 @@ async def cancel_walks(
     request: CancelWalksRequest,
     runner: WalkRunner = Depends(get_walk_runner),
 ) -> dict:
-    """Cancel any running walks for a book.
+    """Cancel any active walks for a book.
 
-    Sets a cancellation flag that the runner checks before each walk.
-    The request is persisted — ``cancel_requested = 1`` on the book's
-    active (pending/running) ``walk_run`` rows with a heartbeat refresh,
+    Sets a cancellation flag that the runner checks before and during
+    execution. The request is persisted — ``cancel_requested = 1`` on the
+    book's active (pending/running) ``walk_run`` rows with a heartbeat refresh,
     plus a stop-file per active run so the cancel survives a restart.
-    Returns ``{status: 'cancelled'}``.
+
+    Cancellation is a REQUEST honored at safe checkpoints, not an immediate
+    abort. After active execution stops, the run terminalizes to ``cancelled``
+    (a cancelled-before-start run finalizes ``cancelled`` with no sink), and —
+    per the CONTRACTS.md run-owned cleanup semantics — the runner purges only
+    output owned by that run while the global gate is held, then finalizes the
+    row. Those terminal ``cancelled`` rows surface through
+    ``GET /walks/{book_id}/runs`` and the status/SSE surfaces.
+
+    Idempotent: re-calling cancel for a book with no active runs is a safe no-op
+    and still returns ``{status: 'cancelled'}``. Transaction-owner-thread
+    contention surfaces as 503 + ``Retry-After`` at the app layer and the
+    frontend retries exactly once.
     """
     runner.cancel_walks(request.book_id)
     return {"status": "cancelled"}
@@ -318,6 +349,18 @@ async def get_walk_runs(
     A book with no runs returns an empty list.  Rows = truth: the
     response is the row's field set (run_id, walk_name, status,
     heartbeat_ms, created_ms, finished_ms, error).
+
+    This is the primary surface for terminal rows produced by the global
+    single-active-walk gate and cancellation:
+      * a globally-blocked run terminalizes its own pending row to ``failed``
+        (error contains "global single-active-walk gate") WITHOUT executing —
+        that ``failed`` row appears here via DB truth, even though the in-memory
+        ``/walk_status`` dict is not updated on the early-return path;
+      * a cancelled run terminalizes to ``cancelled`` and (for non-completed
+        runs) runs run-owned cleanup before finalizing — that ``cancelled`` row
+        appears here as well.
+    Frontends use ``GET /walk_status/{book_id}`` for per-walk progress and this
+    endpoint for run-row activity/terminal truth.
     """
     rows = storage.execute_query(
         "SELECT run_id, walk_name, status, heartbeat_ms, created_ms, "
@@ -526,7 +569,17 @@ async def get_walk_status(
     book_id: str,
     runner: WalkRunner = Depends(get_walk_runner),
 ) -> dict:
-    """Return per-walk status for a book."""
+    """Return per-walk in-memory status for a book.
+
+    Reflects the latest terminal status recorded by the runner (``pending``,
+    ``running``, ``completed``, ``failed``, ``cancelled``). A run blocked by the
+    global single-active-walk gate terminalizes to ``failed`` in the DB without
+    updating this in-memory dict (it returns before ``_set_status``), so its
+    terminal ``failed`` row is observed via ``GET /walks/{book_id}/runs`` (rows
+    = truth) rather than here. Cancelled runs call ``_set_status`` on the way
+    out, so ``cancelled`` does appear here when reached through the terminalizer
+    path.
+    """
     statuses: dict[str, str] = {}
     for walk_name in WALK_ORDER:
         statuses[walk_name] = runner.get_walk_status(book_id, walk_name)
@@ -567,7 +620,10 @@ _WORKBENCH_WALK_NAMES = frozenset(
 
 # Downstream invalidation DAG for rerun reconciliation.
 _RERUN_INVALIDATION: dict[str, list[str]] = {
-    "walk_2b_character_discovery": ["walk_2c_alias_resolution", "walk_2d_scene_presence"],
+    "walk_2b_character_discovery": [
+        "walk_2c_alias_resolution",
+        "walk_2d_scene_presence",
+    ],
     "walk_2c_alias_resolution": ["walk_2d_scene_presence"],
     "walk_2d_scene_presence": [],
 }
@@ -1058,7 +1114,9 @@ async def apply_boundary_override(
     workbench: Workbench = Depends(get_workbench),
 ) -> dict:
     """Apply an active boundary override, recording the effective decision."""
-    return _guard(workbench.apply_boundary_override, book_id=book_id, override_id=override_id)
+    return _guard(
+        workbench.apply_boundary_override, book_id=book_id, override_id=override_id
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1182,9 +1240,7 @@ async def validate_prompt_config(
 # ---------------------------------------------------------------------------
 
 
-@router.post(
-    "/walks/{book_id}/config/revisions", status_code=201
-)
+@router.post("/walks/{book_id}/config/revisions", status_code=201)
 async def save_prompt_config_revision(
     book_id: str,
     request: PromptConfigWriteRequest,

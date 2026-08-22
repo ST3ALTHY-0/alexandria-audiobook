@@ -309,9 +309,7 @@ def _process_scene(
     characters = _parse_llm_response(response_text)
 
     # Process each discovered character
-    conn = storage.get_connection()
-    conn.execute("SAVEPOINT walk_2b_scene")
-    try:
+    with storage.savepoint("walk_2b_scene"):
         for char_data in characters:
             _process_character(
                 char_data=char_data,
@@ -323,11 +321,6 @@ def _process_scene(
                 name_to_id=name_to_id,
                 result=result,
             )
-        conn.execute("RELEASE SAVEPOINT walk_2b_scene")
-    except Exception:
-        conn.execute("ROLLBACK TO SAVEPOINT walk_2b_scene")
-        conn.execute("RELEASE SAVEPOINT walk_2b_scene")
-        raise
 
 
 def _process_character(

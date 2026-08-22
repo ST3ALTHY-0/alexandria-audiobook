@@ -75,16 +75,9 @@ def populate_initial_spine(
 
     _ensure_paragraph_text_column(storage)
     _ensure_span_text_column(storage)
-    conn = storage.get_connection()
-    conn.execute("SAVEPOINT populate_spine")
-    try:
+    with storage.savepoint("populate_spine"):
         _insert_series_and_book(series_id, book_id, storage)
         _insert_chapters_with_placeholders(book_id, chapters_data, storage)
-        conn.execute("RELEASE SAVEPOINT populate_spine")
-    except Exception:
-        conn.execute("ROLLBACK TO SAVEPOINT populate_spine")
-        conn.execute("RELEASE SAVEPOINT populate_spine")
-        raise
 
 
 def insert_scene(
@@ -110,18 +103,11 @@ def insert_scene(
     storage:
         Pipeline storage adapter.
     """
-    conn = storage.get_connection()
-    conn.execute("SAVEPOINT insert_scene")
-    try:
+    with storage.savepoint("insert_scene"):
         _insert_scene_row(scene_id, storage)
         scene_position = _get_next_scene_position(chapter_id, storage)
         _insert_chapter_scene_edge(scene_id, chapter_id, scene_position, storage)
         _redistribute_paragraphs(scene_id, paragraph_ids, storage)
-        conn.execute("RELEASE SAVEPOINT insert_scene")
-    except Exception:
-        conn.execute("ROLLBACK TO SAVEPOINT insert_scene")
-        conn.execute("RELEASE SAVEPOINT insert_scene")
-        raise
 
 
 # ---------------------------------------------------------------------------
@@ -133,9 +119,7 @@ def _insert_series_and_book(
     series_id: str, book_id: str, storage: PipelineStorage
 ) -> None:
     """Insert series (if not exists) and book row with version=1."""
-    storage.execute_insert(
-        "INSERT OR IGNORE INTO series (id) VALUES (?)", (series_id,)
-    )
+    storage.execute_insert("INSERT OR IGNORE INTO series (id) VALUES (?)", (series_id,))
     next_position = _next_book_position(series_id, storage)
     storage.execute_insert(
         "INSERT INTO book (id, series_id, book_number, version, position) "
@@ -201,7 +185,14 @@ def _insert_paragraphs_and_spans(
         para_text = _reconstruct_paragraph_text(paragraph.get("spans", []))
         _insert_paragraph(paragraph_id, scene_id, para_idx, para_text, storage)
         for span_idx, span in enumerate(paragraph["spans"], start=1):
-            _insert_span(span["id"], span["span_type"], paragraph_id, span_idx, storage, span.get("text", ""))
+            _insert_span(
+                span["id"],
+                span["span_type"],
+                paragraph_id,
+                span_idx,
+                storage,
+                span.get("text", ""),
+            )
 
 
 def _insert_paragraph(
@@ -223,7 +214,12 @@ def _insert_paragraph(
 
 
 def _insert_span(
-    span_id: str, span_type: str, paragraph_id: str, position: int, storage: PipelineStorage, span_text: str = ""
+    span_id: str,
+    span_type: str,
+    paragraph_id: str,
+    position: int,
+    storage: PipelineStorage,
+    span_text: str = "",
 ) -> None:
     """Insert span row and paragraph_span edge."""
     storage.execute_insert(
@@ -290,15 +286,12 @@ def _ensure_paragraph_text_column(storage: PipelineStorage) -> None:
     """
     conn = storage.get_connection()
     try:
-        conn.execute(
-            "ALTER TABLE paragraph ADD COLUMN text TEXT"
-        )
+        conn.execute("ALTER TABLE paragraph ADD COLUMN text TEXT")
     except sqlite3.OperationalError:
         # Column already exists or SQLite version doesn't support IF NOT EXISTS.
         # Verify the column is present; if not, re-raise.
         cols = {
-            row[1]
-            for row in conn.execute("PRAGMA table_info(paragraph)").fetchall()
+            row[1] for row in conn.execute("PRAGMA table_info(paragraph)").fetchall()
         }
         if "text" not in cols:
             raise
@@ -312,16 +305,11 @@ def _ensure_span_text_column(storage: PipelineStorage) -> None:
     """
     conn = storage.get_connection()
     try:
-        conn.execute(
-            "ALTER TABLE span ADD COLUMN text TEXT"
-        )
+        conn.execute("ALTER TABLE span ADD COLUMN text TEXT")
     except sqlite3.OperationalError:
         # Column already exists or SQLite version doesn't support IF NOT EXISTS.
         # Verify the column is present; if not, re-raise.
-        cols = {
-            row[1]
-            for row in conn.execute("PRAGMA table_info(span)").fetchall()
-        }
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(span)").fetchall()}
         if "text" not in cols:
             raise
 

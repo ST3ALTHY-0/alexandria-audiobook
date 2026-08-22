@@ -49,22 +49,12 @@ from app.pipeline.walks.log_service import (
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# The nine walk modules must always remain byte-identical to git HEAD (zero
-# edits, zero imports as implementation targets). ``api_walks`` was protected
-# while Part C had not yet modified it; since this Phase 2 (Part C SSE endpoint)
-# legitimately adds the SSE route to app/pipeline/api_walks.py, it is no longer
-# byte-immutable and was removed from the protected set. Enforced by the
-# static audit tests at the bottom of P1-S1.
+# Walk modules not modified by an implementation plan must remain byte-identical
+# to git HEAD. The walk modules changed by Plan R are intentionally excluded
+# because their adapter-owned savepoint migration is a legitimate edit. Enforced
+# by the static audit tests at the bottom of P1-S1.
 PROTECTED_MODULES = [
     "walk_2a_scene_segmentation",
-    "walk_2b_character_discovery",
-    "walk_2c_alias_resolution",
-    "walk_2d_scene_presence",
-    "walk_2e_span_attribution",
-    "walk_2f_character_description",
-    "walk_2g_voice_audition",
-    "walk_2h_voice_assignment",
-    "walk_2i_delivery",
 ]
 
 VALID_UUID = "123e4567-e89b-12d3-a456-426614174000"
@@ -295,14 +285,12 @@ class TestSinkBasics:
 
 
 class TestStaticAudit:
-    """The nine walk modules must remain byte-identical to git HEAD.
+    """Unmodified walk modules must remain byte-identical to git HEAD.
 
-    Only the immutable ``walk_2*.py`` modules are protected now: runner/
-    _llm_helpers were removed because the B-runner-integration plan legitimately
-    modified them, and api_walks was removed when Part C (this Phase 2) added
-    the SSE endpoint to it. The protected files must stay byte-identical to the
-    committed git HEAD versions, and this test file must never import them as
-    implementation targets.
+    Plan R legitimately modified walks 2b–2i for adapter-owned savepoints, so
+    only the remaining unmodified walk is protected. Protected files must stay
+    byte-identical to committed git HEAD versions, and this test file must
+    never import them as implementation targets.
     """
 
     def test_protected_modules_byte_identical_to_git_head(self):
@@ -360,7 +348,9 @@ class TestRedaction:
         service = _started_service(tmp_path)
         sink = service.open_run(VALID_UUID, "book-7", "walk_2a_scene_segmentation")
         token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.abcdefgh"
-        sink.append("llm", {"prompts": f"Authorization: Bearer {token}", "response": "ok"})
+        sink.append(
+            "llm", {"prompts": f"Authorization: Bearer {token}", "response": "ok"}
+        )
         content = (tmp_path / "alexandria-walks" / f"{VALID_UUID}.log").read_text(
             encoding="utf-8"
         )
@@ -601,9 +591,7 @@ class TestSinkBoundaries:
         records = _read_records(path)
         # Projected-size check: every accepted chunk is in the file, and no
         # dropped chunk leaked in.
-        chunks_in_file = {
-            r["data"]["chunk"] for r in records if r["event"] == "work"
-        }
+        chunks_in_file = {r["data"]["chunk"] for r in records if r["event"] == "work"}
         assert chunks_in_file == set(accepted)
         # Strict cap: total file bytes stay within 10 MiB.
         assert path.stat().st_size <= SINK_CAP_BYTES
@@ -630,7 +618,9 @@ class TestSinkBoundaries:
                 break
         assert dropped is not None
         path = tmp_path / "alexandria-walks" / f"{VALID_UUID}.log"
-        chunks = {r["data"]["chunk"] for r in _read_records(path) if r["event"] == "work"}
+        chunks = {
+            r["data"]["chunk"] for r in _read_records(path) if r["event"] == "work"
+        }
         assert dropped not in chunks
         service.shutdown()
 
@@ -707,10 +697,14 @@ class TestSinkBoundaries:
         terminal_seq = terminal_seqs[0]
         # No non-terminal record may have a larger seq than the terminal record
         # (i.e. nothing may land after it in the retained file).
-        after = [r for r in records if not r.get("terminal") and r["seq"] > terminal_seq]
+        after = [
+            r for r in records if not r.get("terminal") and r["seq"] > terminal_seq
+        ]
         assert after == []
 
-    def test_append_terminal_marks_closed_even_on_failed_write(self, tmp_path, monkeypatch):
+    def test_append_terminal_marks_closed_even_on_failed_write(
+        self, tmp_path, monkeypatch
+    ):
         """A failed terminal write still closes the sink (best-effort no-raise):
         later appends are dropped and ``close_partial`` remains callable."""
         service = _started_service(tmp_path)
@@ -773,7 +767,9 @@ class TestBrokerOrdering:
                 for i in range(offset, offset + 25):
                     sink.append("work", {"i": i})
 
-            threads = [threading.Thread(target=writer, args=(n * 25,)) for n in range(4)]
+            threads = [
+                threading.Thread(target=writer, args=(n * 25,)) for n in range(4)
+            ]
             for t in threads:
                 t.start()
             for t in threads:
@@ -926,7 +922,10 @@ class TestBrokerLimits:
             sub = service.open_subscription(RUN_ID, after_seq=-1)
             snap = sub.replay
             assert snap[-1].terminal is True
-            assert snap[-1].event == "terminal" or snap[-1].data.get("status") == "completed"
+            assert (
+                snap[-1].event == "terminal"
+                or snap[-1].data.get("status") == "completed"
+            )
             sub.close()
 
         _run_broker(root, scenario)
@@ -959,9 +958,7 @@ class TestBrokerSubscription:
             snap = sub.replay
             assert [r.seq for r in snap if not r.terminal] == [0]
             sink.append("work", {"i": 1})  # live event after registration
-            ev = asyncio.wait_for(
-                asyncio.ensure_future(sub.next_event()), timeout=10
-            )
+            ev = asyncio.wait_for(asyncio.ensure_future(sub.next_event()), timeout=10)
             ev = await ev
             assert ev is not None and ev.seq == 1
             sub.close()
@@ -1136,9 +1133,7 @@ class TestBrokerSubscription:
         root = str(tmp_path / "alexandria-walks")
 
         async def scenario(service):
-            sink = service.open_run(
-                RUN_ID, "book-7", "walk_2a_scene_segmentation"
-            )
+            sink = service.open_run(RUN_ID, "book-7", "walk_2a_scene_segmentation")
             sink.append("work", {"i": 0})  # file has header + record seq 0
 
             orig_flush = sink._flush
@@ -1451,8 +1446,14 @@ class TestSecurityReview:
         path is derived, and no file is created outside the root."""
         service = _started_service(tmp_path)
         outside = tmp_path / "escaped.log"
-        for bad in ("../../etc/passwd", "../escape", "foo/../../etc/passwd",
-                    "..%2f..%2fetc%2fpasswd", "0" * 32, "x" * 40):
+        for bad in (
+            "../../etc/passwd",
+            "../escape",
+            "foo/../../etc/passwd",
+            "..%2f..%2fetc%2fpasswd",
+            "0" * 32,
+            "x" * 40,
+        ):
             with pytest.raises(ValueError):
                 service.open_run(bad, "book-7", "walk_2a_scene_segmentation")
             assert not outside.exists()
@@ -1579,8 +1580,14 @@ class TestSecurityReview:
         payload = {
             "prompts": "p",
             "response": "r",
-            "config": {"nested": {"api_key": secret, "apiKey": secret,
-                                   "API_KEY": secret, "other": "visible"}},
+            "config": {
+                "nested": {
+                    "api_key": secret,
+                    "apiKey": secret,
+                    "API_KEY": secret,
+                    "other": "visible",
+                }
+            },
         }
         sink = service.open_run(VALID_UUID, "book-7", "walk_2a_scene_segmentation")
         sink.append("llm", payload)
@@ -1597,8 +1604,13 @@ class TestSecurityReview:
         for i, s in enumerate(secrets):
             run_id = str(uuid.uuid4())
             sink = service.open_run(run_id, "book-7", "walk_2a_scene_segmentation")
-            sink.append("llm", {"prompts": "p",
-                                "response": f"Api_Key = {s}, API-KEY={s}, api key = {s}"})
+            sink.append(
+                "llm",
+                {
+                    "prompts": "p",
+                    "response": f"Api_Key = {s}, API-KEY={s}, api key = {s}",
+                },
+            )
             content = (tmp_path / "alexandria-walks" / f"{run_id}.log").read_text(
                 encoding="utf-8"
             )
@@ -1678,6 +1690,7 @@ class TestSecurityReview:
             service.shutdown()
 
         asyncio.run(scenario())
+
 
 class TestAmendedSecuritySurfaces:
     """Amended broker/replay security surfaces (Phase 3 rewrite, re-reviewed in

@@ -20,7 +20,7 @@ from __future__ import annotations
 import pytest
 
 from app.pipeline.adapter import InMemorySQLiteAdapter
-from app.pipeline.assembly import get_book_version, reonboard_book
+from app.pipeline.assembly import get_book_version, has_active_run, reonboard_book
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -508,3 +508,56 @@ class TestReonboardEmptyBook:
 
         new_version = reonboard_book("b1", s)
         assert new_version == 2
+
+
+# ---------------------------------------------------------------------------
+# Tests: has_active_run — walk-controller coordination (P4-S2)
+# ---------------------------------------------------------------------------
+
+
+def _insert_walk_run(storage: InMemorySQLiteAdapter, run_id: str, book_id: str, status: str) -> None:
+    """Insert a minimal walk_run row (status must be schema-valid)."""
+    storage.execute_insert(
+        "INSERT INTO walk_run (run_id, book_id, walk_name, status, created_ms) "
+        "VALUES (?, ?, 'walk_2b_character_discovery', ?, 1000)",
+        (run_id, book_id, status),
+    )
+
+
+class TestHasActiveRun:
+    def test_false_no_runs(self, storage):
+        """A book with no walk_run rows has no active run."""
+        assert has_active_run("b1", storage) is False
+
+    def test_true_pending(self, storage):
+        """A pending run prevents replacement (writer not yet started)."""
+        _insert_walk_run(storage, "r1", "b1", "pending")
+        assert has_active_run("b1", storage) is True
+
+    def test_true_running(self, storage):
+        """A running run prevents replacement (writer active)."""
+        _insert_walk_run(storage, "r1", "b1", "running")
+        assert has_active_run("b1", storage) is True
+
+    def test_false_terminal(self, storage):
+        """Terminal rows (completed/cancelled/failed) do not block replacement."""
+        for status in ("completed", "cancelled", "failed"):
+            s = InMemorySQLiteAdapter()
+            s.init_db()
+            _insert_walk_run(s, "r1", "b1", status)
+            assert has_active_run("b1", s) is False, status
+
+    def test_scoped_to_book(self, storage):
+        """Active run on another book does not block this book."""
+        _insert_walk_run(storage, "r-other", "b-other", "running")
+        assert has_active_run("b1", storage) is False
+
+    def test_nonexistent_book_is_not_active(self, storage):
+        """A book with no rows at all is not active (replacement may be 404'd upstream)."""
+        assert has_active_run("does-not-exist", storage) is False
+
+    def test_pending_sibling_rows_all_count(self, storage):
+        """Multiple pending/running rows are all treated as active."""
+        _insert_walk_run(storage, "r1", "b1", "pending")
+        _insert_walk_run(storage, "r2", "b1", "running")
+        assert has_active_run("b1", storage) is True

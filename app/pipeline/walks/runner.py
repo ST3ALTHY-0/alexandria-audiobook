@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 
 from app.pipeline.adapter import ConcurrentTransactionError
 
-from ._llm_helpers import WALK_LOG_SINK
+from ._llm_helpers import CANCEL_CHECK, WALK_LOG_SINK, WalkCancelledError
 from .order import WALK_ORDER
 
 logger = logging.getLogger(__name__)
@@ -486,25 +486,45 @@ class HeartbeatStorage:
     ``transaction``, …) delegate to the wrapped adapter.
     """
 
-    def __init__(self, storage: PipelineStorage, run_id: str) -> None:
+    def __init__(
+        self,
+        storage: PipelineStorage,
+        run_id: str,
+        cancel_check: Callable[[], None] | None = None,
+    ) -> None:
         # object.__setattr__ avoids __getattr__ recursion during init.
         object.__setattr__(self, "storage", storage)
         object.__setattr__(self, "run_id", run_id)
+        object.__setattr__(self, "_cancel_check", cancel_check)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.storage, name)
 
+    def cancel_checkpoint(self) -> None:
+        """Evaluate the owning run's cancellation probe at a write checkpoint.
+
+        The probe (``runner._cancel_probe``) raises ``WalkCancelledError`` if the
+        run has been cancelled. It is checked at the start of every write below
+        — i.e. BETWEEN non-interruptible writes — so an in-flight write always
+        completes before the next checkpoint observes the cancel request.
+        """
+        if self._cancel_check is not None:
+            self._cancel_check()
+
     def execute_insert(self, sql: str, params: tuple = ()) -> int:
+        self.cancel_checkpoint()
         result = _retry_write(lambda: self.storage.execute_insert(sql, params))
         self._touch()
         return result
 
     def execute_update(self, sql: str, params: tuple = ()) -> int:
+        self.cancel_checkpoint()
         result = _retry_write(lambda: self.storage.execute_update(sql, params))
         self._touch()
         return result
 
     def execute_delete(self, sql: str, params: tuple = ()) -> int:
+        self.cancel_checkpoint()
         result = _retry_write(lambda: self.storage.execute_delete(sql, params))
         self._touch()
         return result
@@ -657,192 +677,294 @@ class WalkRunner:
 
         Consumes the reservation created by ``reserve_walk_run``: verifies the
         exact ``pending`` row exists for ``(run_id, book_id)``, atomically checks
-        (under ``storage.transaction``) that no OTHER ``walk_run`` row for the
-        same book is ``running``, transitions it to ``running``, and executes
-        with ``HeartbeatStorage(self._storage, run_id)``. It NEVER allocates,
-        generates, or discovers a replacement run ID — the caller owns identity.
+        (under ``storage.transaction``) that no OTHER ``walk_run`` row ANYWHERE
+        is ``running``, transitions it to ``running``, and executes
+        with ``HeartbeatStorage(self._storage, run_id, cancel_check=...)``. It
+        NEVER allocates, generates, or discovers a replacement run ID — the
+        caller owns identity.
 
-        The pending→running transition and the no-running-row guard are committed
-        together in a single ``BEGIN IMMEDIATE`` transaction (A2 serialization):
-        only rows already ``running`` block start, so the nine pre-reserved
-        ``pending`` rows of a batch never block sequential execution. When the
-        guard is violated (another run for the same book is already running) the
-        attempted reservation is deterministically terminalized to ``failed``
-        (pending row only) WITHOUT executing the walk, and ``{status:'failed'}``
-        is returned.
+        The pending→running transition and the GLOBAL no-running-row guard are
+        committed together in a single ``BEGIN IMMEDIATE`` transaction (A2
+        serialization). The guard spans ALL books and every admission path
+        (single walks, run-all reservations, synchronous reruns, background
+        execution): it blocks on any ``walk_run`` row with ``status='running'``
+        anywhere, not just same-book rows. Only rows already ``running`` block
+        start, so the nine pre-reserved ``pending`` rows of a batch never block
+        sequential execution. When the guard is violated (an active walk is
+        already running), the attempted reservation is deterministically
+        terminalized to ``failed`` (pending row only) WITHOUT executing the
+        walk, and ``{status:'failed'}`` is returned.
+
+        Cancellation is observed at checkpoints: the run is checked once before
+        start (a cancelled-before-start run finalizes ``cancelled`` and opens no
+        sink), and again during execution through a cancellation probe attached
+        to ``CANCEL_CHECK`` (consulted by the shared ``chat_completion`` LLM
+        boundary) and to ``HeartbeatStorage`` (consulted at its write boundary).
+        ``WalkCancelledError`` from a checkpoint finalizes the run to
+        ``cancelled``.
 
         A per-run walk-log sink is opened via ``self._log_service.open_run`` only
         after the pending row is verified and before module execution. When
         ``self._log_service`` is None (the default), no sink operations occur.
-        A sink-open failure never alters the DB outcome (row = truth); DB
-        finalization proceeds normally. When a sink is opened, the runner sets
-        ``WALK_LOG_SINK`` to it immediately before ``walk_module.execute(...)``
-        and resets it in ``finally`` on every terminal path (success, exception,
-        import failure, verification failure); a cancelled-before-start run opens
-        no sink. Exactly one terminal record is appended (via
-        ``log_service.close_run``) before the DB row is finalized.
+        A sink-open failure never alters the DB outcome (row = truth). When a
+        sink is opened, the runner sets ``WALK_LOG_SINK`` to it immediately
+        before ``walk_module.execute(...)`` and resets it in ``finally`` on
+        every terminal path; a cancelled-before-start run opens no sink. Exactly
+        one terminal record is appended (via ``log_service.close_run``) before
+        the DB row is finalized.
+
+        Every terminal exit path — success, walk exception, reportable errors,
+        verification failure, import failure, cancellation, and unexpected
+        ``BaseException`` — routes through ``_finish_run``, which (for non-
+        completed runs) runs run-owned cleanup (``_cleanup_run_owned``) WHILE
+        holding the global gate, then finalizes the row and releases the gate.
+        No ``running`` row is ever left behind and no replacement run can start
+        before this run's cleanup completes.
         """
         self._ensure_book(book_id)
-        with self._storage.transaction():
-            rows = self._storage.execute_query(
-                "SELECT status FROM walk_run WHERE run_id = ? AND book_id = ?",
-                (run_id, book_id),
-            )
-            if not rows or rows[0]["status"] != "pending":
-                return {
-                    "status": "failed",
-                    "error": f"Reservation not pending for run '{run_id}'",
-                }
-            # Serial-execution guard: another walk for the same book is already
-            # running, so this attempted reservation is blocked. Only rows with
-            # status 'running' block start — pending siblings never do. The
-            # blocked row is terminalized to 'failed' deterministically and the
-            # walk is NOT executed.
-            blocked = self._storage.execute_query(
-                "SELECT 1 FROM walk_run WHERE book_id = ? AND status = 'running' "
-                "LIMIT 1",
-                (book_id,),
-            )
-            if blocked:
-                error = f"Another walk is already running for book '{book_id}'"
-                self._storage.execute_update(
-                    "UPDATE walk_run SET status = 'failed', error = ?, "
-                    "finished_ms = ?, heartbeat_ms = ? "
-                    "WHERE run_id = ? AND status = 'pending'",
-                    (error, _now_ms(), _now_ms(), run_id),
-                )
-                logger.error(
-                    "Reserved walk '%s' blocked for book '%s': %s",
-                    walk_name,
-                    book_id,
-                    error,
-                )
-                return {"status": "failed", "error": error}
-            now = _now_ms()
-            self._storage.execute_update(
-                "UPDATE walk_run SET status = 'running', heartbeat_ms = ? "
-                "WHERE run_id = ?",
-                (now, run_id),
-            )
-        # Single cancellation dispatcher — honored before walk execution (and
-        # before any sink is opened, so a cancelled-before-start run opens none).
-        if self.is_cancel_requested(run_id):
-            self._finalize_run(run_id, "cancelled", error="Walk cancelled by user")
-            self._set_status(book_id, walk_name, "cancelled")
-            logger.info(
-                "Reserved walk '%s' cancelled before start for book '%s'",
-                walk_name,
-                book_id,
-            )
-            return {"status": "cancelled", "error": "Walk cancelled by user"}
-        self._set_status(book_id, walk_name, "running")
-        logger.info("Starting reserved walk '%s' for book '%s'", walk_name, book_id)
-
-        # Open the per-run sink AFTER the pending row is verified and BEFORE
-        # module execution. A setup failure is swallowed so DB finalization still
-        # proceeds normally (sink failure never alters DB). When no sink is
-        # opened (log_service is None, or open_run failed), the ContextVar is
-        # never set and no terminal record is written for this run.
-        sink = None
-        if self._log_service is not None:
-            try:
-                sink = self._log_service.open_run(
-                    run_id, book_id, walk_name, started_ms=now
-                )
-            except Exception:
-                logger.warning(
-                    "Walk log sink open failed; run_id=%s", run_id, exc_info=True
-                )
-
-        token = WALK_LOG_SINK.set(sink) if sink is not None else None
+        admitted = False
+        terminalized = False
         try:
+            with self._storage.transaction():
+                rows = self._storage.execute_query(
+                    "SELECT status FROM walk_run WHERE run_id = ? AND book_id = ?",
+                    (run_id, book_id),
+                )
+                if not rows or rows[0]["status"] != "pending":
+                    return {
+                        "status": "failed",
+                        "error": f"Reservation not pending for run '{run_id}'",
+                    }
+                # GLOBAL single-active-walk gate (P3-S1): spans ALL books and every
+                # admission path. Any 'running' walk_run row anywhere blocks this
+                # start. The check lives inside the same BEGIN IMMEDIATE transaction
+                # as the pending->running transition, so the gate is acquired
+                # atomically with run admission and contention is visible across
+                # books. Only rows already 'running' block start — pending siblings
+                # of a batch never do. When blocked, this attempted reservation's
+                # own pending row is deterministically terminalized to 'failed'
+                # WITHOUT executing the walk (pending-sibling terminalization
+                # semantics preserved).
+                blocked = self._storage.execute_query(
+                    "SELECT 1 FROM walk_run WHERE status = 'running' LIMIT 1", ()
+                )
+                if blocked:
+                    error = (
+                        "Another walk is already running "
+                        "(global single-active-walk gate)"
+                    )
+                    self._storage.execute_update(
+                        "UPDATE walk_run SET status = 'failed', error = ?, "
+                        "finished_ms = ?, heartbeat_ms = ? "
+                        "WHERE run_id = ? AND status = 'pending'",
+                        (error, _now_ms(), _now_ms(), run_id),
+                    )
+                    logger.error(
+                        "Reserved walk '%s' blocked for book '%s': %s",
+                        walk_name,
+                        book_id,
+                        error,
+                    )
+                    return {"status": "failed", "error": error}
+                now = _now_ms()
+                self._storage.execute_update(
+                    "UPDATE walk_run SET status = 'running', heartbeat_ms = ? "
+                    "WHERE run_id = ?",
+                    (now, run_id),
+                )
+                admitted = True
+            # Single cancellation dispatcher — honored before walk execution (and
+            # before any sink is opened, so a cancelled-before-start run opens none).
+            if self.is_cancel_requested(run_id):
+                self._finish_run(
+                    run_id,
+                    book_id,
+                    walk_name,
+                    "cancelled",
+                    error="Walk cancelled by user",
+                    emit_terminal=False,
+                )
+                logger.info(
+                    "Reserved walk '%s' cancelled before start for book '%s'",
+                    walk_name,
+                    book_id,
+                )
+                return {"status": "cancelled", "error": "Walk cancelled by user"}
+            self._set_status(book_id, walk_name, "running")
+            logger.info("Starting reserved walk '%s' for book '%s'", walk_name, book_id)
+
+            # Open the per-run sink AFTER the pending row is verified and BEFORE
+            # module execution. A setup failure is swallowed so DB finalization
+            # still proceeds normally (sink failure never alters DB). When no sink
+            # is opened (log_service is None, or open_run failed), the ContextVar
+            # is never set and no terminal record is written for this run.
+            sink = None
+            if self._log_service is not None:
+                try:
+                    sink = self._log_service.open_run(
+                        run_id, book_id, walk_name, started_ms=now
+                    )
+                except Exception:
+                    logger.warning(
+                        "Walk log sink open failed; run_id=%s", run_id, exc_info=True
+                    )
+
+            # Attach the cancellation probe for the duration of this run's
+            # execution. chat_completion (via CANCEL_CHECK) and HeartbeatStorage
+            # (via cancel_check) both consult it at their checkpoint boundaries;
+            # it raises WalkCancelledError if the owning run has been cancelled.
+            cancel_check = self._cancel_probe(run_id)
+            token = WALK_LOG_SINK.set(sink) if sink is not None else None
+            cancel_token = CANCEL_CHECK.set(cancel_check)
             try:
-                walk_module = self._load_walk_module(walk_name)
-            except ImportError as exc:
-                self._terminal_and_close(
+                try:
+                    walk_module = self._load_walk_module(walk_name)
+                except ImportError as exc:
+                    self._finish_run(
+                        run_id,
+                        book_id,
+                        walk_name,
+                        "failed",
+                        error=str(exc),
+                        payload={
+                            "error": str(exc),
+                            "traceback": traceback.format_exc(),
+                        },
+                    )
+                    terminalized = True
+                    return {"status": "failed", "error": str(exc)}
+                try:
+                    result = walk_module.execute(
+                        book_id,
+                        HeartbeatStorage(
+                            self._storage, run_id, cancel_check=cancel_check
+                        ),
+                        config,
+                    )
+                except WalkCancelledError:
+                    error = "Walk cancelled by user"
+                    self._finish_run(
+                        run_id,
+                        book_id,
+                        walk_name,
+                        "cancelled",
+                        error=error,
+                        payload={
+                            "error": error,
+                            "traceback": traceback.format_exc(),
+                        },
+                    )
+                    terminalized = True
+                    return {"status": "cancelled", "error": error}
+                except Exception as exc:  # noqa: BLE001 - walk boundary: record any failure
+                    self._finish_run(
+                        run_id,
+                        book_id,
+                        walk_name,
+                        "failed",
+                        error=str(exc),
+                        payload={
+                            "error": str(exc),
+                            "traceback": traceback.format_exc(),
+                        },
+                    )
+                    terminalized = True
+                    logger.error(
+                        "Reserved walk '%s' raised exception for book '%s': %s",
+                        walk_name,
+                        book_id,
+                        exc,
+                    )
+                    return {"status": "failed", "error": str(exc)}
+                # A3: a non-empty result['errors'] means the walk reported failures
+                # even though it returned without raising. Fail the run and preserve
+                # the raw result (including its errors) as result_json on the failed
+                # row. An empty or missing errors key retains the existing
+                # verification behavior below.
+                if isinstance(result, dict) and result.get("errors"):
+                    error = f"Walk '{walk_name}' reported errors for book '{book_id}'"
+                    self._finish_run(
+                        run_id,
+                        book_id,
+                        walk_name,
+                        "failed",
+                        result=result,
+                        error=error,
+                        payload={"error": error, "result": result},
+                    )
+                    terminalized = True
+                    logger.error(
+                        "Reserved walk '%s' reported %d error(s) for book '%s'",
+                        walk_name,
+                        len(result["errors"]),
+                        book_id,
+                    )
+                    return {"status": "failed", "error": error, "result": result}
+                if not self._run_verification(walk_name, book_id):
+                    error = f"Verification failed for walk '{walk_name}'"
+                    self._finish_run(
+                        run_id,
+                        book_id,
+                        walk_name,
+                        "failed",
+                        error=error,
+                        payload={
+                            "error": error,
+                            "traceback": traceback.format_exc(),
+                        },
+                    )
+                    terminalized = True
+                    logger.error(
+                        "Reserved walk '%s' verification failed for book '%s'",
+                        walk_name,
+                        book_id,
+                    )
+                    return {"status": "failed", "error": error, "result": result}
+                self._finish_run(
                     run_id,
-                    "failed",
-                    {"error": str(exc), "traceback": traceback.format_exc()},
-                )
-                self._finalize_run(run_id, "failed", error=str(exc))
-                self._set_status(book_id, walk_name, "failed")
-                logger.error("Failed to import walk '%s': %s", walk_name, exc)
-                return {"status": "failed", "error": str(exc)}
-            try:
-                result = walk_module.execute(
-                    book_id, HeartbeatStorage(self._storage, run_id), config
-                )
-            except Exception as exc:  # noqa: BLE001 - walk boundary: record any failure
-                self._terminal_and_close(
-                    run_id,
-                    "failed",
-                    {"error": str(exc), "traceback": traceback.format_exc()},
-                )
-                self._finalize_run(run_id, "failed", error=str(exc))
-                self._set_status(book_id, walk_name, "failed")
-                logger.error(
-                    "Reserved walk '%s' raised exception for book '%s': %s",
-                    walk_name,
                     book_id,
-                    exc,
-                )
-                return {"status": "failed", "error": str(exc)}
-            # A3: a non-empty result['errors'] means the walk reported failures
-            # even though it returned without raising. Fail the run and preserve
-            # the raw result (including its errors) as result_json on the failed
-            # row. An empty or missing errors key retains the existing
-            # verification behavior below.
-            if isinstance(result, dict) and result.get("errors"):
-                error = f"Walk '{walk_name}' reported errors for book '{book_id}'"
-                self._terminal_and_close(
-                    run_id,
-                    "failed",
-                    {"error": error, "result": result},
-                )
-                self._finalize_run(run_id, "failed", error=error, result=result)
-                self._set_status(book_id, walk_name, "failed")
-                logger.error(
-                    "Reserved walk '%s' reported %d error(s) for book '%s'",
                     walk_name,
-                    len(result["errors"]),
-                    book_id,
+                    "completed",
+                    result=result,
+                    payload={"status": "completed"},
                 )
-                return {"status": "failed", "error": error, "result": result}
-            if not self._run_verification(walk_name, book_id):
-                error = f"Verification failed for walk '{walk_name}'"
-                self._terminal_and_close(
+                terminalized = True
+                logger.info(
+                    "Completed reserved walk '%s' for book '%s'", walk_name, book_id
+                )
+                # Batch control reads the persisted terminal state below; preserve
+                # the walk module's raw summary for synchronous callers.
+                return result
+            finally:
+                # Reset the cancellation probe ContextVar on EVERY terminal path.
+                CANCEL_CHECK.reset(cancel_token)
+                # Reset the sink ContextVar on EVERY terminal path (success,
+                # exception, import failure, verification failure). token is None
+                # when no sink was opened, so the reset is a no-op then and the
+                # variable returns to its prior value in every case.
+                if token is not None:
+                    WALK_LOG_SINK.reset(token)
+        except BaseException:
+            # A BaseException (e.g. KeyboardInterrupt/SystemExit) escaped active
+            # execution without reaching a terminal path. If we were admitted and
+            # the row is still 'running', terminalize it now via _finish_run
+            # (run-owned cleanup runs first, while the gate is held) so no
+            # 'running' row is stranded and the global gate is released.
+            if admitted and not terminalized:
+                error = "Run terminated by unexpected exception"
+                self._finish_run(
                     run_id,
-                    "failed",
-                    {"error": error, "traceback": traceback.format_exc()},
-                )
-                self._finalize_run(run_id, "failed", error=error)
-                self._set_status(book_id, walk_name, "failed")
-                logger.error(
-                    "Reserved walk '%s' verification failed for book '%s'",
-                    walk_name,
                     book_id,
+                    walk_name,
+                    "failed",
+                    error=error,
+                    payload={
+                        "error": error,
+                        "traceback": traceback.format_exc(),
+                    },
                 )
-                return {
-                    "status": "failed",
-                    "error": error,
-                    "result": result,
-                }
-            self._terminal_and_close(run_id, "completed", {"status": "completed"})
-            self._finalize_run(run_id, "completed", result=result)
-            self._set_status(book_id, walk_name, "completed")
-            logger.info(
-                "Completed reserved walk '%s' for book '%s'", walk_name, book_id
-            )
-            # Batch control reads the persisted terminal state below; preserve
-            # the walk module's raw summary for synchronous callers.
-            return result
-        finally:
-            # Reset the sink ContextVar on EVERY terminal path (success,
-            # exception, import failure, verification failure). token is None
-            # when no sink was opened, so the reset is a no-op then and the
-            # variable returns to its prior value in every case.
-            if token is not None:
-                WALK_LOG_SINK.reset(token)
+                terminalized = True
+            raise
 
     def run_all_walks_reserved(
         self,
@@ -930,6 +1052,111 @@ class WalkRunner:
             logger.warning(
                 "Walk log terminal/close failed; run_id=%s", run_id, exc_info=True
             )
+
+    def _cancel_probe(self, run_id: str) -> Callable[[], None]:
+        """Return a per-run cancellation probe for checkpoint boundaries.
+
+        The probe evaluates ``is_cancel_requested(run_id)`` and raises
+        :class:`WalkCancelledError` when the owning run has been cancelled. It
+        is attached to ``CANCEL_CHECK`` (consumed by ``chat_completion``) and to
+        ``HeartbeatStorage`` (consumed at the write boundary) for the duration
+        of a run's execution.
+        """
+
+        def _probe() -> None:
+            if self.is_cancel_requested(run_id):
+                raise WalkCancelledError(run_id)
+
+        return _probe
+
+    def _cleanup_run_owned(self, run_id: str) -> None:
+        """Idempotently delete run-owned generated output for a non-completed run.
+
+        Aligned with the CONTRACTS.md ownership matrix: for a walk that stopped
+        WITHOUT completing, delete only generated records attributable to THIS
+        run — ``walk_review_item`` rows whose ``run_id`` is this run and whose
+        ``status`` is ``'pending'``, ``character_scene_generated`` rows whose
+        ``source_run_id`` is this run, and ``workbench_provenance`` rows whose
+        ``run_id`` is this run.
+
+        NEVER touched (protected): later-run overwrites (different
+        ``source_run_id``/``generation_revision``), manual/human rows
+        (``human_override``/manual projections), character identity / junctions /
+        alias merges, spine, persona revisions, voice assignments, character-span
+        attribution, ``span.instruct`` delivery, resolved/superseded review
+        history, and NULL-run / direct rows. The cancelled/interrupted
+        ``walk_run`` row and its audit history are preserved (the row is
+        finalized separately by the caller).
+
+        Idempotent: a second call finds no rows to delete and performs no
+        writes. Runs while the global single-active-walk gate is still held
+        (before the run's admission is released), so no replacement run can
+        start mid-cleanup.
+
+        Cleanup is skip-verified: each table is only written when it actually
+        holds run-owned rows for this run. A failed/cancelled run that never
+        produced output therefore performs NO write traffic — the idempotent
+        no-op is decided by a read, keeping the write boundary quiescent on the
+        common no-output path.
+        """
+        _owned_delete_targets = (
+            (
+                "walk_review_item",
+                "run_id = ? AND status = 'pending'",
+            ),
+            ("character_scene_generated", "source_run_id = ?"),
+            ("workbench_provenance", "run_id = ?"),
+        )
+        for table, where in _owned_delete_targets:
+            # Only delete rows actually attributable to THIS run. The gate is
+            # held (no concurrent walk can write owned rows for this run), so
+            # check-then-delete has no TOCTOU hazard here.
+            present = self._storage.execute_query(
+                f"SELECT 1 FROM {table} WHERE {where} LIMIT 1", (run_id,)
+            )
+            if present:
+                self._storage.execute_delete(
+                    f"DELETE FROM {table} WHERE {where}", (run_id,)
+                )
+
+    def _finish_run(
+        self,
+        run_id: str,
+        book_id: str,
+        walk_name: str,
+        status: str,
+        *,
+        result: dict | None = None,
+        error: str | None = None,
+        payload: dict[str, Any] | None = None,
+        emit_terminal: bool = True,
+    ) -> None:
+        """Single terminalizer for a run: close sink, clean up, finalize the row.
+
+        Ordering guarantees (contract P3-S3/P3-S4):
+
+        1. ``emit_terminal`` — append exactly one terminal log record via
+           ``_terminal_and_close`` (close_run fires BEFORE the DB row is
+           finalized). Suppressed for a cancelled-before-start run, which opens
+           no sink and must emit no terminal record.
+        2. For any non-``completed`` status, run run-owned cleanup
+           (``_cleanup_run_owned``) while the global gate is still held, so no
+           replacement run can start before cleanup completes.
+        3. Finalize the ``walk_run`` row (``_finalize_run``) and mirror the
+           status into the in-memory ``_status`` dict. Finalizing the row out of
+           ``running`` is what releases the global gate (the next admission sees
+           no ``running`` row).
+
+        ``result``/``error`` mirror ``_finalize_run``'s three branches: both
+        (reported-errors case preserves raw result_json alongside error),
+        result only (completed), or error only (failed/cancelled).
+        """
+        if emit_terminal:
+            self._terminal_and_close(run_id, status, payload)
+        if status != "completed":
+            self._cleanup_run_owned(run_id)
+        self._finalize_run(run_id, status, error=error, result=result)
+        self._set_status(book_id, walk_name, status)
 
     def get_walk_status(self, book_id: str, walk_name: str) -> str:
         """Return the current status of a walk for a book.

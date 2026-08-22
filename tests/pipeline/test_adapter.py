@@ -685,6 +685,183 @@ class TestTransactionContextManager:
         assert rows == []
 
 
+class TestSavepoint:
+    """PipelineStorage.savepoint() — shared by both adapters (P2-S2).
+
+    Proves the saved line: RELEASE on normal exit, ROLLBACK TO + RELEASE on
+    both ``Exception`` and ``BaseException``, nesting, autocommit implicit
+    transaction (atomic unit) with rollback-on-failure and release-commit on
+    success, cross-thread rejection via the owner guard,
+    and connection reusability (no dangling savepoint) after failure.
+    """
+
+    @pytest.mark.parametrize("adapter_name", _ADAPTER_FIXTURES)
+    def test_releases_on_clean_exit(self, adapter_name, request):
+        adapter = request.getfixturevalue(adapter_name)
+        with adapter.transaction():
+            with adapter.savepoint("sp_clean"):
+                adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("s1",))
+            # Savepoint released: outer transaction still open and usable.
+            assert adapter.get_connection().in_transaction is True
+            adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("s2",))
+        assert adapter.get_connection().in_transaction is False
+        rows = adapter.execute_query("SELECT id FROM series")
+        assert {r["id"] for r in rows} == {"s1", "s2"}
+
+    @pytest.mark.parametrize("adapter_name", _ADAPTER_FIXTURES)
+    def test_nested_savepoints(self, adapter_name, request):
+        adapter = request.getfixturevalue(adapter_name)
+        with adapter.transaction(), adapter.savepoint("sp_outer"):
+            adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("a",))
+            with adapter.savepoint("sp_mid"):
+                adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("b",))
+                with (
+                    pytest.raises(RuntimeError, match="deep"),
+                    adapter.savepoint("sp_deep"),
+                ):
+                    adapter.execute_insert(
+                        "INSERT INTO series (id) VALUES (?)", ("discard",)
+                    )
+                    raise RuntimeError("deep")
+        # The deepest savepoint's write rolled back; a and b committed.
+        rows = adapter.execute_query("SELECT id FROM series")
+        assert {r["id"] for r in rows} == {"a", "b"}
+
+    @pytest.mark.parametrize("adapter_name", _ADAPTER_FIXTURES)
+    def test_rollback_release_on_exception(self, adapter_name, request):
+        adapter = request.getfixturevalue(adapter_name)
+        with adapter.transaction():
+            with pytest.raises(RuntimeError, match="boom"), adapter.savepoint("sp_exc"):
+                adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("x",))
+                raise RuntimeError("boom")
+            # ROLLBACK TO + RELEASE must leave the outer transaction usable.
+            assert adapter.get_connection().in_transaction is True
+            adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("kept",))
+        # The failed savepoint's write is gone; the later write survives.
+        rows = adapter.execute_query("SELECT id FROM series")
+        assert [r["id"] for r in rows] == ["kept"]
+
+    @pytest.mark.parametrize("adapter_name", _ADAPTER_FIXTURES)
+    def test_rollback_release_on_base_exception(self, adapter_name, request):
+        adapter = request.getfixturevalue(adapter_name)
+        with adapter.transaction():
+            with pytest.raises(KeyboardInterrupt), adapter.savepoint("sp_ki"):
+                adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("y",))
+                raise KeyboardInterrupt
+            # BaseException path also releases the savepoint: connection usable.
+            assert adapter.get_connection().in_transaction is True
+            adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("kept2",))
+        rows = adapter.execute_query("SELECT id FROM series")
+        assert [r["id"] for r in rows] == ["kept2"]
+
+    @pytest.mark.parametrize("adapter_name", _ADAPTER_FIXTURES)
+    def test_autocommit_opens_implicit_transaction_release_commits(
+        self, adapter_name, request
+    ):
+        adapter = request.getfixturevalue(adapter_name)
+        # In autocommit (no owning transaction) the raw SAVEPOINT opens an
+        # implicit transaction, so the block runs as an atomic unit.
+        with adapter.savepoint("sp_auto"):
+            assert adapter.get_connection().in_transaction is True
+            adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("auto",))
+        # RELEASE committed the implicit transaction; writes are preserved and
+        # the connection is back in autocommit.
+        assert adapter.get_connection().in_transaction is False
+        rows = adapter.execute_query("SELECT id FROM series")
+        assert [r["id"] for r in rows] == ["auto"]
+
+    @pytest.mark.parametrize("adapter_name", _ADAPTER_FIXTURES)
+    def test_autocommit_failure_rolls_back_preceding_write(self, adapter_name, request):
+        adapter = request.getfixturevalue(adapter_name)
+        adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("pre",))
+        with pytest.raises(RuntimeError, match="boom"), adapter.savepoint("sp_auto"):
+            # A write BEFORE the failing write in the same block must be
+            # undone by ROLLBACK TO SAVEPOINT.
+            adapter.execute_update(
+                "UPDATE series SET id = ? WHERE id = ?", ("pre-updated", "pre")
+            )
+            raise RuntimeError("boom")
+        # The implicit transaction committed nothing on failure: the preceding
+        # UPDATE is rolled back.
+        assert adapter.get_connection().in_transaction is False
+        rows = adapter.execute_query("SELECT id FROM series")
+        assert [r["id"] for r in rows] == ["pre"]
+
+    @pytest.mark.parametrize("adapter_name", _ADAPTER_FIXTURES)
+    def test_cross_thread_savepoint_rejected(self, adapter_name, request):
+        adapter = request.getfixturevalue(adapter_name)
+        captured: dict[str, ConcurrentTransactionError] = {}
+
+        def savepoint_from_other_thread() -> None:
+            try:
+                with adapter.savepoint("sp_other"):
+                    pass
+            except ConcurrentTransactionError as exc:
+                captured["error"] = exc
+
+        with adapter.transaction():
+            thread = threading.Thread(target=savepoint_from_other_thread)
+            thread.start()
+            thread.join()
+            assert isinstance(captured.get("error"), ConcurrentTransactionError)
+            # The owner thread can still use savepoints.
+            with adapter.savepoint("sp_owner"):
+                adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("o",))
+        rows = adapter.execute_query("SELECT id FROM series")
+        assert [r["id"] for r in rows] == ["o"]
+
+    @pytest.mark.parametrize("adapter_name", _ADAPTER_FIXTURES)
+    def test_invalid_savepoint_name_rejected(self, adapter_name, request):
+        adapter = request.getfixturevalue(adapter_name)
+        with pytest.raises(ValueError), adapter.savepoint("bad name;"):
+            pass
+
+    @pytest.mark.parametrize("adapter_name", _ADAPTER_FIXTURES)
+    def test_each_level_releases_only_its_own(self, adapter_name, request):
+        """A clean nested exit RELEASE-commits only its own level; a later inner
+        failure rolls back only ITS OWN write, leaving every outer level usable
+        (P5-S3 adversarial nesting)."""
+        adapter = request.getfixturevalue(adapter_name)
+        with adapter.transaction(), adapter.savepoint("sp1"):
+            adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("a",))
+            # Inner savepoint releases cleanly -> its write commits into sp1.
+            with adapter.savepoint("sp2"):
+                adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("b",))
+            # A second inner level fails -> rolls back only ITS OWN write.
+            with (
+                pytest.raises(RuntimeError, match="c2"),
+                adapter.savepoint("sp2b"),
+            ):
+                adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("c",))
+                raise RuntimeError("c2")
+            # sp1 is still open and usable.
+            assert adapter.get_connection().in_transaction is True
+        rows = adapter.execute_query("SELECT id FROM series")
+        assert {r["id"] for r in rows} == {"a", "b"}
+
+    @pytest.mark.parametrize("adapter_name", _ADAPTER_FIXTURES)
+    def test_repeated_failures_leave_connection_reusable(self, adapter_name, request):
+        """Many consecutive failing savepoints each roll back + release their own
+        block; the owning transaction stays open and usable throughout, and no
+        dangling savepoint remains (P5-S3 adversarial reusability)."""
+        adapter = request.getfixturevalue(adapter_name)
+        with adapter.transaction():
+            for i in range(3):
+                with (
+                    pytest.raises(RuntimeError, match="fail"),
+                    adapter.savepoint(f"sp_f{i}"),
+                ):
+                    adapter.execute_insert(
+                        "INSERT INTO series (id) VALUES (?)", (f"x{i}",)
+                    )
+                    raise RuntimeError("fail")
+            # Every rollback + release left the transaction open and usable.
+            assert adapter.get_connection().in_transaction is True
+            adapter.execute_insert("INSERT INTO series (id) VALUES (?)", ("final",))
+        rows = adapter.execute_query("SELECT id FROM series")
+        assert [r["id"] for r in rows] == ["final"]
+
+
 class TestIsolationLevelAutocommit:
     """Both adapters must run in explicit autocommit mode (isolation_level=None)."""
 

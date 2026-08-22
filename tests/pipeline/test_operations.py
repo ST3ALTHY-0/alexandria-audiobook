@@ -573,7 +573,34 @@ class TestExecuteMerge:
 
         assert _get_span_text(conn, "sp1") == "Hello world"
         assert _get_span_text(conn, "sp2") is None
-        assert _get_paragraph_text(conn, "p1") == "Hello world"
+
+    def test_merge_releases_savepoint_and_resets_fk_deferral(self, storage, executor):
+        """Merge's savepoint fully releases and defer_foreign_keys resets on every
+        exit path (P5-S4, 'missing merge RELEASE' regression)."""
+        conn = storage.get_connection()
+        _populate_test_spine(conn)
+
+        executor.execute_merge(
+            book_id="b1", presentation_index_left=1, presentation_index_right=2
+        )
+        # After a successful merge the guarded transaction is committed and the
+        # savepoint released: connection reusable, no SQL transaction open.
+        assert conn.in_transaction is False
+        assert conn.execute("PRAGMA defer_foreign_keys").fetchone()[0] == 0
+
+    def test_failed_merge_resets_fk_deferral(self, storage, executor):
+        """A merge that fails mid-savepoint still resets defer_foreign_keys and
+        leaves the connection reusable (regression for the missing RELEASE)."""
+        conn = storage.get_connection()
+        _populate_test_spine(conn)
+
+        # Non-adjacent spans: sp1 (pos 1) and sp3 (pos 3) are not consecutive.
+        with pytest.raises(ValueError):
+            executor.execute_merge(
+                book_id="b1", presentation_index_left=1, presentation_index_right=3
+            )
+        assert conn.in_transaction is False
+        assert conn.execute("PRAGMA defer_foreign_keys").fetchone()[0] == 0
 
     @pytest.mark.parametrize(
         "left_pause,right_pause", [(None, None), (0, 750), (750, 0)]

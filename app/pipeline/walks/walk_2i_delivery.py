@@ -360,9 +360,7 @@ def _process_span(
     prior_instruct = _get_prior_instruct(span_id, storage)
 
     # Store instruct in span table
-    conn = storage.get_connection()
-    conn.execute("SAVEPOINT walk_2i_delivery")
-    try:
+    with storage.savepoint("walk_2i_delivery"):
         storage.execute_update(
             "UPDATE span SET instruct = ? WHERE id = ?",
             (instruct, span_id),
@@ -374,12 +372,7 @@ def _process_span(
                 span_id=span_id,
                 prior_value=prior_instruct,
             )
-        conn.execute("RELEASE SAVEPOINT walk_2i_delivery")
         committed_target_ids.append(span_id)
-    except Exception:
-        conn.execute("ROLLBACK TO SAVEPOINT walk_2i_delivery")
-        conn.execute("RELEASE SAVEPOINT walk_2i_delivery")
-        raise
 
     result["instructs_generated"] += 1
 

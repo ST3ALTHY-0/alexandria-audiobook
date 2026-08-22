@@ -15,6 +15,17 @@ class PipelineStorage(ABC):
     def execute_insert(self, sql: str, params: tuple = ()) -> int  # returns lastrowid
     def execute_update(self, sql: str, params: tuple = ()) -> int  # returns rowcount
     def execute_delete(self, sql: str, params: tuple = ()) -> int  # returns rowcount
+    def savepoint(self, name: str) -> Iterator[None]
+    # Adapter-owned nested savepoint primitive, implemented identically by BOTH
+    # SQLiteAdapter and InMemorySQLiteAdapter. Enforces connection owner-thread
+    # semantics: a raw SAVEPOINT is opened on EVERY entry including autocommit
+    # (issuing SAVEPOINT in autocommit makes SQLite implicitly open a
+    # transaction, so the wrapped block runs as an atomic unit), RELEASE-COMMITs
+    # on normal exit, and on Exception AND BaseException (incl.
+    # KeyboardInterrupt/SystemExit) issues ROLLBACK TO then RELEASE, re-raising
+    # and leaving the connection reusable. Supports nesting via the transaction
+    # ownership/depth machinery. Full contract in the Walk Runner section's
+    # Savepoint Ownership Override.
 ```
 
 ### SQLiteAdapter(PipelineStorage)
@@ -134,10 +145,107 @@ class WalkRunner:
     def __init__(self, storage: PipelineStorage)
     def run_walk(self, walk_name: str, book_id: str, config: dict) -> dict
     def run_all_walks(self, book_id: str, config: dict) -> dict
-    # Serial execution — walks run one at a time
+    # Process-wide single-active-walk invariant: GLOBAL serial execution, at
+    # most one active walk across ALL books and every entry path (single walk,
+    # run-all reservation, synchronous workbench rerun, background execution).
+    # The gate spans books — never a per-book lock — because all walks share the
+    # same storage connection/write path.
     # Each walk consumes prior walk's output
-    # Walk status: pending/running/completed/failed
+    # Walk status: pending/running/completed/failed + interrupted/cancelled
 ```
+
+### Critical Walk Concurrency and Cancellation Override
+The post-cutover critical fix supersedes prior wording ANYWHERE in this
+document — including the append-only register sections — that allowed
+different books to walk concurrently, treated cancellation as only a
+persisted/requested flag (`cancel_requested`), restricted cleanup to
+startup-only stale-row reconciliation or retention-only GC, or prohibited
+deletion on cancellation. This section reconciles those prior lines (e.g. the
+`cancel_walks` register entry and the `cancel_requested`-only clauses).
+
+- **Process-wide single-active-walk invariant.** Exactly one active walk may
+exist across ALL books and all entry paths. A walk on book A and a walk on
+book B are mutual contention — they must never overlap. The gate is
+process-level (shared across books), not a per-book lock, because all walks
+share the same storage connection and write path. Admission, run lifecycle,
+and cleanup are serialized by this single global gate.
+- **Atomic acquisition/release in `finally`.** The gate is acquired atomically
+— admission and run creation commit together so two racers cannot both be
+admitted — before active execution begins. It is released in a `finally`
+path that runs only after the run reaches a TERMINAL state
+(`completed|failed|interrupted|cancelled`) AND run-owned cleanup completes.
+A run faulting with `BaseException` follows the same `finally` release.
+Cleanup runs only after active execution has STOPPED; the gate is never
+released while the run's ownership scope is still being cleaned.
+- **Cancellation states.** Cancellation is a REQUEST honored at safe
+checkpoints, not a prerequisite for admission and not a gate-freeing event. A
+run passes through observable states: `running` (cancel requested, not yet
+observed) → checkpoint-stop active execution at safe unit boundaries →
+terminal `cancelled` (or `interrupted`/`failed` for other termination causes)
+→ post-stop run-owned cleanup → gate released. Every terminal path —
+cancellation, verifier/module failure, unexpected `BaseException` — releases
+the gate via the same `finally`.
+- **Cancellation cleanup semantics.** Cancellation cleanup runs only AFTER
+active execution has stopped (terminal status reached) and is scoped to
+records demonstrably OWNED by that run (`run_id`). It may remove only
+run-owned generated output and pending run-owned review items. The
+cancelled/interrupted `walk_run` row and audit-safe history are PRESERVED —
+cleanup never deletes `walk_run` history, human/manual rows, shared identity
+or spine data, other-run writes, or unprovenanced rows.
+- **Run-output ownership matrix.** Cleanup may remove only rows it can prove
+are owned by the cancelled run, per the Run-Owned versus Protected Data
+matrix below. Everything else is protected.
+- **Onboarding / re-onboarding / book-switching coordination.** Onboarding,
+re-onboarding, and book switching wait for cancellation, active execution
+termination, AND cleanup before replacement state becomes current; replacement
+may not become current while any active writer could still run. Observable
+API/frontend behavior: while a walk is active, a replacement attempt returns
+a documented CONFLICT result (HTTP `503` + `Retry-After`, consistent with
+existing contention) or opts to WAIT for the active run to reach terminal
+status and complete cleanup before proceeding — it never optimistically
+resets `currentBookId`/persisted identity or clears data ahead of the active
+run.
+
+### Run-Owned versus Protected Data (Ownership Matrix)
+Cleanup of a cancelled/interrupted run keys on `run_id` (or generation /
+provenance linkage) AND latest-writer/status/manual guards. It is idempotent:
+re-running cleanup for the same run is safe and changes nothing further.
+
+| Rows | Owned by the run → may be removed | Protected → must NOT be blanket-deleted |
+|------|-----------------------------------|------------------------------------------|
+| Generated presence (`character_scene_generated`) | projection/provenance originating from THIS run (`source_run_id`/`generation_revision` = this run) | later-run overwrites, any row with `human_override=1` or a manual projection, active human absence (`character_scene_absence`), resolved/superseded history |
+| Workbench provenance (`workbench_provenance`) | `run_id = this run` rows for targets the run generated | other-run rows, human/derived-source rows, provenance referenced by a live/manual decision |
+| Pending review items (`walk_review_item`) | `run_id = this run` AND `status = pending` | resolved/superseded/stale items, items backed by a human decision, other-run items |
+| Character identity & junctions (`character`, `character_scene`, `character_span`, aliases) | — (never blanket-owned) | human/manual-flagged rows, shared/merged identity, `character_alias_merge` (reversible history), merged-member records |
+| Spine (book/chapter/scene/paragraph/span/edges) | — (never blanket-owned) | all — spine is structural, not run-owned |
+| Persona / voice assignment / attribution / delivery | — (never blanket-owned) | manual persona revisions, `voice_assignment_id`, character_span attribution, `span.instruct` delivery |
+| Unprovenanced rows (NULL `run_id` / direct-call rows) | — (never blanket-owned) | require a safe non-delete/convergence policy or explicit-undo — never deleted by cancellation cleanup |
+
+“Blanket-deleted” means cleanup never issues table-wide or ownership-unaware
+deletes; ownership is proven per row via `run_id` plus status/manual guards.
+Completed/other-run/human data and the retained run record are always
+preserved.
+
+### Savepoint Ownership Override
+- Raw `SAVEPOINT`, `ROLLBACK TO SAVEPOINT`, and `RELEASE SAVEPOINT` statements
+are not permitted through `get_connection()` in pipeline callers. They must
+use `PipelineStorage.savepoint(name)` so the shared connection owner guard is
+armed.
+- `savepoint(name)` applies to BOTH `SQLiteAdapter` and `InMemorySQLiteAdapter`,
+behaviorally aligned. A savepoint may be opened on the connection's owning
+thread while the owning transaction is open; in autocommit (`_txn_depth == 0`)
+a raw `SAVEPOINT` is still issued, which makes SQLite implicitly open a
+transaction so the wrapped block is atomic, and `RELEASE SAVEPOINT` on normal
+exit COMMITs it, preserving the block's writes.
+- Nested behavior: nested `savepoint()` calls are supported via the existing
+transaction ownership/depth machinery; each context manager creates its own
+savepoint level and `RELEASE`s only its own level on normal exit.
+- Rollback-and-release on ALL exception classes: on `Exception` and
+`BaseException` (incl. `KeyboardInterrupt`/`SystemExit`), the context manager
+issues `ROLLBACK TO SAVEPOINT <name>` followed by `RELEASE SAVEPOINT <name>`,
+re-raises, and leaves the connection reusable (including within an already-
+open outer transaction) with no dangling transaction/savepoint. This
+supersedes the prior bare-connection savepoint pattern.
 
 ## Walks (9 serial walks, 2a-2i)
 
@@ -191,9 +299,10 @@ def execute(book_id: str, storage: PipelineStorage, config: dict) -> dict
 ```python
 def execute(book_id: str, storage: PipelineStorage, config: dict) -> dict
 # resolve_task_llm('character_description') → temperature=0.1, LOCAL
-# Generates character descriptions, stores in character_metadata (key='description') via UPSERT
+# Generates character descriptions, stores in book-scoped persona_revision rows
 # IMPLEMENTED (Plan D, Phase 3)
-# NOTE: per plan, description lives in character_metadata not character.description (takes precedence over CONTRACTS listing)
+# NOTE: per plan, description lives in book-scoped persona_revision (fields.identity),
+#   not character_metadata (key='description') nor character.description — takes precedence over CONTRACTS listing
 ```
 
 ### Walk 2g: Voice Audition
@@ -924,6 +1033,7 @@ Modified (same path, new row-backed behavior):
 - `POST /api/pipeline/cancel_render` — sets `cancelling` (api_export)
 - `GET /api/pipeline/download/{job_id}` — reads rows; FileResponse-404 subclass (api_export)
 - `POST /api/pipeline/cancel_walks` — persists `walk_run.cancel_requested=1` (api_walks)
+  - REVISED BY PLAN R (see the Walk Runner section's Critical Walk Concurrency and Cancellation Override above): `cancel_walks` requests cancellation AND, once active execution stops, triggers post-stop run-owned cleanup (run-owned generated/pending rows only); it no longer merely persists `cancel_requested=1`. Replacement/contention returns `503` + `Retry-After` or waits.
 - `GET /api/pipeline/review/{book_id}` — union: junction live query + `walk_review_item`; `walkitem:` prefixed item_ids (api_review)
 - `POST /api/pipeline/review/accept|reject|override` — prefix dispatch (`junction:`/`walkitem:`); walk-side value-restore (api_review)
 - `POST /api/config` — raw-JSON merge, validation-only AppConfig, `schema_version` stamp (app.py)
@@ -1050,11 +1160,11 @@ Existing `GET /review/{book_id}` and review action routes remain the resolution 
 - Boundary reads return `list[BoundaryOverrideDTO]` for active rows only. Writes use `BoundaryOverrideWriteDTO`; DELETE uses the URL `override_id` and `{base_revision}` and returns the retained inactive `BoundaryOverrideDTO` plus the new revision. Applying validates the stable anchor and payload, writes the decision and generation revision atomically, and makes it visible to the next 2a run; deletion records an inverse decision and never removes history.
 - Rerun request is `{walk_name,scope,scene_ids,preserve_manual_decisions,base_revision}` and response is `{run_id,status,scope,invalidated_walks,generation_revision}`. `scope` is exactly `book|scenes`; `scenes` requires a non-empty reachable scene list; 2c rejects `scenes` with 422 because alias resolution is book-global.
 
-Rerun reconciliation is exact: mark only affected generated provenance/review rows stale, execute one run, upsert by stable target key, preserve `human_override=1` and active absence, and supersede only prior generated `walk_review_item` rows for touched targets after successful commit. A failed/partial run leaves prior successful rows and revision live; its generated writes are rolled back when atomic, or tagged to the failed run and excluded from reads when a walk reports partial progress. 2b invalidates 2c+2d, 2c invalidates 2d, and 2d invalidates neither upstream walk. `walk_run` follows pending→running→completed|failed|interrupted|cancelled; cancellation sets `cancel_requested`, and stale running rows are reconciled at startup. `POST /cancel_walks` and all contention paths return 503 with `Retry-After: 5` where the universal contract requires it.
+Rerun reconciliation is exact: mark only affected generated provenance/review rows stale, execute one run, upsert by stable target key, preserve `human_override=1` and active absence, and supersede only prior generated `walk_review_item` rows for touched targets after successful commit. A failed/partial run leaves prior successful rows and revision live; its generated writes are rolled back when atomic, or tagged to the failed run and excluded from reads when a walk reports partial progress. 2b invalidates 2c+2d, 2c invalidates 2d, and 2d invalidates neither upstream walk. `walk_run` follows pending→running→completed|failed|interrupted|cancelled; cancellation sets `cancel_requested` [REVISED BY PLAN R — cancellation is now a request honored at safe checkpoints followed by post-stop run-owned cleanup, not a mere `cancel_requested` flag; see Critical Walk Concurrency and Cancellation Override above], and stale running rows are reconciled at startup. `POST /cancel_walks` and all contention paths return 503 with `Retry-After: 5` where the universal contract requires it.
 
 Alias commit is reversible: it records both member voice assignments and all affected target keys in `consequence_json`; unmerge creates a new `workbench_decision` that changes the merge to `undone`, restores member projection and voice assignments only when no newer human assignment exists, reactivates affected review items, and returns 409 otherwise. Snapshot load/restore remains blocked during active workbench runs and uses existing `project_snapshot` schema/version validation. Frontend integration is `frontend/index.html`, `frontend/src/main.ts`, `frontend/src/api.ts`, `frontend/src/state.ts`, `frontend/src/tabs/workbench.ts`, and `frontend/tests/frontend/test_workbench.test.ts`; compiled output is committed in `app/static/dist/` and must pass the existing build/diff gate.
 
-Decision status transitions are `active → undone|superseded|conflict`; `undone` and `superseded` are terminal, while `conflict` is terminal until a new human decision is created. `walk_review_item` transitions remain `pending → resolved|superseded|stale`; generated items are superseded only after successful run commit, and existing human-overridden junctions remain live. `human_override=1` is never cleared by reconciliation. `workbench_provenance` and `walk_run` rows are retained for failed, partial, cancelled, and interrupted runs; only the successful generation is projected by default. The existing `GET /api/pipeline/walks/{book_id}/runs`, `POST /api/pipeline/cancel_walks`, review union/action routes, and `project_snapshot` load/save contracts are consumed unchanged by the workbench.
+Decision status transitions are `active → undone|superseded|conflict`; `undone` and `superseded` are terminal, while `conflict` is terminal until a new human decision is created. `walk_review_item` transitions remain `pending → resolved|superseded|stale`; generated items are superseded only after successful run commit, and existing human-overridden junctions remain live. `human_override=1` is never cleared by reconciliation. `workbench_provenance` and `walk_run` rows are retained for failed, partial, cancelled, and interrupted runs [REVISED BY PLAN R — post-stop cleanup may remove run-owned `workbench_provenance` rows for cancelled/interrupted runs; only the `walk_run` history record is always preserved. See Critical Walk Concurrency and Cancellation Override above]; only the successful generation is projected by default. The existing `GET /api/pipeline/walks/{book_id}/runs`, `POST /api/pipeline/cancel_walks`, review union/action routes, and `project_snapshot` load/save contracts are consumed unchanged by the workbench.
 
 ### Behavioral contracts
 

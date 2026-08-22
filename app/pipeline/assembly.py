@@ -144,6 +144,38 @@ def get_book_version(book_id: str, storage: PipelineStorage) -> int:
     return rows[0]["version"]
 
 
+def has_active_run(book_id: str, storage: PipelineStorage) -> bool:
+    """Return True if any ``walk_run`` row for *book_id* is active.
+
+    Active means a ``pending`` or ``running`` run — a writer that could still
+    execute or is currently executing. This is the single coordination check
+    the API layer uses before clearing/replacing book data (CONTRACTS.md
+    "Onboarding / re-onboarding / book-switching coordination"): replacement
+    state must never become current while an active writer could still run.
+
+    The ``walk_run`` table is authoritative for active runs (rows = truth), so
+    this reads it directly rather than relying on in-memory status caches.
+
+    Parameters
+    ----------
+    book_id:
+        Primary key of the book (may or may not exist).
+    storage:
+        An active ``PipelineStorage`` implementation.
+
+    Returns
+    -------
+    bool
+        True if at least one pending/running walk_run row exists for *book_id*.
+    """
+    rows = storage.execute_query(
+        "SELECT 1 FROM walk_run WHERE book_id = ? "
+        "AND status IN ('pending', 'running') LIMIT 1",
+        (book_id,),
+    )
+    return bool(rows)
+
+
 def _clear_span_junctions(
     storage: PipelineStorage, book_id: str, scene_ids: list[str]
 ) -> None:

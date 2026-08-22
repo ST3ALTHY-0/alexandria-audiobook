@@ -20,6 +20,7 @@ import {
   renderWalkStatuses,
   startWalkPolling,
   stopWalkPolling,
+  resetScriptSessionForTests,
   initScript,
 } from '../../src/tabs/script';
 import { WALK_ORDER, WALK_DISPLAY_NAMES } from '../../src/pipeline/walks';
@@ -556,6 +557,14 @@ describe('Script Tab — Cancel Walks with Retry-once (Plan F, Phase 2)', () => 
 
   /** Drive a real onboard through the UI so currentBookId gets set. */
   async function onboardViaUi(): Promise<void> {
+    // Reset the shared module session first so currentBookId starts null: with
+    // the P4-S3 coordination (cleanup sniff runs BEFORE the onboard POST), a
+    // stale currentBookId would make handleOnboard sniff/abort against a prior
+    // book instead of onboarding cleanly for this test. Also clear the persisted
+    // state id, since initPipelineUI() re-derives currentBookId from it on the
+    // DOMContentLoaded dispatch below.
+    resetScriptSessionForTests();
+    state.pipelineBookId = null;
     const fileInput = document.getElementById('file-upload') as HTMLInputElement;
     const file = new File(['test'], 'book.epub', { type: 'application/epub+zip' });
     Object.defineProperty(fileInput, 'files', { value: [file], configurable: true });
@@ -747,6 +756,7 @@ describe('Script Tab — Walk Runs List (Plan F, Phase 3)', () => {
     vi.clearAllMocks();
     mockFetch.mockReset(); // also drops stale Once queues from earlier describes
     state.pipelineBookId = null; // isolate from earlier describes (handleOnboard leaks it)
+    resetScriptSessionForTests(); // also clear module currentBookId (fresh page)
     localStorage.clear();
     vi.useFakeTimers();
     document.body.innerHTML = `
@@ -1169,6 +1179,7 @@ describe('Script Tab — Per-Walk Log Viewer (Part D)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     state.pipelineBookId = null; // isolate from earlier describes (handleOnboard leaks it)
+    resetScriptSessionForTests(); // also clear module currentBookId (fresh page)
     document.body.innerHTML = '<div id="walk-runs-container"></div>';
   });
 
@@ -1878,6 +1889,7 @@ describe('Script Tab — Per-Walk Log Viewer (Part D)', () => {
 
       beforeEach(() => {
         vi.useFakeTimers();
+        resetScriptSessionForTests(); // fresh page: no leaked currentBookId from earlier describes
         mockFetch.mockReset(); // also drops stale Once queues from earlier describes
         document.body.innerHTML = `
           <input type="file" id="file-upload">
@@ -2120,5 +2132,370 @@ describe('Script Tab — Per-Walk Log Viewer (Part D)', () => {
       expect(bootSrc.includes('openWalkLog')).toBe(false);
       expect(bootSrc.includes('EventSource(')).toBe(false);
     });
+  });
+});
+// ---------------------------------------------------------------------------
+// Walk-controller book-switch coordination (P4-S3)
+//
+// Onboarding, re-onboarding, and book switching must NOT replace a book while
+// an active writer could still run (CONTRACTS.md "Onboarding / re-onboarding /
+// book-switching coordination"). Ordering enforced by waitForWalkCleanup:
+//   1. cancel the prior active walk (pipelineCancelWalks),
+//   2. poll GET /walks/{book_id}/runs until no active (pending/running) row
+//      remains (terminal + run-owned cleanup done),
+//   3. only then switch currentBookId / reset walk UI.
+// On contention/failure the prior identity is kept and an error surfaced.
+//
+// Relies on the file's single shared initScript() DOMContentLoaded listener
+// (registered once by the Cancel Walks describe's beforeAll) — no second
+// initScript() here to avoid stacked listeners.
+// ---------------------------------------------------------------------------
+
+describe('Script Tab — Walk-controller book-switch coordination (P4-S3)', () => {
+  const okResponse = (body: unknown) => ({
+    ok: true,
+    status: 200,
+    statusText: 'OK',
+    headers: { get: () => null },
+    json: async () => body,
+  });
+  const okCancelled = okResponse({ status: 'cancelled' });
+  const cancel503 = {
+    ok: false,
+    status: 503,
+    statusText: 'Service Unavailable',
+    headers: { get: (name: string) => (name === 'Retry-After' ? '1' : null) },
+    json: async () => ({ detail: 'transaction contention' }),
+  };
+
+  function statusesCompleted(): Record<string, string> {
+    const s: Record<string, string> = {};
+    for (const n of WALK_ORDER) s[n] = 'completed';
+    return s;
+  }
+
+  function runRow(status: string): Record<string, unknown> {
+    return {
+      run_id: 'r-1',
+      walk_name: 'walk_2b_character_discovery',
+      status,
+      heartbeat_ms: 0,
+      created_ms: 1000,
+      finished_ms: status === 'running' || status === 'pending' ? 0 : 2000,
+      error: null,
+    };
+  }
+
+  /** Drive a real onboard through the UI for bookId (no active prior book). */
+  async function onboardViaUi(bookId: string): Promise<void> {
+    const fileInput = document.getElementById('file-upload') as HTMLInputElement;
+    const file = new File(['test'], 'book.epub', { type: 'application/epub+zip' });
+    Object.defineProperty(fileInput, 'files', { value: [file], configurable: true });
+    mockFetch.mockResolvedValueOnce(okResponse({ book_id: bookId, series_id: 's', chapters: 3 }));
+    document.dispatchEvent(new Event('DOMContentLoaded'));
+    document.getElementById('btn-onboard-epub')!.click();
+    await vi.advanceTimersByTimeAsync(0); // flush pipelineOnboard + initial poll
+  }
+
+  /** Simulate clicking onboard again for a new book while book-a stays current.
+   * Does NOT set mockFetch (the test supplies the cancel/onboard responses). */
+  async function clickSwitchOnboard(bookId: string): Promise<void> {
+    const fileInput = document.getElementById('file-upload') as HTMLInputElement;
+    const file = new File(['test'], 'switch.epub', { type: 'application/epub+zip' });
+    Object.defineProperty(fileInput, 'files', { value: [file], configurable: true });
+    document.getElementById('btn-onboard-epub')!.click();
+    await vi.advanceTimersByTimeAsync(0); // onboard switch + cleanup sniff/cancel
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockFetch.mockReset(); // also drops stale Once queues from earlier describes
+    state.pipelineBookId = null; // isolate from earlier describes (handleOnboard leaks it)
+    resetScriptSessionForTests(); // fresh page: currentBookId starts null
+    vi.useFakeTimers();
+    document.body.innerHTML = `
+      <input type="file" id="file-upload">
+      <span id="upload-status"></span>
+      <button id="btn-onboard-epub"></button>
+      <div id="walk-execution-section" style="display:none;"></div>
+      <div id="walk-status-container"></div>
+      <div id="walk-runs-container"></div>
+      <button id="btn-run-all-walks"></button>
+      <button id="btn-cancel-walks"></button>
+      <button id="btn-reonboard"></button>
+    `;
+  });
+
+  afterEach(() => {
+    stopWalkPolling();
+    vi.useRealTimers();
+  });
+
+  // -- bookHasActiveWalk / waitForWalkCleanup helpers ------------------------
+
+  it('bookHasActiveWalk: true for pending/running rows, false for terminal/empty', async () => {
+    const { bookHasActiveWalk } = await import('../../src/tabs/script');
+    vi.mocked(API.get).mockResolvedValue([runRow('running')]);
+    await expect(bookHasActiveWalk('book-1')).resolves.toBe(true);
+    vi.mocked(API.get).mockResolvedValue([runRow('pending')]);
+    await expect(bookHasActiveWalk('book-1')).resolves.toBe(true);
+    vi.mocked(API.get).mockResolvedValue([runRow('completed')]);
+    await expect(bookHasActiveWalk('book-1')).resolves.toBe(false);
+    vi.mocked(API.get).mockResolvedValue([runRow('cancelled')]);
+    await expect(bookHasActiveWalk('book-1')).resolves.toBe(false);
+    vi.mocked(API.get).mockResolvedValue([]);
+    await expect(bookHasActiveWalk('book-1')).resolves.toBe(false);
+  });
+
+  it('waitForWalkCleanup: resolves true immediately when no active walk (no cancel fired)', async () => {
+    const { waitForWalkCleanup } = await import('../../src/tabs/script');
+    vi.mocked(API.get).mockResolvedValue([]);
+    mockFetch.mockClear();
+    await expect(waitForWalkCleanup('book-idle')).resolves.toBe(true);
+    expect(mockFetch).not.toHaveBeenCalled(); // never cancels a book with no active run
+  });
+
+  it('waitForWalkCleanup: cancels an active walk, polls until terminal, then resolves true', async () => {
+    const { waitForWalkCleanup } = await import('../../src/tabs/script');
+    let active = true;
+    mockFetch.mockImplementation((url: RequestInfo | URL) => Promise.resolve(okCancelled));
+    vi.mocked(API.get).mockImplementation((endpoint: string) => {
+      if (String(endpoint).endsWith('/runs')) {
+        return Promise.resolve(active ? [runRow('running')] : [runRow('cancelled')]);
+      }
+      return Promise.resolve(statusesCompleted());
+    });
+
+    const promise = waitForWalkCleanup('book-sw');
+    await vi.advanceTimersByTimeAsync(0); // sniff (active) + cancel
+    expect(active).toBe(true);
+
+    active = false; // the cancel took effect: next poll sees terminal
+    await vi.advanceTimersByTimeAsync(300);
+    await expect(promise).resolves.toBe(true);
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/api/pipeline/cancel_walks',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ book_id: 'book-sw' }) }),
+    );
+  });
+
+  it('waitForWalkCleanup: returns false (keep identity) when cancellation fails', async () => {
+    const { waitForWalkCleanup } = await import('../../src/tabs/script');
+    vi.mocked(API.get).mockResolvedValue([runRow('running')]); // active walk
+    mockFetch.mockRejectedValue(new Error('cancel network failure'));
+    await expect(waitForWalkCleanup('book-cxl')).resolves.toBe(false);
+  });
+
+  it('waitForWalkCleanup: returns false when a walk never reaches terminal within the timeout', async () => {
+    const { waitForWalkCleanup } = await import('../../src/tabs/script');
+    mockFetch.mockResolvedValue(okCancelled); // cancel succeeds, but...
+    vi.mocked(API.get).mockResolvedValue([runRow('running')]); // ...the walk never terminalizes
+    const promise = waitForWalkCleanup('book-stuck');
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(31_000); // exceed the 30s cleanup timeout
+    await expect(promise).resolves.toBe(false);
+  });
+
+  // -- handleOnboard: cancel-before-switch -----------------------------------
+
+  it('handleOnboard: cancels the prior book active walk and awaits cleanup before switching currentBookId', async () => {
+    // Onboard book-a first (idle).
+    vi.mocked(API.get).mockResolvedValue([]);
+    await onboardViaUi('book-a');
+    expect(state.pipelineBookId).toBe('book-a');
+
+    // Book-a now has an active walk; the cancel is honored and the row goes
+    // terminal, so the switch to book-b is permitted.
+    let cancelledA = false;
+    mockFetch.mockImplementation((url: RequestInfo | URL) => {
+      if (String(url).endsWith('/cancel_walks')) {
+        cancelledA = true;
+        return Promise.resolve(okCancelled);
+      }
+      return Promise.resolve(okResponse({ book_id: 'book-b', series_id: 's', chapters: 3 }));
+    });
+    vi.mocked(API.get).mockImplementation((endpoint: string) => {
+      if (String(endpoint).endsWith('/runs')) {
+        return Promise.resolve(cancelledA ? [runRow('cancelled')] : [runRow('running')]);
+      }
+      return Promise.resolve(statusesCompleted());
+    });
+
+    await clickSwitchOnboard('book-b');
+    // cleanup poll observes the terminal row
+    await vi.advanceTimersByTimeAsync(300);
+
+    // The prior walk was cancelled (POST cancel for book-a).
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/api/pipeline/cancel_walks',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ book_id: 'book-a' }) }),
+    );
+    // Identity switched only after cleanup — persisted identity is book-b.
+    expect(state.pipelineBookId).toBe('book-b');
+  });
+
+  it('handleOnboard: on contention keeps the prior book identity and aborts BEFORE posting onboard (no orphaned book)', async () => {
+    const { showToast } = await import('../../src/utils');
+    vi.mocked(API.get).mockResolvedValue([]);
+    await onboardViaUi('book-a');
+    expect(state.pipelineBookId).toBe('book-a');
+    mockFetch.mockClear(); // isolate the switch phase (setup onboard of book-a already fired)
+
+    // FIX #4: the prior book's active walk cannot be cancelled (contention).
+    // The coordination check now happens BEFORE the onboard POST, so the fresh
+    // book is never created/orphaned and the UI must NOT switch identity.
+    mockFetch.mockImplementation((url: RequestInfo | URL) => {
+      if (String(url).endsWith('/onboard')) {
+        return Promise.resolve(okResponse({ book_id: 'book-b', series_id: 's', chapters: 3 }));
+      }
+      return Promise.reject(new Error('cancel contention'));
+    });
+    vi.mocked(API.get).mockResolvedValue([runRow('running')]); // book-a stays active
+
+    await clickSwitchOnboard('book-b');
+    await vi.advanceTimersByTimeAsync(300);
+
+    expect(state.pipelineBookId).toBe('book-a'); // persisted identity unchanged
+    expect(mockFetch).not.toHaveBeenCalledWith('/api/pipeline/onboard', expect.anything());
+    expect(showToast).toHaveBeenCalledWith(
+      expect.stringContaining('Onboard aborted'),
+      'error',
+    );
+  });
+
+  // -- handleReonboard: wait-for-cleanup before clearing ---------------------
+
+  it('handleReonboard: cancels the prior walk and awaits cleanup before posting reonboard', async () => {
+    const { showConfirm } = await import('../../src/utils');
+    vi.mocked(API.get).mockResolvedValue([]);
+    await onboardViaUi('book-r');
+    expect(state.pipelineBookId).toBe('book-r');
+    vi.mocked(showConfirm).mockResolvedValue(true);
+
+    // Book-r has an active walk; cancel is honored → row goes terminal.
+    let cancelledR = false;
+    mockFetch.mockImplementation((url: RequestInfo | URL) => {
+      if (String(url).endsWith('/cancel_walks')) {
+        cancelledR = true;
+        return Promise.resolve(okCancelled);
+      }
+      return Promise.resolve(okResponse({ book_id: 'book-r', series_id: 's', chapters: 3 }));
+    });
+    vi.mocked(API.get).mockImplementation((endpoint: string) => {
+      if (String(endpoint).endsWith('/runs')) {
+        return Promise.resolve(cancelledR ? [runRow('cancelled')] : [runRow('running')]);
+      }
+      return Promise.resolve(statusesCompleted());
+    });
+    vi.mocked(API.post).mockResolvedValue({ book_id: 'book-r', version: 2, status: 'reonboarded' });
+
+    document.getElementById('btn-reonboard')!.click();
+    await vi.advanceTimersByTimeAsync(0); // showConfirm + cleanup sniff + cancel
+    await vi.advanceTimersByTimeAsync(300); // cleanup poll sees terminal → proceed
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/api/pipeline/cancel_walks',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ book_id: 'book-r' }) }),
+    );
+    expect(API.post).toHaveBeenCalledWith('/api/pipeline/reonboard', { book_id: 'book-r' });
+  });
+
+  it('handleReonboard: on contention does NOT post reonboard and keeps the book identity', async () => {
+    const { showConfirm, showToast } = await import('../../src/utils');
+    vi.mocked(API.get).mockResolvedValue([]);
+    await onboardViaUi('book-r');
+    expect(state.pipelineBookId).toBe('book-r');
+    vi.mocked(showConfirm).mockResolvedValue(true);
+
+    // Active walk present; cancellation fails (retry-once exhausted on 503).
+    mockFetch.mockImplementation((url: RequestInfo | URL) => {
+      if (String(url).endsWith('/cancel_walks')) return Promise.resolve(cancel503);
+      return Promise.resolve(okResponse({ book_id: 'book-r', series_id: 's', chapters: 3 }));
+    });
+    vi.mocked(API.get).mockResolvedValue([runRow('running')]); // still active
+
+    document.getElementById('btn-reonboard')!.click();
+    await vi.advanceTimersByTimeAsync(0); // showConfirm + cleanup sniff/cancel attempt
+    await vi.advanceTimersByTimeAsync(1001); // retry-once delay for 503 elapses → fails
+
+    expect(API.post).not.toHaveBeenCalledWith('/api/pipeline/reonboard', { book_id: 'book-r' });
+    expect(showToast).toHaveBeenCalledWith(
+      expect.stringContaining('Re-onboard aborted'),
+      'error',
+    );
+    expect(state.pipelineBookId).toBe('book-r'); // identity preserved
+  });
+
+  // -- P5-S5 additional coordination edge cases -----------------------------
+
+  it('waitForWalkCleanup: ignores transient poll errors and keeps polling until terminal', async () => {
+    const { waitForWalkCleanup } = await import('../../src/tabs/script');
+    let pollCount = 0;
+    let active = true;
+    mockFetch.mockImplementation(() => Promise.resolve(okCancelled));
+    vi.mocked(API.get).mockImplementation((endpoint: string) => {
+      if (String(endpoint).endsWith('/runs')) {
+        pollCount += 1;
+        if (pollCount === 1) return Promise.resolve([runRow('running')]);
+        if (pollCount === 2) return Promise.reject(new Error('transient poll failure'));
+        return Promise.resolve(active ? [runRow('running')] : [runRow('cancelled')]);
+      }
+      return Promise.resolve(statusesCompleted());
+    });
+    const promise = waitForWalkCleanup('book-polls');
+    await vi.advanceTimersByTimeAsync(0); // sniff (running) + cancel
+    active = false;
+    await vi.advanceTimersByTimeAsync(300); // transient poll error -> keep polling
+    await vi.advanceTimersByTimeAsync(300); // terminal poll observed
+    await expect(promise).resolves.toBe(true);
+  });
+
+  it('waitForWalkCleanup: returns false when the initial active-walk sniff fails (no cancel)', async () => {
+    const { waitForWalkCleanup } = await import('../../src/tabs/script');
+    vi.mocked(API.get).mockRejectedValue(new Error('runs endpoint down'));
+    mockFetch.mockClear();
+    await expect(waitForWalkCleanup('book-down')).resolves.toBe(false);
+    expect(mockFetch).not.toHaveBeenCalled(); // aborts before ever cancelling
+  });
+
+  it('handleOnboard: switches immediately when the prior book has no active walk (no cancel fired)', async () => {
+    vi.mocked(API.get).mockResolvedValue([]);
+    await onboardViaUi('book-a');
+    expect(state.pipelineBookId).toBe('book-a');
+    mockFetch.mockClear();
+    mockFetch.mockImplementation((url: RequestInfo | URL) =>
+      Promise.resolve(okResponse({ book_id: 'book-b', series_id: 's', chapters: 3 })),
+    );
+    await clickSwitchOnboard('book-b');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(state.pipelineBookId).toBe('book-b'); // persisted identity switched
+    expect(mockFetch).not.toHaveBeenCalledWith(
+      '/api/pipeline/cancel_walks',
+      expect.anything(),
+    );
+  });
+
+  it('handleOnboard: keeps the prior book identity when the cleanup sniff fails', async () => {
+    const { showToast } = await import('../../src/utils');
+    vi.mocked(API.get).mockResolvedValue([]);
+    await onboardViaUi('book-a');
+    expect(state.pipelineBookId).toBe('book-a');
+    mockFetch.mockClear();
+    mockFetch.mockImplementation((url: RequestInfo | URL) =>
+      Promise.resolve(okResponse({ book_id: 'book-b', series_id: 's', chapters: 3 })),
+    );
+    // The cleanup sniff (GET /runs) fails -> waitForWalkCleanup aborts before
+    // cancelling AND before onboarding, so the UI must NOT switch identity and
+    // the fresh book is never POSTed/orphaned (FIX #4).
+    vi.mocked(API.get).mockRejectedValue(new Error('runs endpoint down'));
+    await clickSwitchOnboard('book-b');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(state.pipelineBookId).toBe('book-a'); // persisted identity unchanged
+    expect(mockFetch).not.toHaveBeenCalledWith('/api/pipeline/onboard', expect.anything());
+    expect(showToast).toHaveBeenCalledWith(
+      expect.stringContaining('Onboard aborted'),
+      'error',
+    );
   });
 });

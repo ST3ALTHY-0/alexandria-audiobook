@@ -274,9 +274,7 @@ def _process_character(
     is_review = 0.5 <= confidence < 0.7
 
     # Store description in a book-scoped persona revision.
-    conn = storage.get_connection()
-    conn.execute("SAVEPOINT walk_2f_character")
-    try:
+    with storage.savepoint("walk_2f_character"):
         stored = _store_description(
             book_id,
             character_id,
@@ -286,11 +284,6 @@ def _process_character(
             "needs_review" if is_review else "accepted",
             storage,
         )
-        conn.execute("RELEASE SAVEPOINT walk_2f_character")
-    except Exception:
-        conn.execute("ROLLBACK TO SAVEPOINT walk_2f_character")
-        conn.execute("RELEASE SAVEPOINT walk_2f_character")
-        raise
 
     if not stored:
         logger.info("Skipping protected persona for character %s", character_id)

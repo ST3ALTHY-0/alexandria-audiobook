@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -92,6 +93,67 @@ class PipelineStorage(ABC):
     @abstractmethod
     def execute_delete(self, sql: str, params: tuple = ()) -> int:
         """Execute a DELETE and return ``rowcount``."""
+
+    _SAVEPOINT_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+    @classmethod
+    def _validate_savepoint_name(cls, name: str) -> None:
+        """Reject non-identifier savepoint names before they reach raw SQL.
+
+        ``savepoint`` interpolates *name* directly into ``SAVEPOINT`` /
+        ``ROLLBACK TO`` / ``RELEASE`` statements, so the name is validated as
+        a bare SQLite identifier (alphanumeric + underscore, not starting
+        with a digit).  This is the single defense against name-shaped SQL
+        injection on an adapter surface whose callers pass fixed literals
+        (e.g. ``"merge_op"``, ``"split_op"``).
+        """
+        if not cls._SAVEPOINT_NAME_RE.match(name):
+            raise ValueError(f"invalid savepoint name: {name!r}")
+
+    @contextmanager
+    def savepoint(self, name: str) -> Iterator[None]:
+        """Run the wrapped block inside an adapter-owned ``SAVEPOINT``.
+
+        Implemented identically by BOTH ``SQLiteAdapter`` and
+        ``InMemorySQLiteAdapter`` — defined once on ``PipelineStorage`` so the
+        two concrete adapters share one implementation and cannot diverge.
+
+        A raw ``SAVEPOINT <name>`` is opened on EVERY entry, including in
+        autocommit (``_txn_depth == 0``): issuing ``SAVEPOINT`` in autocommit
+        makes SQLite implicitly open a transaction, so the wrapped block runs
+        as an atomic unit.  ``RELEASE SAVEPOINT`` on normal exit COMMITs that
+        implicit transaction and preserves the block's writes; on failure
+        ``ROLLBACK TO SAVEPOINT`` + ``RELEASE`` undo the block.  A savepoint
+        attempted on the wrong thread while a transaction is open raises
+        ``ConcurrentTransactionError`` via ``_ensure_owner_thread``.
+
+        Nested ``savepoint()`` calls create their own levels through the
+        transaction depth machinery; each exits only its own level.  On
+        normal exit ``RELEASE SAVEPOINT <name>`` is issued.  On ``Exception``
+        AND ``BaseException`` (incl. ``KeyboardInterrupt``/``SystemExit``)
+        the context manager issues ``ROLLBACK TO SAVEPOINT <name>`` followed
+        by ``RELEASE SAVEPOINT <name>``, re-raises, and leaves the connection
+        reusable with no dangling savepoint — including within an already-open
+        outer transaction.  This supersedes the prior bare-connection savepoint
+        pattern.
+        """
+        self._validate_savepoint_name(name)
+        # `_ensure_owner_thread` raises on the wrong thread only when a
+        # transaction is actually open; otherwise it passes (autocommit
+        # included) and the raw SAVEPOINT below still opens an implicit
+        # transaction so the block is atomic.
+        self._ensure_owner_thread()
+        self._conn.execute(f"SAVEPOINT {name}")
+        try:
+            yield
+        except BaseException:
+            try:
+                self._conn.execute(f"ROLLBACK TO SAVEPOINT {name}")
+            finally:
+                self._conn.execute(f"RELEASE SAVEPOINT {name}")
+            raise
+        else:
+            self._conn.execute(f"RELEASE SAVEPOINT {name}")
 
     @abstractmethod
     def get_walk_overrides(self, book_id: str) -> list[dict]:

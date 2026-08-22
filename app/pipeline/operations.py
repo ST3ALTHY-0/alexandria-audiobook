@@ -302,8 +302,7 @@ class OperationExecutor:
             If *split_point* is out of range or the span has NULL text.
         """
         conn = self._storage.get_connection()
-        conn.execute("SAVEPOINT split_op")
-        try:
+        with self._storage.savepoint("split_op"):
             # Resolve span and position
             span_id, parent_id, old_position = self._get_span_position(
                 conn, presentation_index, book_id=book_id
@@ -369,12 +368,6 @@ class OperationExecutor:
                 (new_span_id, span_id),
             )
 
-            conn.execute("RELEASE SAVEPOINT split_op")
-        except Exception:
-            conn.execute("ROLLBACK TO SAVEPOINT split_op")
-            conn.execute("RELEASE SAVEPOINT split_op")
-            raise
-
     @_guarded_operation
     def execute_merge(
         self,
@@ -406,120 +399,121 @@ class OperationExecutor:
             If the spans are not adjacent or have different parents
         """
         conn = self._storage.get_connection()
-        conn.execute("SAVEPOINT merge_op")
         # Defer FK constraint checking until RELEASE
         conn.execute("PRAGMA defer_foreign_keys = ON")
         try:
-            # Resolve both spans
-            left_span_id, left_parent_id, left_position = self._get_span_position(
-                conn, presentation_index_left, book_id=book_id
-            )
-            right_span_id, right_parent_id, right_position = self._get_span_position(
-                conn, presentation_index_right, book_id=book_id
-            )
-
-            # Verify same parent
-            if left_parent_id != right_parent_id:
-                raise ValueError(
-                    f"Cannot merge spans with different parents: "
-                    f"{left_parent_id} vs {right_parent_id}"
+            with self._storage.savepoint("merge_op"):
+                # Resolve both spans
+                left_span_id, left_parent_id, left_position = self._get_span_position(
+                    conn, presentation_index_left, book_id=book_id
+                )
+                right_span_id, right_parent_id, right_position = (
+                    self._get_span_position(
+                        conn, presentation_index_right, book_id=book_id
+                    )
                 )
 
-            # Verify adjacency
-            if left_position + 1 != right_position:
-                raise ValueError(
-                    f"Cannot merge non-adjacent spans: positions {left_position} "
-                    f"and {right_position} are not consecutive"
-                )
+                # Verify same parent
+                if left_parent_id != right_parent_id:
+                    raise ValueError(
+                        f"Cannot merge spans with different parents: "
+                        f"{left_parent_id} vs {right_parent_id}"
+                    )
 
-            # Get all memberships for both spans
-            left_memberships = conn.execute(
-                "SELECT character_id, relation_type, source, confidence, human_override "
-                "FROM character_span WHERE span_id = ?",
-                (left_span_id,),
-            ).fetchall()
+                # Verify adjacency
+                if left_position + 1 != right_position:
+                    raise ValueError(
+                        f"Cannot merge non-adjacent spans: positions {left_position} "
+                        f"and {right_position} are not consecutive"
+                    )
 
-            right_memberships = conn.execute(
-                "SELECT character_id, relation_type, source, confidence, human_override "
-                "FROM character_span WHERE span_id = ?",
-                (right_span_id,),
-            ).fetchall()
+                # Get all memberships for both spans
+                left_memberships = conn.execute(
+                    "SELECT character_id, relation_type, source, confidence, human_override "
+                    "FROM character_span WHERE span_id = ?",
+                    (left_span_id,),
+                ).fetchall()
 
-            # Preserve the content of both spans on the surviving left span.
-            left_text = conn.execute(
-                "SELECT text FROM span WHERE id = ?", (left_span_id,)
-            ).fetchone()[0]
-            right_row = conn.execute(
-                "SELECT text, pause_after_ms FROM span WHERE id = ?",
-                (right_span_id,),
-            ).fetchone()
-            right_text = right_row[0]
-            right_pause_after_ms = right_row[1]
-            if left_text is None:
-                merged_text = right_text
-            elif right_text is None:
-                merged_text = left_text
-            else:
-                merged_text = left_text + right_text
-            conn.execute(
-                "UPDATE span SET text = ?, pause_after_ms = ? WHERE id = ?",
-                (merged_text, right_pause_after_ms, left_span_id),
-            )
+                right_memberships = conn.execute(
+                    "SELECT character_id, relation_type, source, confidence, human_override "
+                    "FROM character_span WHERE span_id = ?",
+                    (right_span_id,),
+                ).fetchall()
 
-            # Build union with confidence tiebreak
-            # Key: (character_id, relation_type), Value: (source, confidence, human_override)
-            membership_map: dict[tuple[str, str], tuple[str, float, int]] = {}
-
-            for row in left_memberships:
-                char_id, rel_type, source, conf, override = row
-                membership_map[(char_id, rel_type)] = (source, conf, override)
-
-            for row in right_memberships:
-                char_id, rel_type, source, conf, override = row
-                key = (char_id, rel_type)
-                if key not in membership_map or conf > membership_map[key][1]:
-                    membership_map[key] = (source, conf, override)
-
-            # Delete left span's old memberships
-            conn.execute(
-                "DELETE FROM character_span WHERE span_id = ?", (left_span_id,)
-            )
-
-            # Insert the union into left span (before deleting right span)
-            for (char_id, rel_type), (source, conf, override) in membership_map.items():
+                # Preserve the content of both spans on the surviving left span.
+                left_text = conn.execute(
+                    "SELECT text FROM span WHERE id = ?", (left_span_id,)
+                ).fetchone()[0]
+                right_row = conn.execute(
+                    "SELECT text, pause_after_ms FROM span WHERE id = ?",
+                    (right_span_id,),
+                ).fetchone()
+                right_text = right_row[0]
+                right_pause_after_ms = right_row[1]
+                if left_text is None:
+                    merged_text = right_text
+                elif right_text is None:
+                    merged_text = left_text
+                else:
+                    merged_text = left_text + right_text
                 conn.execute(
-                    "INSERT INTO character_span (character_id, span_id, relation_type, "
-                    "source, confidence, human_override) VALUES (?, ?, ?, ?, ?, ?)",
-                    (char_id, left_span_id, rel_type, source, conf, override),
+                    "UPDATE span SET text = ?, pause_after_ms = ? WHERE id = ?",
+                    (merged_text, right_pause_after_ms, left_span_id),
                 )
 
-            # Delete right span's character_span memberships
-            conn.execute(
-                "DELETE FROM character_span WHERE span_id = ?", (right_span_id,)
-            )
+                # Build union with confidence tiebreak
+                # Key: (character_id, relation_type), Value: (source, confidence, human_override)
+                membership_map: dict[tuple[str, str], tuple[str, float, int]] = {}
 
-            # Delete right span's paragraph_span edge
-            conn.execute(
-                "DELETE FROM paragraph_span WHERE child_id = ?", (right_span_id,)
-            )
+                for row in left_memberships:
+                    char_id, rel_type, source, conf, override = row
+                    membership_map[(char_id, rel_type)] = (source, conf, override)
 
-            # Delete right span
-            conn.execute("DELETE FROM span WHERE id = ?", (right_span_id,))
+                for row in right_memberships:
+                    char_id, rel_type, source, conf, override = row
+                    key = (char_id, rel_type)
+                    if key not in membership_map or conf > membership_map[key][1]:
+                        membership_map[key] = (source, conf, override)
 
-            # Shift positions > right_position down by 1
-            self._two_phase_reindex(
-                conn, "paragraph_span", left_parent_id, right_position, delta=-1
-            )
+                # Delete left span's old memberships
+                conn.execute(
+                    "DELETE FROM character_span WHERE span_id = ?", (left_span_id,)
+                )
 
-            reconstruct_paragraph_text(conn, left_parent_id)
+                # Insert the union into left span (before deleting right span)
+                for (char_id, rel_type), (
+                    source,
+                    conf,
+                    override,
+                ) in membership_map.items():
+                    conn.execute(
+                        "INSERT INTO character_span (character_id, span_id, relation_type, "
+                        "source, confidence, human_override) VALUES (?, ?, ?, ?, ?, ?)",
+                        (char_id, left_span_id, rel_type, source, conf, override),
+                    )
 
-            conn.execute("RELEASE SAVEPOINT merge_op")
-            # Reset FK defer setting
+                # Delete right span's character_span memberships
+                conn.execute(
+                    "DELETE FROM character_span WHERE span_id = ?", (right_span_id,)
+                )
+
+                # Delete right span's paragraph_span edge
+                conn.execute(
+                    "DELETE FROM paragraph_span WHERE child_id = ?", (right_span_id,)
+                )
+
+                # Delete right span
+                conn.execute("DELETE FROM span WHERE id = ?", (right_span_id,))
+
+                # Shift positions > right_position down by 1
+                self._two_phase_reindex(
+                    conn, "paragraph_span", left_parent_id, right_position, delta=-1
+                )
+
+                reconstruct_paragraph_text(conn, left_parent_id)
+        finally:
+            # Reset FK defer setting on every exit path.
             conn.execute("PRAGMA defer_foreign_keys = OFF")
-        except Exception:
-            conn.execute("ROLLBACK TO SAVEPOINT merge_op")
-            conn.execute("PRAGMA defer_foreign_keys = OFF")
-            raise
 
     @_guarded_operation
     def execute_move(
@@ -545,8 +539,7 @@ class OperationExecutor:
             If the target position is in a different parent paragraph
         """
         conn = self._storage.get_connection()
-        conn.execute("SAVEPOINT move_op")
-        try:
+        with self._storage.savepoint("move_op"):
             # Resolve source span
             span_id, parent_id, old_position = self._get_span_position(
                 conn, presentation_index_from, book_id=book_id
@@ -565,7 +558,6 @@ class OperationExecutor:
 
             # No-op if same position
             if old_position == target_position:
-                conn.execute("RELEASE SAVEPOINT move_op")
                 return
 
             # Temporarily set source span to a position outside the range to avoid conflicts
@@ -604,12 +596,6 @@ class OperationExecutor:
 
             reconstruct_paragraph_text(conn, parent_id)
 
-            conn.execute("RELEASE SAVEPOINT move_op")
-        except Exception:
-            conn.execute("ROLLBACK TO SAVEPOINT move_op")
-            conn.execute("RELEASE SAVEPOINT move_op")
-            raise
-
     @_guarded_operation
     def execute_delete(self, book_id: str, presentation_index: int) -> None:
         """Remove a span and its memberships, renumbering positions.
@@ -622,8 +608,7 @@ class OperationExecutor:
             Index of the span to delete
         """
         conn = self._storage.get_connection()
-        conn.execute("SAVEPOINT delete_op")
-        try:
+        with self._storage.savepoint("delete_op"):
             # Resolve span and position
             span_id, parent_id, position = self._get_span_position(
                 conn, presentation_index, book_id=book_id
@@ -644,9 +629,3 @@ class OperationExecutor:
             )
 
             reconstruct_paragraph_text(conn, parent_id)
-
-            conn.execute("RELEASE SAVEPOINT delete_op")
-        except Exception:
-            conn.execute("ROLLBACK TO SAVEPOINT delete_op")
-            conn.execute("RELEASE SAVEPOINT delete_op")
-            raise

@@ -104,7 +104,9 @@ def execute(book_id: str, storage: PipelineStorage, config: dict[str, Any]) -> d
     available_voices = _load_voice_config(storage)
 
     if not available_voices:
-        logger.warning("No voices found in voice_config table — all characters will be unmatched")
+        logger.warning(
+            "No voices found in voice_config table — all characters will be unmatched"
+        )
 
     # Load existing characters for this book
     existing_characters = _load_existing_characters(book_id, storage)
@@ -199,9 +201,7 @@ def _load_voice_config(storage: PipelineStorage) -> list[dict[str, str]]:
     ]
 
 
-def _get_voice_profile(
-    character_id: str, storage: PipelineStorage
-) -> dict | None:
+def _get_voice_profile(character_id: str, storage: PipelineStorage) -> dict | None:
     """Retrieve the character's voice profile from character_metadata.
 
     Returns the parsed voice profile dict, or None if not found.
@@ -320,9 +320,7 @@ def _process_character(
         prior_assignment = _get_prior_voice_assignment(character_id, storage)
 
         # Update character.voice_assignment_id
-        conn = storage.get_connection()
-        conn.execute("SAVEPOINT walk_2h_voice_assignment")
-        try:
+        with storage.savepoint("walk_2h_voice_assignment"):
             storage.execute_update(
                 "UPDATE character SET voice_assignment_id = ? WHERE id = ?",
                 (voice_config_id, character_id),
@@ -334,12 +332,7 @@ def _process_character(
                     character_id=character_id,
                     prior_value=prior_assignment,
                 )
-            conn.execute("RELEASE SAVEPOINT walk_2h_voice_assignment")
             committed_target_ids.append(character_id)
-        except Exception:
-            conn.execute("ROLLBACK TO SAVEPOINT walk_2h_voice_assignment")
-            conn.execute("RELEASE SAVEPOINT walk_2h_voice_assignment")
-            raise
 
         result["voices_matched"] += 1
 
@@ -415,7 +408,9 @@ def _build_voice_assignment_prompt(
         voice_id = voice["id"]
         voice_name = voice["name"]
         voice_desc = voice["description"] or "(no description)"
-        voice_lines.append(f"  {idx}. id=\"{voice_id}\", name=\"{voice_name}\", description=\"{voice_desc}\"")
+        voice_lines.append(
+            f'  {idx}. id="{voice_id}", name="{voice_name}", description="{voice_desc}"'
+        )
 
     voices_text = "\n".join(voice_lines)
 
@@ -455,9 +450,7 @@ def _parse_llm_response(response_text: str) -> dict:
     """
     match_data = extract_json_from_llm_response(response_text, expected_type="dict")
     if match_data is None:
-        logger.error(
-            f"Failed to parse LLM response as JSON: {response_text[:200]}"
-        )
+        logger.error(f"Failed to parse LLM response as JSON: {response_text[:200]}")
         return {}
 
     if not isinstance(match_data, dict):
@@ -470,7 +463,9 @@ def _parse_llm_response(response_text: str) -> dict:
 
     # voice_config_id can be None (no match) or a string
     if voice_config_id is not None and not isinstance(voice_config_id, str):
-        logger.error(f"voice_config_id is not a valid string or null: {voice_config_id}")
+        logger.error(
+            f"voice_config_id is not a valid string or null: {voice_config_id}"
+        )
         return {}
 
     return {

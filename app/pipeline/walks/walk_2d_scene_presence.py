@@ -291,9 +291,7 @@ def _process_scene(
     presence_list = _parse_llm_response(response_text)
 
     # Process each character presence
-    conn = storage.get_connection()
-    conn.execute("SAVEPOINT walk_2d_scene")
-    try:
+    with storage.savepoint("walk_2d_scene"):
         accepted_presence: dict[str, float] = {}
         for presence_data in presence_list:
             character_id = presence_data.get("character_id", "").strip()
@@ -321,11 +319,6 @@ def _process_scene(
                 existing_junctions=existing_junctions,
                 result=result,
             )
-        conn.execute("RELEASE SAVEPOINT walk_2d_scene")
-    except Exception:
-        conn.execute("ROLLBACK TO SAVEPOINT walk_2d_scene")
-        conn.execute("RELEASE SAVEPOINT walk_2d_scene")
-        raise
 
 
 def _process_presence(

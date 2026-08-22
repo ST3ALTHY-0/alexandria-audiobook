@@ -329,9 +329,7 @@ def _process_character(
     prior_profile = _get_prior_voice_profile(character_id, storage)
 
     # Store voice profile in character_metadata
-    conn = storage.get_connection()
-    conn.execute("SAVEPOINT walk_2g_voice")
-    try:
+    with storage.savepoint("walk_2g_voice"):
         _store_voice_profile(character_id, voice_profile, storage)
         if is_review:
             _insert_review_item(
@@ -340,12 +338,7 @@ def _process_character(
                 character_id=character_id,
                 prior_value=prior_profile,
             )
-        conn.execute("RELEASE SAVEPOINT walk_2g_voice")
         committed_target_ids.append(character_id)
-    except Exception:
-        conn.execute("ROLLBACK TO SAVEPOINT walk_2g_voice")
-        conn.execute("RELEASE SAVEPOINT walk_2g_voice")
-        raise
 
     result["profiles_generated"] += 1
 

@@ -217,6 +217,86 @@ export async function pipelineReonboard(bookId: string): Promise<ReonboardResult
 }
 
 // ---------------------------------------------------------------------------
+// Walk-controller coordination for book replacement (P4-S3)
+//
+// Onboarding, re-onboarding, and book switching must NOT make replacement
+// state current while an active writer could still run (CONTRACTS.md "Onboarding
+// / re-onboarding / book-switching coordination"). The ordering is:
+//   1. cancel the prior active walk (pipelineCancelWalks),
+//   2. poll GET /walks/{book_id}/runs until NO active (pending/running)
+//      walk_run row remains — i.e. the run reached a terminal status and its
+//      run-owned cleanup has run (the backend finalizes the row only after
+//      cleanup),
+//   3. only then does the caller switch currentBookId / reset walk UI.
+// On contention or failure the caller keeps the prior book identity and shows
+// an error instead of resetting optimistically.
+// ---------------------------------------------------------------------------
+
+const WALK_CLEANUP_POLL_INTERVAL_MS = 300;
+const WALK_CLEANUP_TIMEOUT_MS = 30_000;
+
+/** True when a run row is still a possible writer (reserved or executing). */
+function isActiveRun(run: WalkRunRow): boolean {
+  return run.status === 'pending' || run.status === 'running';
+}
+
+/** Resolve after *ms* via setTimeout (timer-fake friendly). */
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Whether *bookId* has any active (pending/running) walk_run row. Rows = truth
+ * (the authoritative surface), mirroring the backend coordination helper
+ * `assembly.has_active_run`. A fetch error is surfaced so the caller aborts
+ * rather than switching over an unknown active state.
+ */
+export async function bookHasActiveWalk(bookId: string): Promise<boolean> {
+  const runs = await pipelineWalkRuns(bookId);
+  return runs.some(isActiveRun);
+}
+
+/**
+ * Cancel *bookId*'s active walk(s) and await their terminal cleanup before
+ * returning. Resolves true when it is safe to switch/replace (no active row
+ * remains), false on cancellation/polling failure or if the walk never reaches
+ * terminal within the timeout — callers MUST then keep the prior book identity.
+ */
+export async function waitForWalkCleanup(bookId: string): Promise<boolean> {
+  let active: boolean;
+  try {
+    active = await bookHasActiveWalk(bookId);
+  } catch (e) {
+    console.error('Unable to determine active walks; aborting switch', e);
+    return false;
+  }
+  if (!active) return true; // no writer — safe to switch immediately
+
+  try {
+    await pipelineCancelWalks(bookId);
+  } catch (e) {
+    // Cancellation failed (e.g. 503 contention that never cleared): do not
+    // switch over an active writer.
+    console.error('Cancel failed before book switch', e);
+    return false;
+  }
+
+  // Poll until no active walk_run row remains (terminal + cleaned up), or the
+  // timeout expires. Transient poll errors are ignored until the deadline.
+  const deadline = Date.now() + WALK_CLEANUP_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    try {
+      if (!(await bookHasActiveWalk(bookId))) return true;
+    } catch {
+      // transient poll error — keep polling until the deadline
+    }
+    await sleep(WALK_CLEANUP_POLL_INTERVAL_MS);
+  }
+  console.error('Walk cleanup did not reach terminal within timeout');
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // Walk status display
 // ---------------------------------------------------------------------------
 
@@ -774,6 +854,16 @@ export function stopWalkPolling(): void {
 }
 
 /**
+ * Reset per-session module state so a fresh page (no book onboarded) can be
+ * simulated. Test-support only: clears the module-private ``currentBookId``
+ * and any active polling interval. Not part of the tab's user-facing API.
+ */
+export function resetScriptSessionForTests(): void {
+  currentBookId = null;
+  stopWalkPolling();
+}
+
+/**
  * Enable/disable individual walk run buttons based on current statuses.
  * A walk button is disabled if that walk is currently 'running'.
  */
@@ -833,8 +923,33 @@ async function handleOnboard(): Promise<void> {
     statusEl.innerHTML = '<span class="text-info"><i class="fas fa-spinner fa-spin me-1"></i>Onboarding EPUB...</span>';
   }
 
+  // Book switching coordination (P4-S3 / FIX #4): onboarding a NEW book
+  // replaces the current one, so cancel the prior book's active walk(s) and
+  // await their terminal cleanup BEFORE posting onboard. Checking the prior
+  // book FIRST (before the onboard POST) means a later-aborted switch can never
+  // leave a freshly-created book orphaned in the DB: identity changes only after
+  // cancellation + cleanup, never optimistically while an active writer could
+  // still run.
+  if (currentBookId) {
+    const safe = await waitForWalkCleanup(currentBookId);
+    if (!safe) {
+      if (statusEl) {
+        statusEl.innerHTML = '<span class="text-danger"><i class="fas fa-times me-1"></i>Onboard aborted: a walk is still active for the current book. Cancel and wait for it to finish before switching books.</span>';
+      }
+      showToast(
+        'Onboard aborted while a walk is still active for the current book.',
+        'error',
+      );
+      return;
+    }
+    // Stop polling the old book before switching (no orphaned poller);
+    // startWalkPolling() below opens the new book's poller.
+    stopWalkPolling();
+  }
+
   try {
     const result = await pipelineOnboard(file);
+
     currentBookId = result.book_id;
     setPipelineBookId(result.book_id);
 
@@ -959,8 +1074,20 @@ async function handleReonboard(): Promise<void> {
     `Re-onboard book ${currentBookId}? This will clear all walk outputs and create a new version. This cannot be undone.`,
   )) return;
 
+  // Re-onboard coordination (P4-S3): a re-onboard clears ALL walk outputs and
+  // bumps the book version, so it must never run while a writer could still
+  // execute. Cancel the current book's active walk(s) and await their terminal
+  // cleanup BEFORE posting reonboard. On contention/failure keep the identity
+  // and abort — do not reset the walk UI optimistically.
+  const bookId = currentBookId;
+  const clean = await waitForWalkCleanup(bookId);
+  if (!clean) {
+    showToast('Re-onboard aborted: cancel the active walk and wait for it to finish before re-onboarding.', 'error');
+    return;
+  }
+
   try {
-    const result = await pipelineReonboard(currentBookId);
+    const result = await pipelineReonboard(bookId);
     showToast(
       `Re-onboarded successfully. New version: ${result.version}.`,
       'success',

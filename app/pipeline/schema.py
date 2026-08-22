@@ -630,6 +630,31 @@ def _ensure_span_pause_column(connection: sqlite3.Connection) -> None:
         )
 
 
+_RUN_OWNERSHIP_INDEXES = """
+-- Run-owned cleanup lookup indexes (Plan R, P2-S1).  Run-owned cancellation
+-- cleanup (CONTRACTS.md "Run-Owned versus Protected Data" matrix) keys on
+-- run_id / source_run_id plus status/manual guards.  These ADDITIVE indexes
+-- make run-owned row lookup index-backed rather than a full scan.
+--
+-- Ownership semantics: no hard FK or run_id backfill is introduced here —
+-- ``walk_review_item.run_id`` is intentionally FK-free and NULLABLE so
+-- legacy/direct-call rows with NULL run_id remain valid and unprovenanced.
+-- ``workbench_provenance.run_id`` and ``character_scene_generated.source_run_id``
+-- already reference ``walk_run(run_id)`` in their DDL.  NULL run_id rows never
+-- match run-owned cleanup (the matrix protects unprovenanced rows from
+-- blanket deletion).  All three are idempotent CREATE INDEX IF NOT EXISTS.
+
+CREATE INDEX IF NOT EXISTS idx_walk_review_item_run
+    ON walk_review_item (run_id);
+
+CREATE INDEX IF NOT EXISTS idx_character_scene_generated_source_run
+    ON character_scene_generated (source_run_id);
+
+CREATE INDEX IF NOT EXISTS idx_workbench_provenance_run
+    ON workbench_provenance (run_id);
+"""
+
+
 def create_schema(connection: sqlite3.Connection) -> None:
     """Create all pipeline tables and views on *connection*.
 
@@ -658,6 +683,7 @@ def create_schema(connection: sqlite3.Connection) -> None:
              )"""
     )
     connection.executescript(_SPEAKER_UNIQUE_INDEX)
+    connection.executescript(_RUN_OWNERSHIP_INDEXES)
     _ensure_book_single_speaker_column(connection)
     _ensure_paragraph_text_column(connection)
     _ensure_book_pause_columns(connection)

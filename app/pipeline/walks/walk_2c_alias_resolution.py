@@ -377,9 +377,7 @@ def _merge_group(
         persist_global=False,
     )
 
-    conn = storage.get_connection()
-    conn.execute("SAVEPOINT merge_group")
-    try:
+    with storage.savepoint("merge_group"):
         decision_id = None
         if persist_global_aliases:
             _consolidate_aliases(
@@ -411,12 +409,6 @@ def _merge_group(
             _redirect_junctions(storage, canonical_id, nc_id, book_id)
             merged_ids.add(nc_id)
             result["characters_merged"] += 1
-
-        conn.execute("RELEASE SAVEPOINT merge_group")
-    except Exception:
-        conn.execute("ROLLBACK TO SAVEPOINT merge_group")
-        conn.execute("RELEASE SAVEPOINT merge_group")
-        raise
 
     if is_review:
         result["merges_for_review"] += 1

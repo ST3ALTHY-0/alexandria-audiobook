@@ -20,7 +20,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel
 
 from app.pipeline.adapter import PipelineStorage, SQLiteAdapter
-from app.pipeline.assembly import reonboard_book
+from app.pipeline.assembly import get_book_version, has_active_run, reonboard_book
 from app.pipeline.extract import extract_epub_text
 from app.pipeline.populate import populate_spine
 from app.pipeline.tts_integration import get_render_root
@@ -30,6 +30,11 @@ def _write_bytes(path: str, content: bytes) -> None:
     """Persist uploaded bytes to *path* with a blocking write (off the event loop)."""
     with open(path, "wb") as f:
         f.write(content)
+
+
+# Retry-After advertized when re-onboard is blocked by an active walk
+# (CONTRACTS.md contention contract — consistent with the app-level 503 mapping).
+_REONBOARD_CONTENTION_RETRY_AFTER_SECONDS = 5
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +175,38 @@ async def reonboard(
     request: ReonboardRequest,
     storage: PipelineStorage = Depends(get_storage),
 ) -> dict:
-    """Re-onboard a book: clear walk outputs, bump version."""
+    """Re-onboard a book: clear walk outputs, bump version.
+
+    Coordinates with the global walk controller (CONTRACTS.md "Onboarding /
+    re-onboarding / book-switching coordination"): if any ``walk_run`` row for
+    the book is active (``pending``/``running``), replacement data may NOT
+    become current while that writer could still run, so the synchronous path
+    does NOT clear/replace and instead returns a documented conflict —
+    HTTP 503 + ``Retry-After`` (consistent with the app-level contention
+    mapping) — rather than hanging the request thread. The frontend cancels the
+    active walk and awaits terminal cleanup before retrying.
+
+    Existence is checked first: unknown books map to 404. Only after
+    confirming the book exists and no active run remains does
+    ``reonboard_book`` clear outputs / bump ``version``.
+    """
+    # 404 (unknown book) is preserved and checked BEFORE the active-run check.
+    try:
+        get_book_version(request.book_id, storage)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    # 503 + Retry-After contention (book replacement while a writer is active).
+    if has_active_run(request.book_id, storage):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "A walk is still active for this book — cancel it and retry "
+                f"after {_REONBOARD_CONTENTION_RETRY_AFTER_SECONDS}s"
+            ),
+            headers={"Retry-After": str(_REONBOARD_CONTENTION_RETRY_AFTER_SECONDS)},
+        )
+
     try:
         new_version = reonboard_book(request.book_id, storage)
     except ValueError as exc:

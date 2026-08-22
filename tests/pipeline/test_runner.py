@@ -22,6 +22,7 @@ import time
 import types
 import uuid
 from pathlib import Path
+from typing import ClassVar
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -257,8 +258,13 @@ class TestSerialExecution:
         assert result["status"] == "failed"
         assert "already running" in result["error"]
 
-    def test_different_books_can_run_same_walk(self, runner):
-        """Different books can run the same walk independently."""
+    def test_different_books_run_sequentially_through_global_gate(self, runner):
+        """Different books run the SAME walk only sequentially.
+
+        The CONTRACTS.md single-active-walk override serializes execution across
+        ALL books: a book-2 walk may not begin while book-1's is active, so the
+        two runs must complete in order (no interleaving). Running them one
+        after another on a clear gate succeeds for both."""
         call_order = []
 
         def execute_fn(book_id, storage, config):
@@ -266,7 +272,10 @@ class TestSerialExecution:
             return {"status": "completed"}
 
         mock_module = _make_mock_walk_module(execute_fn)
-        with patch.object(WalkRunner, "_load_walk_module", return_value=mock_module):
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
             runner.run_walk("walk_2a_scene_segmentation", "book-1", {})
             runner.run_walk("walk_2a_scene_segmentation", "book-2", {})
         assert call_order == ["book-1", "book-2"]
@@ -2327,11 +2336,20 @@ class TestWalkLogSinkContextVar:
 
 
 class TestWalkModuleStaticAudit:
-    """Static/import audit: the nine ``walk_2*.py`` modules remain
-    byte-identical to git HEAD (no edits) and never import the Part B seam
-    (implementation imports forbidden). The final representative-execution test
-    drives a helper-instrumented walk through the reserved runner seam and
-    asserts the run's sink receives both ``llm`` and ``parse`` records."""
+    """Static/import audit for the nine ``walk_2*.py`` modules.
+
+    The old ''byte-identical to git HEAD'' invariant was INTENTIONALLY dropped
+    (P5-S4): Phases 2-4 migrated walks 2b-2i from raw
+    ``conn.execute("SAVEPOINT ...")`` blocks to ``storage.savepoint(...)`` and
+    applied ``persona_revision`` changes to walks 2f/2g/2i, so the modules are
+    deliberately no longer byte-identical to HEAD. This structural audit
+    replaces the byte-equality assertion: every module must parse, no raw
+    SAVEPOINT / ROLLBACK TO / RELEASE statement may remain executed through
+    ``get_connection()``, and every migrated walk must use ``storage.savepoint()``.
+    Walk modules still never import the Part B seam (implementation imports
+    forbidden). The final representative-execution test drives a
+    helper-instrumented walk through the reserved runner seam and asserts the
+    run's sink receives both ``llm`` and ``parse`` records."""
 
     _REPO_ROOT = Path(__file__).resolve().parents[2]
     _WALK_DIR = _REPO_ROOT / "app/pipeline/walks"
@@ -2346,26 +2364,52 @@ class TestWalkModuleStaticAudit:
         "WalkLogSink",
         "log_service",
     )
+    #: Walks that were migrated to ``storage.savepoint()`` in Phase 3.
+    MIGRATED_SAVEPOINT_WALKS: ClassVar[set[str]] = {
+        "2b",
+        "2c",
+        "2d",
+        "2e",
+        "2f",
+        "2g",
+        "2h",
+        "2i",
+    }
 
     def _walk_files(self):
         return sorted(self._WALK_DIR.glob("walk_2*.py"))
 
-    def test_walk_modules_byte_identical_to_git_head(self):
-        import subprocess
+    def test_walk_modules_migrated_savepoint_parse_and_no_raw_sql(self):
+        """Every walk parses; walks 2b-2i use ``storage.savepoint()``; and no raw
+        SAVEPOINT / ROLLBACK TO / RELEASE is executed through
+        ``get_connection()`` (P5-S4 structural audit replacing byte-identical)."""
+        import ast
+        import re
 
+        raw_stmt = re.compile(
+            r"\.execute\(\s*[\"']"
+            r"(?:SAVEPOINT|ROLLBACK\s+TO(?:\s+SAVEPOINT)?|RELEASE\s+SAVEPOINT)"
+        )
+        seen_migrated: set[str] = set()
         for path in self._walk_files():
-            rel = path.relative_to(self._REPO_ROOT)
-            proc = subprocess.run(
-                ["git", "show", f"HEAD:{rel.as_posix()}"],
-                capture_output=True,
-                check=False,
-                cwd=self._REPO_ROOT,
+            source = path.read_text(encoding="utf-8")
+            ast.parse(source)  # must be syntactically valid
+            match = re.search(r"walk_2([a-i])_", path.name)
+            assert match is not None, f"unexpected walk filename {path.name}"
+            label = "2" + match.group(1)
+            # No raw savepoint control may be executed through a connection.
+            assert not raw_stmt.search(source), (
+                f"{path.name} still executes a raw SAVEPOINT/ROLLBACK/RELEASE "
+                "through get_connection(); use storage.savepoint() instead"
             )
-            assert proc.returncode == 0, f"{rel} not tracked in git HEAD"
-            assert path.read_bytes() == proc.stdout, (
-                f"{rel} modified from git HEAD — the nine walk modules must remain "
-                "byte-identical"
-            )
+            if label in self.MIGRATED_SAVEPOINT_WALKS:
+                assert "with storage.savepoint(" in source, (
+                    f"{path.name} should use storage.savepoint() after migration"
+                )
+                seen_migrated.add(label)
+        assert seen_migrated == self.MIGRATED_SAVEPOINT_WALKS, (
+            "not every expected walk uses storage.savepoint()"
+        )
 
     def test_walk_modules_have_no_implementation_imports(self):
         for path in self._walk_files():
@@ -2417,3 +2461,584 @@ class TestWalkModuleStaticAudit:
         events = [r["event"] for r in sink.records]
         assert "llm" in events
         assert "parse" in events
+
+
+# ---------------------------------------------------------------------------
+# P5-S1 — global single-active-walk gate regression (CONTRACTS.md override)
+# ---------------------------------------------------------------------------
+
+
+def _insert_running_row(storage, run_id: str, book_id: str, walk_name: str) -> None:
+    """Insert a square 'running' walk_run row (an active writer for a book)."""
+    _insert_pending_row(storage, run_id, book_id, walk_name)
+    storage.execute_update(
+        "UPDATE walk_run SET status = 'running' WHERE run_id = ?", (run_id,)
+    )
+
+
+def _seed_series(storage, series_id: str) -> None:
+    storage.execute_insert("INSERT OR IGNORE INTO series (id) VALUES (?)", (series_id,))
+
+
+def _seed_book(storage, book_id: str, series_id: str) -> None:
+    _seed_series(storage, series_id)
+    storage.execute_insert(
+        "INSERT OR IGNORE INTO book (id, series_id, position) VALUES (?, ?, 1)",
+        (book_id, series_id),
+    )
+
+
+def _seed_scene(storage, scene_id: str) -> None:
+    storage.execute_insert("INSERT OR IGNORE INTO scene (id) VALUES (?)", (scene_id,))
+
+
+def _seed_character(storage, character_id: str, name: str = "Char") -> None:
+    storage.execute_insert(
+        "INSERT OR IGNORE INTO character (id, name) VALUES (?, ?)",
+        (character_id, name),
+    )
+
+
+class TestGlobalSingleActiveWalk:
+    """P5-S1: regression for the process-wide single-active-walk gate.
+
+    Locks the CONTRACTS.md Critical Override: at most ONE active walk across
+    ALL books and every admission path. A 'running' row on book A blocks a
+    reservation for book B (global gate, not per-book); a blocked reservation
+    terminalizes its OWN pending row to 'failed' WITHOUT executing; every
+    admission path (run_walk sync, run_all_walks_reserved, background) routes
+    through the same run_walk_reserved gate; an active module observes
+    cancellation at a write checkpoint and stops; a cancelled-before-start run
+    produces no output and opens no sink; and a replacement run cannot start
+    until the prior run's cleanup completed (no overlapping 'running' rows).
+    """
+
+    BOOK_A = "11111111-2222-3333-4444-555555555555"
+    BOOK_B = "bbbbbbbb-1111-1111-1111-111111111111"
+    WALK = "walk_2a_scene_segmentation"
+
+    def _runner(self, storage):
+        return WalkRunner(storage, log_service=_FakeLogService())
+
+    def test_running_row_on_other_book_blocks_reservation(self, storage):
+        run_a = str(uuid.uuid4())
+        _insert_running_row(storage, run_a, self.BOOK_A, self.WALK)
+        run_b = str(uuid.uuid4())
+        _insert_pending_row(storage, run_b, self.BOOK_B, self.WALK)
+        runner = self._runner(storage)
+        execute_fn = MagicMock(return_value={"status": "completed"})
+        with patch.object(
+            WalkRunner,
+            "_load_walk_module",
+            return_value=_make_mock_walk_module(execute_fn),
+        ):
+            result = runner.run_walk_reserved(run_b, self.WALK, self.BOOK_B, {})
+        # Blocked: failed, did not execute.
+        assert result["status"] == "failed"
+        assert "already running" in result["error"]
+        execute_fn.assert_not_called()
+        # Book A's active row untouched; book B's reservation terminalized.
+        rows = storage.execute_query(
+            "SELECT status FROM walk_run WHERE run_id = ?", (run_a,)
+        )
+        assert rows[0]["status"] == "running"
+        rows = storage.execute_query(
+            "SELECT status, error FROM walk_run WHERE run_id = ?", (run_b,)
+        )
+        assert rows[0]["status"] == "failed"
+        assert "already running" in rows[0]["error"]
+
+    def test_sync_run_walk_respects_global_gate(self, storage):
+        """The sync run_walk admission path shares the same global gate."""
+        run_a = str(uuid.uuid4())
+        _insert_running_row(storage, run_a, self.BOOK_A, self.WALK)
+        runner = self._runner(storage)
+        execute_fn = MagicMock(return_value={"status": "completed"})
+        with patch.object(
+            WalkRunner,
+            "_load_walk_module",
+            return_value=_make_mock_walk_module(execute_fn),
+        ):
+            result = runner.run_walk(self.WALK, self.BOOK_B, {})
+        assert result["status"] == "failed"
+        assert "already running" in result["error"]
+        execute_fn.assert_not_called()
+        rows = storage.execute_query(
+            "SELECT status FROM walk_run WHERE book_id = ?", (self.BOOK_B,)
+        )
+        assert rows[0]["status"] == "failed"
+
+    def test_run_all_walks_reserved_child_blocked_aborts_batch(self, storage):
+        """The run-all reservation path shares the gate: its first child is
+        blocked by another book's running row and the batch is terminalized
+        without executing (no child ever becomes 'running')."""
+        run_a = str(uuid.uuid4())
+        _insert_running_row(storage, run_a, self.BOOK_A, self.WALK)
+        reservations = [(w, str(uuid.uuid4())) for w in WALK_ORDER]
+        batch_id = str(uuid.uuid4())
+        for w, rid in reservations:
+            _insert_pending_row(storage, rid, self.BOOK_B, w)
+        runner = self._runner(storage)
+        execute_fn = MagicMock(return_value={"status": "completed"})
+        with patch.object(
+            WalkRunner,
+            "_load_walk_module",
+            return_value=_make_mock_walk_module(execute_fn),
+        ):
+            results = runner.run_all_walks_reserved(
+                batch_id, reservations, self.BOOK_B, {}
+            )
+        first_walk = reservations[0][0]
+        assert results[first_walk]["status"] == "failed"
+        execute_fn.assert_not_called()
+        rows = storage.execute_query(
+            "SELECT status FROM walk_run WHERE book_id = ?", (self.BOOK_B,)
+        )
+        assert all(r["status"] != "running" for r in rows)
+
+    def test_background_admission_respects_global_gate(self, storage):
+        """A background-thread reservation (the same run_walk_reserved path
+        used by background execution) is blocked by another book's running row."""
+        run_a = str(uuid.uuid4())
+        _insert_running_row(storage, run_a, self.BOOK_A, self.WALK)
+        run_b = str(uuid.uuid4())
+        _insert_pending_row(storage, run_b, self.BOOK_B, self.WALK)
+        runner = self._runner(storage)
+        execute_fn = MagicMock(return_value={"status": "completed"})
+        result_holder: dict = {}
+        with patch.object(
+            WalkRunner,
+            "_load_walk_module",
+            return_value=_make_mock_walk_module(execute_fn),
+        ):
+            t = threading.Thread(
+                target=lambda: result_holder.__setitem__(
+                    "result",
+                    runner.run_walk_reserved(run_b, self.WALK, self.BOOK_B, {}),
+                )
+            )
+            t.start()
+            t.join(timeout=10)
+        assert not t.is_alive()
+        assert result_holder["result"]["status"] == "failed"
+        execute_fn.assert_not_called()
+
+    def test_active_module_observes_cancellation_at_write_checkpoint(self, storage):
+        """An admitted module observes a mid-run cancellation at the next write
+        checkpoint (HeartbeatStorage cancel_check) and stops as 'cancelled'."""
+        run_id = str(uuid.uuid4())
+        _insert_pending_row(storage, run_id, self.BOOK_A, self.WALK)
+        runner = self._runner(storage)
+        entered = threading.Event()
+        release = threading.Event()
+        result_holder: dict = {}
+
+        def execute_fn(book_id, hbs, config):
+            entered.set()
+            release.wait(timeout=10)
+            # This write boundary is its own cancel checkpoint: it raises
+            # WalkCancelledError because cancel_walks was requested meanwhile.
+            hbs.execute_insert("INSERT INTO series (id) VALUES (?)", ("mid-write",))
+            return {"status": "completed"}
+
+        mock_module = _make_mock_walk_module(execute_fn)
+        with patch.object(WalkRunner, "_load_walk_module", return_value=mock_module):
+            t = threading.Thread(
+                target=lambda: result_holder.__setitem__(
+                    "result",
+                    runner.run_walk_reserved(run_id, self.WALK, self.BOOK_A, {}),
+                )
+            )
+            t.start()
+            assert entered.wait(timeout=5)
+            runner.cancel_walks(self.BOOK_A)
+            release.set()
+            t.join(timeout=10)
+        assert not t.is_alive()
+        assert result_holder["result"]["status"] == "cancelled"
+        rows = storage.execute_query(
+            "SELECT status FROM walk_run WHERE run_id = ?", (run_id,)
+        )
+        assert rows[0]["status"] == "cancelled"
+        # The write after the checkpoint never committed.
+        rows = storage.execute_query("SELECT id FROM series")
+        assert rows == []
+
+    def test_cancelled_before_start_produces_no_output_and_no_sink(self, storage):
+        run_id = str(uuid.uuid4())
+        _insert_pending_row(storage, run_id, self.BOOK_A, self.WALK)
+        service = _FakeLogService()
+        runner = WalkRunner(storage, log_service=service)
+        runner.cancel_walks(self.BOOK_A)
+        execute_fn = MagicMock(return_value={"status": "completed", "scenes": 99})
+        with patch.object(
+            WalkRunner,
+            "_load_walk_module",
+            return_value=_make_mock_walk_module(execute_fn),
+        ):
+            result = runner.run_walk_reserved(run_id, self.WALK, self.BOOK_A, {})
+        assert result["status"] == "cancelled"
+        execute_fn.assert_not_called()  # walk never executed -> no generated output
+        assert run_id not in service.sinks  # open_run never called -> no sink
+        assert run_id not in service.closed_ids  # no terminal record emitted
+        rows = storage.execute_query(
+            "SELECT status FROM walk_run WHERE run_id = ?", (run_id,)
+        )
+        assert rows[0]["status"] == "cancelled"
+
+    def test_escaped_base_exception_finalizes_and_releases_gate(self, storage):
+        """A KeyboardInterrupt escaping active execution is caught by the outer
+        ``except BaseException`` finalizer: the run is terminalized (failed, not
+        stranded 'running'), run-owned cleanup runs, the global gate is released
+        (a replacement run on another book is admitted), and the KeyboardInterrupt
+        is re-raised to the caller."""
+        run_a = str(uuid.uuid4())
+        _insert_pending_row(storage, run_a, self.BOOK_A, self.WALK)
+        # Run-owned pending review item for run_a: must be cleaned up by the
+        # BaseException finalizer path.
+        storage.execute_insert(
+            "INSERT INTO walk_review_item (id, book_id, run_id, kind, status) "
+            "VALUES (?, ?, ?, 'instruction', 'pending')",
+            ("ri-baseexc", self.BOOK_A, run_a),
+        )
+        runner = self._runner(storage)
+        mock_module = _make_mock_walk_module(MagicMock(side_effect=KeyboardInterrupt()))
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+            pytest.raises(KeyboardInterrupt),
+        ):
+            runner.run_walk_reserved(run_a, self.WALK, self.BOOK_A, {})
+        # (a) The run terminalizes to 'failed' — no stranded 'running' row.
+        rows = storage.execute_query(
+            "SELECT status FROM walk_run WHERE run_id = ?", (run_a,)
+        )
+        assert rows[0]["status"] == "failed"
+        # (c) Run-owned cleanup ran during finalization.
+        rows = storage.execute_query(
+            "SELECT id FROM walk_review_item WHERE run_id = ?", (run_a,)
+        )
+        assert rows == []
+        # (b) The global gate is released: a replacement run on ANOTHER book is
+        # admitted and completes normally.
+        run_b = str(uuid.uuid4())
+        _insert_pending_row(storage, run_b, self.BOOK_B, self.WALK)
+        ok_fn = MagicMock(return_value={"status": "completed"})
+        with (
+            patch.object(
+                WalkRunner,
+                "_load_walk_module",
+                return_value=_make_mock_walk_module(ok_fn),
+            ),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
+            res2 = runner.run_walk_reserved(run_b, self.WALK, self.BOOK_B, {})
+        assert res2["status"] == "completed"
+
+    def test_cleanup_completes_before_replacement_run_starts(self, storage):
+        """A failed run's run-owned cleanup finishes before a replacement run on
+        another book is admitted — never two 'running' rows at once."""
+        run_a = str(uuid.uuid4())
+        _insert_pending_row(storage, run_a, self.BOOK_A, self.WALK)
+        storage.execute_insert(
+            "INSERT INTO walk_review_item (id, book_id, run_id, kind, status) "
+            "VALUES (?, ?, ?, 'instruction', 'pending')",
+            ("ri-a", self.BOOK_A, run_a),
+        )
+        runner = self._runner(storage)
+        mock_module = _make_mock_walk_module(
+            MagicMock(side_effect=RuntimeError("boom"))
+        )
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
+            result = runner.run_walk_reserved(run_a, self.WALK, self.BOOK_A, {})
+        assert result["status"] == "failed"
+        # Run-owned output was cleaned up during _finish_run (cleanup before
+        # the row is finalized -> gate releases only after cleanup).
+        rows = storage.execute_query(
+            "SELECT id FROM walk_review_item WHERE run_id = ?", (run_a,)
+        )
+        assert rows == []
+        # Gate is released: a replacement run for a DIFFERENT book can start.
+        run_b = str(uuid.uuid4())
+        _insert_pending_row(storage, run_b, self.BOOK_B, self.WALK)
+        ok_fn = MagicMock(return_value={"status": "completed"})
+        with (
+            patch.object(
+                WalkRunner,
+                "_load_walk_module",
+                return_value=_make_mock_walk_module(ok_fn),
+            ),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
+            res2 = runner.run_walk_reserved(run_b, self.WALK, self.BOOK_B, {})
+        assert res2["status"] == "completed"
+
+
+# ---------------------------------------------------------------------------
+# P5-S2 — run-owned cleanup regression coverage
+# ---------------------------------------------------------------------------
+
+
+class TestRunOwnedCleanup:
+    """Regression coverage for ``_cleanup_run_owned``.
+
+    Base on the actual tables per schema: walk_review_item (run_id + status
+    pending), character_scene_generated (source_run_id), workbench_provenance
+    (run_id). The cleanup must delete only run-Owned generated rows; protected
+    rows (later-run overwrites, manual/human/absence, resolved/superseded
+    items, NULL-run direct-call rows, alias-merge undo history) are preserved,
+    the run_history (walk_run row) is retained, and re-invoking is a no-op.
+    """
+
+    BOOK = "11111111-2222-3333-4444-555555555555"
+    SERIES = "ser-1"
+    WALK = "walk_2a_scene_segmentation"
+
+    def _run(self, storage, run_id):
+        _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
+
+    def _review_item(
+        self, storage, item_id, run_id, status="pending", kind="instruction"
+    ):
+        storage.execute_insert(
+            "INSERT INTO walk_review_item (id, book_id, run_id, kind, status) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (item_id, self.BOOK, run_id, kind, status),
+        )
+
+    def _generated(self, storage, gid, run_id, char_id, scene_id, rev=1):
+        _seed_book(storage, self.BOOK, self.SERIES)
+        _seed_character(storage, char_id)
+        _seed_scene(storage, scene_id)
+        storage.execute_insert(
+            "INSERT INTO character_scene_generated (id, book_id, character_id, "
+            "scene_id, relation_type, confidence, generation_revision, "
+            "source_run_id) VALUES (?, ?, ?, ?, 'present', 0.9, ?, ?)",
+            (gid, self.BOOK, char_id, scene_id, rev, run_id),
+        )
+
+    def _provenance(self, storage, pid, run_id, rev=1, source="walk"):
+        _seed_book(storage, self.BOOK, self.SERIES)
+        storage.execute_insert(
+            "INSERT INTO workbench_provenance (provenance_id, book_id, target_kind, "
+            "target_key, run_id, generation_revision, source, created_ms) "
+            "VALUES (?, ?, 'review', 'k', ?, ?, ?, 1000)",
+            (pid, self.BOOK, run_id, rev, source),
+        )
+
+    def test_removes_run_owned_generated_and_provenance(self, storage):
+        run_id = str(uuid.uuid4())
+        self._run(storage, run_id)
+        self._review_item(storage, "ri-1", run_id)
+        self._generated(storage, "g-1", run_id, "ch-1", "sc-1")
+        self._provenance(storage, "prov-1", run_id)
+        WalkRunner(storage)._cleanup_run_owned(run_id)
+        assert (
+            storage.execute_query(
+                "SELECT id FROM walk_review_item WHERE run_id = ?", (run_id,)
+            )
+            == []
+        )
+        assert (
+            storage.execute_query(
+                "SELECT id FROM character_scene_generated WHERE source_run_id = ?",
+                (run_id,),
+            )
+            == []
+        )
+        assert (
+            storage.execute_query(
+                "SELECT provenance_id FROM workbench_provenance WHERE run_id = ?",
+                (run_id,),
+            )
+            == []
+        )
+
+    def test_pending_removed_but_resolved_and_superseded_retained(self, storage):
+        run_id = str(uuid.uuid4())
+        self._run(storage, run_id)
+        self._review_item(storage, "ri-pending", run_id, status="pending")
+        self._review_item(storage, "ri-resolved", run_id, status="resolved")
+        self._review_item(storage, "ri-superseded", run_id, status="superseded")
+        WalkRunner(storage)._cleanup_run_owned(run_id)
+        remaining = [
+            r["id"]
+            for r in storage.execute_query(
+                "SELECT id FROM walk_review_item WHERE run_id = ?", (run_id,)
+            )
+        ]
+        assert remaining == ["ri-resolved", "ri-superseded"]
+
+    def test_later_run_overwrite_preserved(self, storage):
+        """Row rewritten by a LATER run (different source_run_id) is preserved."""
+        this_run = str(uuid.uuid4())
+        later_run = str(uuid.uuid4())
+        self._run(storage, this_run)
+        self._run(storage, later_run)
+        self._generated(storage, "g-this", this_run, "ch-a", "sc-a")
+        self._generated(storage, "g-later", later_run, "ch-b", "sc-b")
+        WalkRunner(storage)._cleanup_run_owned(this_run)
+        assert (
+            storage.execute_query(
+                "SELECT id FROM character_scene_generated WHERE id = ?", ("g-later",)
+            )
+            != []
+        )
+        assert (
+            storage.execute_query(
+                "SELECT id FROM character_scene_generated WHERE id = ?", ("g-this",)
+            )
+            == []
+        )
+
+    def test_manual_human_and_absence_rows_preserved(self, storage):
+        """Cleanup never touches manual projections or human absence tombstones."""
+        run_id = str(uuid.uuid4())
+        self._run(storage, run_id)
+        self._seed_book_row(storage)
+        self._seed_decision(storage, "dec-1")
+        _seed_character(storage, "ch-m")
+        _seed_scene(storage, "sc-m")
+        _seed_character(storage, "ch-a")
+        _seed_scene(storage, "sc-a")
+        storage.execute_insert(
+            "INSERT INTO character_scene_manual (id, book_id, character_id, scene_id, "
+            "relation_type, decision_id) VALUES ('m-1', ?, ?, ?, 'present', 'dec-1')",
+            (self.BOOK, "ch-m", "sc-m"),
+        )
+        storage.execute_insert(
+            "INSERT INTO character_scene_absence (book_id, scene_id, character_id, "
+            "decision_id, active, created_ms) VALUES (?, ?, ?, 'dec-1', 1, 1000)",
+            (self.BOOK, "sc-a", "ch-a"),
+        )
+        WalkRunner(storage)._cleanup_run_owned(run_id)
+        assert (
+            storage.execute_query(
+                "SELECT id FROM character_scene_manual WHERE id = 'm-1'"
+            )
+            != []
+        )
+        assert (
+            storage.execute_query(
+                "SELECT character_id FROM character_scene_absence "
+                "WHERE character_id = 'ch-a'"
+            )
+            != []
+        )
+
+    def test_null_run_direct_call_rows_preserved(self, storage):
+        """Rows authored OUTSIDE any run (NULL run_id / source_run_id) survive."""
+        run_id = str(uuid.uuid4())
+        self._run(storage, run_id)
+        self._seed_book_row(storage)
+        storage.execute_insert(
+            "INSERT INTO walk_review_item (id, book_id, run_id, kind, status) "
+            "VALUES ('ri-null', ?, NULL, 'instruction', 'pending')",
+            (self.BOOK,),
+        )
+        _seed_character(storage, "ch-n")
+        _seed_scene(storage, "sc-n")
+        storage.execute_insert(
+            "INSERT INTO character_scene_generated (id, book_id, character_id, "
+            "scene_id, relation_type, confidence, generation_revision, "
+            "source_run_id) VALUES ('g-null', ?, ?, ?, 'present', 0.8, 1, NULL)",
+            (self.BOOK, "ch-n", "sc-n"),
+        )
+        self._seed_book_row(storage)
+        storage.execute_insert(
+            "INSERT INTO workbench_provenance (provenance_id, book_id, target_kind, "
+            "target_key, run_id, generation_revision, source, created_ms) "
+            "VALUES ('prov-null', ?, 'review', 'k', NULL, 1, 'human', 1000)",
+            (self.BOOK,),
+        )
+        WalkRunner(storage)._cleanup_run_owned(run_id)
+        assert (
+            storage.execute_query(
+                "SELECT id FROM walk_review_item WHERE id = 'ri-null'"
+            )
+            != []
+        )
+        assert (
+            storage.execute_query(
+                "SELECT id FROM character_scene_generated WHERE id = 'g-null'"
+            )
+            != []
+        )
+        assert (
+            storage.execute_query(
+                "SELECT provenance_id FROM workbench_provenance "
+                "WHERE provenance_id = 'prov-null'"
+            )
+            != []
+        )
+
+    def test_alias_merge_undo_history_preserved(self, storage):
+        run_id = str(uuid.uuid4())
+        self._run(storage, run_id)
+        self._seed_book_row(storage)
+        self._seed_decision(storage, "dec-m")
+        _seed_character(storage, "ch-can")
+        _seed_character(storage, "ch-mem")
+        storage.execute_insert(
+            "INSERT INTO character_alias_merge (merge_id, book_id, canonical_id, "
+            "member_id, merge_revision, decision_id, status, prior_member_name, "
+            "prior_member_aliases_json, consequence_json, created_ms) "
+            "VALUES ('mg-1', ?, ?, ?, 1, 'dec-m', 'active', 'Old', '[]', '{}', 1000)",
+            (self.BOOK, "ch-can", "ch-mem"),
+        )
+        WalkRunner(storage)._cleanup_run_owned(run_id)
+        assert (
+            storage.execute_query(
+                "SELECT merge_id FROM character_alias_merge WHERE merge_id = 'mg-1'"
+            )
+            != []
+        )
+
+    def test_run_history_retained_after_cleanup(self, storage):
+        run_id = str(uuid.uuid4())
+        self._run(storage, run_id)
+        self._review_item(storage, "ri-1", run_id)
+        WalkRunner(storage)._cleanup_run_owned(run_id)
+        assert (
+            storage.execute_query(
+                "SELECT run_id FROM walk_run WHERE run_id = ?", (run_id,)
+            )
+            != []
+        )
+
+    def test_cleanup_is_idempotent_and_noop_on_second_call(self, storage):
+        run_id = str(uuid.uuid4())
+        self._run(storage, run_id)
+        self._review_item(storage, "ri-1", run_id)
+        runner = WalkRunner(storage)
+        runner._cleanup_run_owned(run_id)
+        assert (
+            storage.execute_query(
+                "SELECT id FROM walk_review_item WHERE run_id = ?", (run_id,)
+            )
+            == []
+        )
+        deletes: list = []
+        real_delete = storage.execute_delete
+        storage.execute_delete = lambda sql, params=(): (
+            deletes.append(sql),
+            real_delete(sql, params),
+        )[1]
+        runner._cleanup_run_owned(run_id)
+        assert deletes == []  # skip-verified second call issues no writes
+
+    def _seed_book_row(self, storage):
+        _seed_book(storage, self.BOOK, self.SERIES)
+
+    def _seed_decision(self, storage, decision_id):
+        _seed_book(storage, self.BOOK, self.SERIES)
+        storage.execute_insert(
+            "INSERT INTO workbench_decision (decision_id, book_id, target_kind, "
+            "target_key, decision_type, base_revision, payload_json, status, source, "
+            "created_ms) VALUES (?, ?, 'presence', 'k', 'auto', 0, '{}', 'active', "
+            "'human', 1000)",
+            (decision_id, self.BOOK),
+        )

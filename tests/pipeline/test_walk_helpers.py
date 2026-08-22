@@ -79,13 +79,13 @@ class TestExtractJsonRegexFallback:
 
     def test_list_with_markdown_code_block(self):
         """List JSON inside markdown code fences should be extracted."""
-        text = "```json\n[{\"name\": \"John\"}]\n```"
+        text = '```json\n[{"name": "John"}]\n```'
         result = extract_json_from_llm_response(text, expected_type="list")
         assert result == [{"name": "John"}]
 
     def test_dict_with_markdown_code_block(self):
         """Dict JSON inside markdown code fences should be extracted."""
-        text = "```json\n{\"key\": \"value\"}\n```"
+        text = '```json\n{"key": "value"}\n```'
         result = extract_json_from_llm_response(text, expected_type="dict")
         assert result == {"key": "value"}
 
@@ -163,7 +163,7 @@ class TestExtractJsonTypeValidation:
 
     def test_expected_type_auto_accepts_list(self):
         """expected_type='auto' should accept a list."""
-        text = '[1, 2, 3]'
+        text = "[1, 2, 3]"
         result = extract_json_from_llm_response(text, expected_type="auto")
         assert result == [1, 2, 3]
 
@@ -177,7 +177,7 @@ class TestExtractJsonTypeValidation:
     def test_expected_type_list_rejects_dict_with_regex_fallback(self):
         """expected_type='list' with text containing only a dict should return None
         even when regex fallback is needed."""
-        text = "Here is the data:\n{\"key\": \"value\"}\nDone."
+        text = 'Here is the data:\n{"key": "value"}\nDone.'
         result = extract_json_from_llm_response(text, expected_type="list")
         assert result is None
 
@@ -327,7 +327,9 @@ class TestChatCompletionLLMRecord:
     def test_chat_completion_emits_llm_record(self):
         from app.pipeline.walks._llm_helpers import WALK_LOG_SINK, chat_completion
 
-        usage = types.SimpleNamespace(prompt_tokens=10, completion_tokens=20, total_tokens=30)
+        usage = types.SimpleNamespace(
+            prompt_tokens=10, completion_tokens=20, total_tokens=30
+        )
         response = _Response("gpt-4o", _Choice("  hi there  ", "stop"), usage)
         client = _Client(response)
         sink, token = _set_sink()
@@ -430,6 +432,74 @@ class TestChatCompletionLLMRecord:
 
 
 # ---------------------------------------------------------------------------
+# P3-S2 — chat_completion raises WalkCancelledError from the CANCEL_CHECK probe
+# ---------------------------------------------------------------------------
+
+
+class TestChatCompletionCancelCheck:
+    """The shared ``chat_completion`` boundary checks the runner-attached
+    ``CANCEL_CHECK`` probe BEFORE the (non-interruptible) ``create`` call, so a
+    cancelled active run stops between units rather than mid-call. The probe is
+    a no-op outside a running walk (no value default), and when it raises
+    ``WalkCancelledError`` the create call is never reached."""
+
+    def test_cancel_probe_raises_walk_cancelled_before_create(self):
+        """A CANCEL_CHECK probe that raises WalkCancelledError aborts
+        chat_completion before client.chat.completions.create is called."""
+        from app.pipeline.walks._llm_helpers import (
+            CANCEL_CHECK,
+            WalkCancelledError,
+            chat_completion,
+        )
+
+        calls: list = []
+
+        class _RecordingCompletions:
+            def create(self, **kwargs):
+                calls.append(kwargs)
+                raise AssertionError(
+                    "create must not be called after a cancel checkpoint"
+                )
+
+        class _RecordingClient:
+            def __init__(self):
+                self.chat = _Chat(None)
+                self.chat.completions = _RecordingCompletions()
+
+        client = _RecordingClient()
+
+        # The probe lands on the run BEFORE chat_completion performs the
+        # non-interruptible create call, matching the runner's attachment.
+        token = CANCEL_CHECK.set(
+            lambda: (_ for _ in ()).throw(WalkCancelledError("run-123"))
+        )
+        raised: WalkCancelledError | None = None
+        try:
+            chat_completion(client, "m", 0.5, None, "sys", "usr")
+        except WalkCancelledError as exc:
+            raised = exc
+        finally:
+            CANCEL_CHECK.reset(token)
+
+        assert raised is not None  # WalkCancelledError propagated from the probe
+        assert calls == []  # client.create was never invoked
+
+    def test_no_probe_is_noop_and_create_reached(self):
+        """Without an attached probe, chat_completion proceeds to create (no
+        cancellation interruption on the shared boundary)."""
+        from app.pipeline.walks._llm_helpers import (
+            CANCEL_CHECK,
+            chat_completion,
+        )
+
+        assert CANCEL_CHECK.get() is None  # no probe attached by default
+        response = _Response("m", _Choice("  ok  ", "stop"), None)
+        client = _Client(response)
+        result = chat_completion(client, "m", 0.5, None, "sys", "usr")
+        assert result == "ok"
+
+
+# ---------------------------------------------------------------------------
 # P1-S6 — extract_json_from_llm_response emits an optional ``parse`` record
 # ---------------------------------------------------------------------------
 
@@ -501,7 +571,7 @@ class TestExtractJsonParseRecord:
 
         sink, token = _set_sink()
         try:
-            result = extract_json_from_llm_response('[1, 2, 3]', expected_type="dict")
+            result = extract_json_from_llm_response("[1, 2, 3]", expected_type="dict")
         finally:
             WALK_LOG_SINK.reset(token)
         assert result is None
