@@ -668,11 +668,12 @@ class TestAcceptReviewItem:
         manager.accept_review_item(scene_item["item_id"])
 
         rows = manager._storage.execute_query(
-            """SELECT confidence FROM character_scene
+            """SELECT confidence, human_override FROM character_scene
                WHERE character_id = ? AND scene_id = ?""",
             ("c1", "sc1"),
         )
         assert rows[0]["confidence"] == 1.0
+        assert rows[0]["human_override"] == 1
 
     def test_accept_span_item(self, manager):
         """Accepting a character_span item sets confidence to 1.0."""
@@ -686,11 +687,12 @@ class TestAcceptReviewItem:
         manager.accept_review_item(span_item["item_id"])
 
         rows = manager._storage.execute_query(
-            """SELECT confidence FROM character_span
+            """SELECT confidence, human_override FROM character_span
                WHERE character_id = ? AND span_id = ?""",
             ("c1", "sp1"),
         )
         assert rows[0]["confidence"] == 1.0
+        assert rows[0]["human_override"] == 1
 
     def test_accepted_item_no_longer_in_review(self, manager):
         """After accepting, the item no longer appears in review queue."""
@@ -877,7 +879,7 @@ class TestGetReviewItemsMultipleJunctionTypes:
             assert "item_id" in item
             # item_id should be parseable
             parts = item["item_id"].split(":")
-            assert len(parts) == 3
+            assert len(parts) in (3, 4)
             assert parts[0] == item["junction_table"]
 
     def test_each_item_has_required_fields(self, manager):
@@ -938,10 +940,10 @@ class TestWalkItemsInQueue:
     _JUNCTION_IDS = frozenset(
         {
             "character_book:c2:b1",
-            "character_scene:c1:sc1",
-            "character_scene:c3:sc2",
-            "character_span:c1:sp1",
-            "character_span:c4:sp3",
+            "character_scene:c1:sc1:present",
+            "character_scene:c3:sc2:present",
+            "character_span:c1:sp1:speaker",
+            "character_span:c4:sp3:speaker",
         }
     )
 
@@ -1582,7 +1584,7 @@ class TestReviewItemNeighborContext:
 
     def test_character_span_middle_span_full_window(self, neighbor_manager):
         """A span in the middle gets the full ±2 window, in presentation order."""
-        item = self._by_id(neighbor_manager)["character_span:c-nb:sp-nb3"]
+        item = self._by_id(neighbor_manager)["character_span:c-nb:sp-nb3:speaker"]
         assert item["neighbors"] == {
             "before": ["Span 1 text", "Span 2 text"],
             "after": ["Span 4 text", "Span 5 text"],
@@ -1590,13 +1592,13 @@ class TestReviewItemNeighborContext:
 
     def test_first_span_empty_before(self, neighbor_manager):
         """Item targeting the book's FIRST span → empty before."""
-        item = self._by_id(neighbor_manager)["character_span:c-nb:sp-nb1"]
+        item = self._by_id(neighbor_manager)["character_span:c-nb:sp-nb1:speaker"]
         assert item["neighbors"]["before"] == []
         assert item["neighbors"]["after"] == ["Span 2 text", "Span 3 text"]
 
     def test_last_span_empty_after(self, neighbor_manager):
         """Item targeting the book's LAST span → empty after."""
-        item = self._by_id(neighbor_manager)["character_span:c-nb:sp-nb5"]
+        item = self._by_id(neighbor_manager)["character_span:c-nb:sp-nb5:speaker"]
         assert item["neighbors"]["before"] == ["Span 3 text", "Span 4 text"]
         assert item["neighbors"]["after"] == []
 
@@ -1627,7 +1629,7 @@ class TestReviewItemNeighborContext:
             "(character_id, scene_id, relation_type, source, confidence) "
             "VALUES ('c-nb', 'sc-nb', 'present', 'walk', 0.57)"
         )
-        item = self._by_id(neighbor_manager)["character_scene:c-nb:sc-nb"]
+        item = self._by_id(neighbor_manager)["character_scene:c-nb:sc-nb:present"]
         assert item["neighbors"] == {"before": [], "after": []}
 
     def test_walk_item_targeting_span_outside_book_gets_empty_lists(

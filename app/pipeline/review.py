@@ -46,11 +46,11 @@ CONFIDENCE_REJECTED = 0.0
 # Item-ID helpers
 # ---------------------------------------------------------------------------
 
-# Format: "{junction_table}:{character_id}:{related_entity_id}"
+# Format: "{junction_table}:{character_id}:{related_entity_id}[:{relation_type}]"
 # Examples:
 #   "character_book:c1:b1"
-#   "character_scene:c1:sc1"
-#   "character_span:c1:sp1"
+#   "character_scene:c1:sc1:present"
+#   "character_span:c1:sp1:speaker"
 #   "character_series:c1:s1"
 
 _VALID_JUNCTION_TABLES = frozenset(
@@ -72,29 +72,48 @@ _JUNCTION_META: dict[str, dict[str, Any]] = {
 }
 
 
-def _parse_item_id(item_id: str) -> tuple[str, str, str]:
-    """Parse an item_id into (junction_table, character_id, related_entity_id).
+def _parse_item_id(item_id: str) -> tuple[str, str, str, str | None]:
+    """Parse an item_id into its junction identity components.
 
     Raises ``ValueError`` if the format is invalid.
     """
     parts = item_id.split(":")
-    if len(parts) != 3:
+    if len(parts) not in (3, 4):
         raise ValueError(
             f"Invalid item_id format: {item_id!r}. "
-            f"Expected '{{table}}:{{character_id}}:{{entity_id}}'"
+            f"Expected '{{table}}:{{character_id}}:{{entity_id}}[:{{relation_type}}]'"
         )
-    junction_table, character_id, related_entity_id = parts
+    junction_table, character_id, related_entity_id = parts[:3]
     if junction_table not in _VALID_JUNCTION_TABLES:
         raise ValueError(
             f"Unknown junction table: {junction_table!r}. "
             f"Must be one of {sorted(_VALID_JUNCTION_TABLES)}"
         )
-    return junction_table, character_id, related_entity_id
+    relation_type = parts[3] if len(parts) == 4 else None
+    if relation_type is None and _JUNCTION_META[junction_table]["extra_cols"]:
+        raise ValueError(
+            f"Invalid item_id format: {item_id!r}. "
+            f"{junction_table} items require relation_type"
+        )
+    if relation_type is not None and not _JUNCTION_META[junction_table]["extra_cols"]:
+        raise ValueError(
+            f"Invalid item_id format: {item_id!r}. "
+            f"{junction_table} items do not accept relation_type"
+        )
+    return junction_table, character_id, related_entity_id, relation_type
 
 
-def _make_item_id(junction_table: str, character_id: str, related_entity_id: str) -> str:
+def _make_item_id(
+    junction_table: str,
+    character_id: str,
+    related_entity_id: str,
+    relation_type: str | None = None,
+) -> str:
     """Build an item_id from its components."""
-    return f"{junction_table}:{character_id}:{related_entity_id}"
+    item_id = f"{junction_table}:{character_id}:{related_entity_id}"
+    if relation_type is not None:
+        item_id = f"{item_id}:{relation_type}"
+    return item_id
 
 
 def supersede_targets(
@@ -150,12 +169,8 @@ _WALK_TARGET_WRITES: dict[str, str] = {
         "UPDATE character_metadata SET value = ? "
         "WHERE character_id = ? AND key = 'voice_profile'"
     ),
-    "voice_assignment": (
-        "UPDATE character SET voice_assignment_id = ? WHERE id = ?"
-    ),
-    "instruction": (
-        "UPDATE span SET instruct = ? WHERE id = ?"
-    ),
+    "voice_assignment": ("UPDATE character SET voice_assignment_id = ? WHERE id = ?"),
+    "instruction": ("UPDATE span SET instruct = ? WHERE id = ?"),
 }
 
 
@@ -236,11 +251,9 @@ def _build_neighbors(
         if span["id"] == span_ref:
             return {
                 "before": [
-                    s["text"] for s in ordered_spans[max(0, idx - window):idx]
+                    s["text"] for s in ordered_spans[max(0, idx - window) : idx]
                 ],
-                "after": [
-                    s["text"] for s in ordered_spans[idx + 1:idx + 1 + window]
-                ],
+                "after": [s["text"] for s in ordered_spans[idx + 1 : idx + 1 + window]],
             }
     return {"before": [], "after": []}
 
@@ -330,9 +343,7 @@ class ReviewManager:
         #    enrichment rides through the GET /review/{book_id} response
         #    unchanged (api_review.py returns the manager output verbatim).
         if items:
-            ordered_spans = _load_spans_in_presentation_order(
-                book_id, self._storage
-            )
+            ordered_spans = _load_spans_in_presentation_order(book_id, self._storage)
             for item in items:
                 item["neighbors"] = _build_neighbors(
                     _resolve_span_reference(item), ordered_spans
@@ -345,21 +356,29 @@ class ReviewManager:
     # ------------------------------------------------------------------
 
     def accept_review_item(self, item_id: str) -> None:
-        """Accept a review item — set confidence to 1.0.
+        """Accept a review item — set confidence to 1.0 and protect it from regeneration.
 
         Parameters
         ----------
         item_id:
-            Encoded as ``"{junction_table}:{character_id}:{entity_id}"``.
+            Encoded as ``"{junction_table}:{character_id}:{entity_id}"``
+            or, for scene/span rows, with ``:relation_type`` appended.
         """
-        junction_table, character_id, related_entity_id = _parse_item_id(item_id)
+        junction_table, character_id, related_entity_id, relation_type = _parse_item_id(
+            item_id
+        )
         meta = _JUNCTION_META[junction_table]
         related_col = meta["related_col"]
 
+        where = f"character_id = ? AND {related_col} = ?"
+        params: list[Any] = [character_id, related_entity_id]
+        if relation_type is not None:
+            where += " AND relation_type = ?"
+            params.append(relation_type)
         updated = self._storage.execute_update(
-            f"UPDATE {junction_table} SET confidence = {CONFIDENCE_ACCEPTED} "
-            f"WHERE character_id = ? AND {related_col} = ?",
-            (character_id, related_entity_id),
+            f"UPDATE {junction_table} SET confidence = {CONFIDENCE_ACCEPTED}, human_override = 1 "
+            f"WHERE {where}",
+            tuple(params),
         )
         if updated == 0:
             raise ReviewItemNotFoundError(item_id)
@@ -371,16 +390,24 @@ class ReviewManager:
         Parameters
         ----------
         item_id:
-            Encoded as ``"{junction_table}:{character_id}:{entity_id}"``.
+            Encoded as ``"{junction_table}:{character_id}:{entity_id}"``
+            or, for scene/span rows, with ``:relation_type`` appended.
         """
-        junction_table, character_id, related_entity_id = _parse_item_id(item_id)
+        junction_table, character_id, related_entity_id, relation_type = _parse_item_id(
+            item_id
+        )
         meta = _JUNCTION_META[junction_table]
         related_col = meta["related_col"]
 
+        where = f"character_id = ? AND {related_col} = ?"
+        params: list[Any] = [character_id, related_entity_id]
+        if relation_type is not None:
+            where += " AND relation_type = ?"
+            params.append(relation_type)
         updated = self._storage.execute_update(
             f"UPDATE {junction_table} SET confidence = {CONFIDENCE_REJECTED}, human_override = 1 "
-            f"WHERE character_id = ? AND {related_col} = ?",
-            (character_id, related_entity_id),
+            f"WHERE {where}",
+            tuple(params),
         )
         if updated == 0:
             raise ReviewItemNotFoundError(item_id)
@@ -395,21 +422,27 @@ class ReviewManager:
 
         Parameters
         ----------
-        item_id:
-            Encoded as ``"{junction_table}:{character_id}:{entity_id}"``.
+            item_id:
+                Encoded as ``"{junction_table}:{character_id}:{entity_id}"``
+                or, for scene/span rows, with ``:relation_type`` appended.
         new_value:
             If a ``dict``, its keys are treated as column names to update
             on the junction row (e.g. ``{"relation_type": "speaker"}``).
             Non-dict values are ignored (only dict overrides are
             supported for column updates).
         """
-        junction_table, character_id, related_entity_id = _parse_item_id(item_id)
+        junction_table, character_id, related_entity_id, relation_type = _parse_item_id(
+            item_id
+        )
         meta = _JUNCTION_META[junction_table]
         related_col = meta["related_col"]
         allowed_extra = set(meta["extra_cols"])
 
         # Build SET clause
-        set_parts: list[str] = [f"confidence = {CONFIDENCE_ACCEPTED}", "human_override = 1"]
+        set_parts: list[str] = [
+            f"confidence = {CONFIDENCE_ACCEPTED}",
+            "human_override = 1",
+        ]
         params: list[Any] = []
 
         if isinstance(new_value, dict):
@@ -420,10 +453,13 @@ class ReviewManager:
                 # Silently ignore unknown columns to avoid SQL injection
 
         params.extend([character_id, related_entity_id])
+        where = f"character_id = ? AND {related_col} = ?"
+        if relation_type is not None:
+            where += " AND relation_type = ?"
+            params.append(relation_type)
 
         updated = self._storage.execute_update(
-            f"UPDATE {junction_table} SET {', '.join(set_parts)} "
-            f"WHERE character_id = ? AND {related_col} = ?",
+            f"UPDATE {junction_table} SET {', '.join(set_parts)} WHERE {where}",
             tuple(params),
         )
         if updated == 0:
@@ -444,7 +480,7 @@ class ReviewManager:
         with no matching row raise ``ReviewItemNotFoundError`` (404).
         """
         if item_id.startswith("walkitem:"):
-            self._resolve_walk_item(action, item_id[len("walkitem:"):], new_value)
+            self._resolve_walk_item(action, item_id[len("walkitem:") :], new_value)
             return
 
         if action == "accept":
@@ -534,6 +570,7 @@ class ReviewManager:
                        'character_scene' AS junction_table,
                        cs.confidence, cs.source AS walk_name,
                        cs.scene_id AS related_entity_id,
+                       cs.relation_type,
                        'Low-confidence character-scene association' AS reason
                   FROM character c
                   JOIN character_scene cs ON c.id = cs.character_id
@@ -549,7 +586,10 @@ class ReviewManager:
 
         for row in rows:
             row["item_id"] = _make_item_id(
-                "character_scene", row["character_id"], row["related_entity_id"]
+                "character_scene",
+                row["character_id"],
+                row["related_entity_id"],
+                row["relation_type"],
             )
         return rows
 
@@ -572,6 +612,7 @@ class ReviewManager:
                        'character_span' AS junction_table,
                        csp.confidence, csp.source AS walk_name,
                        csp.span_id AS related_entity_id,
+                       csp.relation_type,
                        'Low-confidence character-span association' AS reason
                   FROM character c
                   JOIN character_span csp ON c.id = csp.character_id
@@ -589,7 +630,10 @@ class ReviewManager:
 
         for row in rows:
             row["item_id"] = _make_item_id(
-                "character_span", row["character_id"], row["related_entity_id"]
+                "character_span",
+                row["character_id"],
+                row["related_entity_id"],
+                row["relation_type"],
             )
         return rows
 
