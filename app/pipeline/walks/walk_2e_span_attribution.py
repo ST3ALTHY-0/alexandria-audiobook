@@ -296,26 +296,37 @@ def _process_attribution(
     # Replace generated scene-level guesses (including legacy Walk 2b rows),
     # but never overwrite a human decision.  This keeps reruns idempotent
     # while allowing the authoritative span-level walk to correct coarse data.
-    updated = storage.execute_update(
-        "UPDATE character_span SET character_id = ?, source = 'walk', "
-        "confidence = ?, human_override = 0 "
-        "WHERE span_id = ? AND relation_type = 'speaker' "
-        "AND human_override = 0",
-        (character_id, confidence, span_id),
+    attribution_written = bool(
+        storage.execute_update(
+            "UPDATE character_span SET character_id = ?, source = 'walk', "
+            "confidence = ?, human_override = 0 "
+            "WHERE span_id = ? AND relation_type = 'speaker' "
+            "AND human_override = 0",
+            (character_id, confidence, span_id),
+        )
     )
-    if not updated:
+    if not attribution_written:
+        existing_speaker = storage.execute_query(
+            "SELECT 1 FROM character_span "
+            "WHERE span_id = ? AND relation_type = 'speaker'",
+            (span_id,),
+        )
+    else:
+        existing_speaker = []
+
+    if not attribution_written and not existing_speaker:
         storage.execute_insert(
             "INSERT INTO character_span "
             "(character_id, span_id, relation_type, source, confidence, human_override) "
-            "SELECT ?, ?, 'speaker', 'walk', ?, 0 "
-            "WHERE NOT EXISTS ("
-            "SELECT 1 FROM character_span "
-            "WHERE span_id = ? AND relation_type = 'speaker'"
-            ")",
-            (character_id, span_id, confidence, span_id),
+            "VALUES (?, ?, 'speaker', 'walk', ?, 0)",
+            (character_id, span_id, confidence),
         )
+        attribution_written = True
 
-    # Human overrides are intentionally not counted as a new attribution.
+    if not attribution_written:
+        # Human overrides are intentionally not counted as a new attribution.
+        return
+
     result["speakers_attributed"] += 1
 
     if is_review:
