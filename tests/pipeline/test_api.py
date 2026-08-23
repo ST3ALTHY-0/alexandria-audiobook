@@ -1054,8 +1054,9 @@ class TestReviewActionDispatch:
     ``walkitem:`` ids -> walk-side action (status resolved, target write only
     for reject/override); everything else -> existing junction behavior.
     Malformed ids -> 400; well-formed but unknown ids -> 404 (NEW contract);
-    walk-side override without a value -> 400.  Junction ids stay byte-identical
-    ``{table}:{char}:{entity}`` — there is no literal ``junction:`` prefix.
+    walk-side override without a value -> 400.  Junction ids stay bare (there
+    is no literal ``junction:`` prefix); scene/span ids include the
+    ``:relation_type`` suffix.
     """
 
     # -- walkitem: accept --------------------------------------------------
@@ -1182,7 +1183,7 @@ class TestReviewActionDispatch:
         """Reject on a well-formed but unknown junction id returns 404 (NEW)."""
         response = client.post(
             "/api/pipeline/review/reject",
-            json={"item_id": "character_scene:c1:nonexistent-scene"},
+            json={"item_id": "character_scene:c1:nonexistent-scene:present"},
         )
         assert response.status_code == 404
 
@@ -1191,7 +1192,7 @@ class TestReviewActionDispatch:
         response = client.post(
             "/api/pipeline/review/override",
             json={
-                "item_id": "character_span:c1:nonexistent-span",
+                "item_id": "character_span:c1:nonexistent-span:speaker",
                 "new_value": {"relation_type": "speaker"},
             },
         )

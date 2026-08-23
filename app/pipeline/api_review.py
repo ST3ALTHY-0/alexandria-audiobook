@@ -18,7 +18,11 @@ from pydantic import BaseModel
 
 from app.pipeline.adapter import PipelineStorage
 from app.pipeline.api_onboard import get_storage
-from app.pipeline.review import ReviewItemNotFoundError, ReviewManager
+from app.pipeline.review import (
+    ReviewItemNotFoundError,
+    ReviewManager,
+    _parse_item_id,
+)
 from app.pipeline.workbench import (
     BookNotFoundError,
     ConflictError,
@@ -84,7 +88,9 @@ def get_workbench(storage: PipelineStorage = Depends(get_storage)) -> Workbench:
 class ReviewActionRequest(BaseModel):
     """Request body for POST /api/pipeline/review/accept|reject|override.
 
-    ``base_revision`` is optional and only checked for workbench dispatch
+    ``item_id`` may be ``junction:{table}:{char}:{entity}[:{relation_type}]``
+    (scene/span targets require ``relation_type``). ``base_revision`` is
+    optional and only checked for workbench dispatch
     targets (``decision:`` / ``junction:`` prefixes).  Legacy junction and
     ``walkitem:`` ids keep their existing behavior.
     """
@@ -145,12 +151,6 @@ _ACTION_STATUS = {
     "reject": "rejected",
     "override": "overridden",
 }
-
-
-#: Allow-listed junction tables for the ``junction:`` dispatch form.
-_ALLOWED_JUNCTION_TABLES = frozenset(
-    {"character_book", "character_scene", "character_span", "character_series"}
-)
 
 
 def _book_id_for_junction(
@@ -269,18 +269,22 @@ def _resolve_junction_action(
 ) -> dict:
     """Resolve a review action on a ``junction:{table}:{char}:{entity}`` target.
 
-    The ``junction:`` prefix is stripped and the allow-listed live junction is
-    resolved by the existing ReviewManager (authority), then a human review
-    decision is recorded in one transaction.
+    Scene and span targets include the required ``:relation_type`` suffix.
+
+    The ``junction:`` prefix is stripped and the live junction is resolved by
+    ReviewManager's shared item-id parser, then a human review decision is
+    recorded in one transaction.
     """
     stripped = item_id[len("junction:") :]
-    parts = stripped.split(":")
-    if len(parts) != 3 or parts[0] not in _ALLOWED_JUNCTION_TABLES:
+    try:
+        table, _character_id, entity_id, _relation_type = _parse_item_id(stripped)
+    except ValueError as exc:
+        # Keep the prefixed API form's malformed-target response consistent
+        # with the legacy dispatch path while sharing ReviewManager's parser.
         raise HTTPException(
             status_code=400,
-            detail=f"Malformed junction target: {item_id!r}",
-        )
-    table, _character_id, entity_id = parts
+            detail=str(exc),
+        ) from exc
     book_id = _book_id_for_junction(storage, table, entity_id)
     if book_id is None:
         raise HTTPException(

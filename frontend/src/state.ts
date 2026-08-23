@@ -208,7 +208,7 @@ export interface WorkbenchState {
   aliases: WorkbenchAliasMerge[];
   /** Scene presence (manual + generated). */
   presence: WorkbenchPresence[];
-  /** Confidence review items (decision:/junction:/walkitem: id forms). */
+  /** Confidence review items (bare junction ids; action APIs also accept prefixes). */
   review_items: WorkbenchReviewItem[];
   /** Per-walk DB overrides (config overrides applied by the user). */
   overrides: WorkbenchOverride[];

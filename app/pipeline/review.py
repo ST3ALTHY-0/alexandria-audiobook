@@ -349,9 +349,10 @@ class ReviewManager:
         1. Junction live query — the existing low-confidence
            ``character_book`` / ``character_scene`` / ``character_span``
            records with confidence in [0.5, 0.7).  Each dict includes an
-           ``item_id`` key encoding the junction table and primary key
-           (``{junction_table}:{character_id}:{entity_id}`` — byte-identical
-           to the pre-union format) for use with accept/reject/override.
+            ``item_id`` key encoding the junction table and primary key
+            (``{junction_table}:{character_id}:{entity_id}[:{relation_type}]``;
+            scene/span items always include ``relation_type``) for use with
+            accept/reject/override.
         2. Walk items — pending ``walk_review_item`` rows recorded by walks
            2g/2h/2i in their per-unit transaction.  These carry the raw
            table columns (``kind``, ``target_table``, ``target_id``,
