@@ -333,9 +333,7 @@ def test_extract_epub_text_contract(minimal_epub: str, storage) -> None:
     assert len(result["chapters"]) == 2
 
 
-def test_extract_epub_text_chapter_structure(
-    minimal_epub: str, storage
-) -> None:
+def test_extract_epub_text_chapter_structure(minimal_epub: str, storage) -> None:
     """Each chapter has id and paragraphs list."""
     result = extract_epub_text(minimal_epub, "test-book-123", storage)
 
@@ -347,9 +345,7 @@ def test_extract_epub_text_chapter_structure(
         assert len(chapter["id"]) == 36
 
 
-def test_extract_epub_text_paragraph_structure(
-    minimal_epub: str, storage
-) -> None:
+def test_extract_epub_text_paragraph_structure(minimal_epub: str, storage) -> None:
     """Each paragraph has id and spans list."""
     result = extract_epub_text(minimal_epub, "test-book-123", storage)
 
@@ -362,9 +358,7 @@ def test_extract_epub_text_paragraph_structure(
             assert len(paragraph["id"]) == 36
 
 
-def test_extract_epub_text_span_structure(
-    minimal_epub: str, storage
-) -> None:
+def test_extract_epub_text_span_structure(minimal_epub: str, storage) -> None:
     """Each span has id, span_type, and text."""
     result = extract_epub_text(minimal_epub, "test-book-123", storage)
 
@@ -403,9 +397,7 @@ def test_extract_epub_text_content(minimal_epub: str, storage) -> None:
     assert "Second chapter" in ch2_text
 
 
-def test_extract_epub_text_quotation_detection(
-    minimal_epub: str, storage
-) -> None:
+def test_extract_epub_text_quotation_detection(minimal_epub: str, storage) -> None:
     """Quotation spans are correctly detected."""
     result = extract_epub_text(minimal_epub, "test-book-123", storage)
 
@@ -419,17 +411,17 @@ def test_extract_epub_text_quotation_detection(
     assert found_quotation, "Expected to find quotation span with text 'hello'"
 
 
-def test_extract_epub_text_series_id_default(
-    minimal_epub: str, storage
-) -> None:
-    """series_id uses default UUID when no series context."""
-    result = extract_epub_text(minimal_epub, "test-book-123", storage)
-    assert result["series_id"] == "00000000-0000-4000-8000-000000000001"
+def test_extract_epub_text_series_id_fresh(minimal_epub: str, storage) -> None:
+    """Each import without series context receives an independent series UUID."""
+    first = extract_epub_text(minimal_epub, "test-book-123", storage)
+    second = extract_epub_text(minimal_epub, "test-book-456", storage)
+
+    assert len(first["series_id"]) == 36
+    assert len(second["series_id"]) == 36
+    assert first["series_id"] != second["series_id"]
 
 
-def test_extract_epub_text_no_database_insertion(
-    minimal_epub: str, storage
-) -> None:
+def test_extract_epub_text_no_database_insertion(minimal_epub: str, storage) -> None:
     """Phase 1 does not insert into database."""
     # Call extract
     extract_epub_text(minimal_epub, "test-book-123", storage)

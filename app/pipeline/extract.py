@@ -22,9 +22,6 @@ from app.utils import PARA_MARKER
 if TYPE_CHECKING:
     from app.pipeline.adapter import PipelineStorage
 
-# Fixed series UUID for EPUBs with no series context.
-_DEFAULT_SERIES_ID = "00000000-0000-4000-8000-000000000001"
-
 # Sentence boundary: split on whitespace following sentence-ending punctuation.
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 
@@ -40,10 +37,25 @@ _QUOTATION_RE = re.compile(r""""([^"]*)"|'([^']*)'""")
 class _HTMLTextExtractor(HTMLParser):
     """Strip HTML tags, inserting PARA_MARKER between block-level elements."""
 
-    BLOCK_TAGS = frozenset({
-        "p", "div", "h1", "h2", "h3", "h4", "h5", "h6",
-        "li", "blockquote", "br", "hr", "tr", "section", "article",
-    })
+    BLOCK_TAGS = frozenset(
+        {
+            "p",
+            "div",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
+            "li",
+            "blockquote",
+            "br",
+            "hr",
+            "tr",
+            "section",
+            "article",
+        }
+    )
     SKIP_TAGS = frozenset({"style", "script"})
 
     def __init__(self) -> None:
@@ -156,7 +168,7 @@ def _sentence_to_spans(sentence: str) -> list[dict[str, str]]:
     spans: list[dict[str, str]] = []
     last_end = 0
     for match in _QUOTATION_RE.finditer(sentence):
-        before = sentence[last_end:match.start()].strip()
+        before = sentence[last_end : match.start()].strip()
         if before:
             spans.append(_make_span("sentence", before))
         quoted = match.group(1) if match.group(1) is not None else match.group(2)
@@ -235,7 +247,7 @@ def extract_epub_text(
     Returns
     -------
     dict with keys:
-        series_id : str — fixed default series UUID
+        series_id : str — fresh series UUID for this independent import
         book_id : str — the provided book_id
         chapters : list of {id, paragraphs: [{id, spans: [{id, span_type, text}]}]}
     """
@@ -244,7 +256,9 @@ def extract_epub_text(
         raise ValueError("EPUB contains no readable chapters")
     chapters = _build_chapters(chapter_texts)
     return {
-        "series_id": _DEFAULT_SERIES_ID,
+        # An import-as-new has no series context, so it owns an independent
+        # series rather than joining every other imported EPUB.
+        "series_id": str(uuid.uuid4()),
         "book_id": book_id,
         "chapters": chapters,
     }
