@@ -2826,6 +2826,186 @@ describe('Script Tab — Replace current book (Plan T, Phase 5)', () => {
     expect(state.pipelineBookId).toBe('book-rep'); // currentBookId NOT reassigned
   });
 
+  // -- Render-state invalidation on Replace success (Plan T, Phase 5) ---------
+
+  /** Add the render-control DOM nodes used by editor-pipeline's reset. */
+  function addRenderSurface(): void {
+    const mkBtn = (id: string, display: string) => {
+      const b = document.createElement('button');
+      b.id = id;
+      b.style.display = display;
+      document.body.appendChild(b);
+    };
+    mkBtn('btn-pipeline-render', 'inline-block');
+    mkBtn('btn-pipeline-regen', 'inline-block');
+    mkBtn('btn-pipeline-cancel', 'none');
+    mkBtn('btn-pipeline-download', 'inline-block');
+    mkBtn('btn-pipeline-play-book', 'inline-block');
+    mkBtn('btn-pipeline-undo', 'disabled');
+  }
+
+  it('Replace success invalidates the previous render job: job handle cleared and result surface hidden', async () => {
+    const { showConfirm, showToast } = await import('../../src/utils');
+    await onboardImportAsNew('book-rep');
+    mockFetch.mockClear();
+    vi.mocked(showConfirm).mockResolvedValue(true);
+    mockFetch.mockResolvedValueOnce(okResponse({
+      book_id: 'book-rep', series_id: 's', book_number: 1, position: 1,
+      version: 2, chapters: 3, status: 'replaced',
+    }));
+
+    // Simulate a prior completed render for this book: job handle retained in
+    // state + the download / whole-book play affordances revealed.
+    state.pipelineRenderJobId = 'job-prev';
+    addRenderSurface();
+    setReplaceFile('new.epub');
+    document.getElementById('btn-replace-epub')!.click();
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Success invalidation: the stale render job handle is forgotten and the
+    // result-surface affordances pointing at the deleted job are hidden.
+    expect(showToast).toHaveBeenCalledWith(
+      expect.stringContaining('Book replaced successfully'),
+      'success',
+    );
+    expect(state.pipelineRenderJobId).toBeNull();
+    const btnDownload = document.getElementById('btn-pipeline-download') as HTMLElement;
+    const btnPlayBook = document.getElementById('btn-pipeline-play-book') as HTMLElement;
+    expect(btnDownload.style.display).toBe('none');
+    expect(btnDownload.hasAttribute('data-job-id')).toBe(false);
+    expect(btnPlayBook.style.display).toBe('none');
+  });
+
+  it('a failed Replace retains the prior render state (no optimistic invalidation)', async () => {
+    const { showConfirm, showToast } = await import('../../src/utils');
+    await onboardImportAsNew('book-rep');
+    expect(state.pipelineBookId).toBe('book-rep');
+    mockFetch.mockClear();
+    vi.mocked(showConfirm).mockResolvedValue(true);
+    // Simulate a prior completed render for this book.
+    state.pipelineRenderJobId = 'job-prev';
+    addRenderSurface();
+    mockFetch.mockResolvedValue(replace503); // both attempts -> 503 (retry-once exhausted)
+    setReplaceFile('new.epub');
+
+    document.getElementById('btn-replace-epub')!.click();
+    await vi.advanceTimersByTimeAsync(0); // showConfirm + sniff + attempt 1 (503 -> delay scheduled)
+    await vi.advanceTimersByTimeAsync(1000); // retry delay elapses -> attempt 2 (503) -> fail
+
+    expect(showToast).toHaveBeenCalledWith(expect.stringContaining('Replace failed'), 'error');
+    // No optimistic change: the previous render job handle and revealed download
+    // affordance survive the failed request untouched.
+    expect(state.pipelineRenderJobId).toBe('job-prev');
+    expect(state.pipelineBookId).toBe('book-rep');
+    const btnDownload = document.getElementById('btn-pipeline-download') as HTMLElement;
+    expect(btnDownload.style.display).toBe('inline-block');
+  });
+
+  // -- Replace while a render is mid-poll (Plan T render-state invalidation) --
+
+  it('Replace while pipelineRenderAll has a pending poll: promise settles, controls/surfaces restore, cancel fires once, job state null', async () => {
+    const { showConfirm, showToast } = await import('../../src/utils');
+    const ep = await import('../../src/tabs/editor-pipeline');
+    await onboardImportAsNew('book-rep');
+    expect(state.pipelineBookId).toBe('book-rep');
+    mockFetch.mockClear();
+    vi.mocked(showConfirm).mockResolvedValue(true);
+    addRenderSurface(); // render buttons + download / whole-book play affordances
+
+    // Start a live render but leave it mid-poll: pipelineRenderAudiobook returns
+    // a job_id (API.post mocked), so _currentRenderJobId is set, the poll timer
+    // is armed, and _renderPollSettle is captured. The render-status poll stays
+    // non-terminal (mockIdlePoll's generic API.get), so the promise stays pending.
+    vi.mocked(API.post).mockResolvedValueOnce({ job_id: 'job-live' });
+    const renderAllPromise = ep.pipelineRenderAll();
+    await vi.advanceTimersByTimeAsync(0); // job start lands; poll pending
+
+    // Replace succeeds. resetRenderStateForBookReplacement must cancel the live
+    // render exactly once, settle the pending poll promise, and restore controls.
+    mockFetch.mockImplementation((url: string) => {
+      if (String(url) === '/api/pipeline/replace') {
+        return Promise.resolve(okResponse({
+          book_id: 'book-rep', series_id: 's', book_number: 1, position: 1,
+          version: 2, chapters: 3, status: 'replaced',
+        }));
+      }
+      if (String(url) === '/api/pipeline/cancel_render') {
+        return Promise.resolve(okCancelled);
+      }
+      return Promise.resolve(okResponse({ status: 'ok' }));
+    });
+    setReplaceFile('new.epub');
+    document.getElementById('btn-replace-epub')!.click();
+    await vi.advanceTimersByTimeAsync(0); // showConfirm + sniff + replace + cancel + settle
+
+    // The pending render promise must settle (resolve) — not hang forever.
+    await renderAllPromise;
+
+    expect(showToast).toHaveBeenCalledWith(
+      expect.stringContaining('Book replaced successfully'),
+      'success',
+    );
+    // Cancellation fired exactly once for the replaced book's live render.
+    const cancelCalls = mockFetch.mock.calls.filter(([url]) => String(url) === '/api/pipeline/cancel_render');
+    expect(cancelCalls.length).toBe(1);
+    // Render job state is null after the replacement.
+    expect(state.pipelineRenderJobId).toBeNull();
+    // Controls/surfaces restored: render+regen back, cancel hidden, and the
+    // result-surface affordances pointing at the deleted job are hidden.
+    expect((document.getElementById('btn-pipeline-render') as HTMLElement).style.display).toBe('inline-block');
+    expect((document.getElementById('btn-pipeline-regen') as HTMLElement).style.display).toBe('inline-block');
+    expect((document.getElementById('btn-pipeline-cancel') as HTMLElement).style.display).toBe('none');
+    expect((document.getElementById('btn-pipeline-download') as HTMLElement).style.display).toBe('none');
+    expect((document.getElementById('btn-pipeline-play-book') as HTMLElement).style.display).toBe('none');
+  });
+
+  it('a rejecting preview-player stop during a successful Replace keeps the success path (toast + state)', async () => {
+    const { showConfirm, showToast } = await import('../../src/utils');
+    const ep = await import('../../src/tabs/editor-pipeline');
+    const { getPreviewPlayer } = await import('../../src/player');
+    const origPlayer = getPreviewPlayer();
+    try {
+      await onboardImportAsNew('book-rep');
+      expect(state.pipelineBookId).toBe('book-rep');
+      mockFetch.mockClear();
+      vi.mocked(showConfirm).mockResolvedValue(true);
+      addRenderSurface();
+      state.pipelineRenderJobId = 'job-prev';
+
+      // Inject a preview player whose stop() rejects (e.g. AbortError from an
+      // in-flight playback). resetRenderStateForBookReplacement must swallow that
+      // rejection so the already-succeeded Replace is NOT surfaced as a failure.
+      const rejectingStop = vi.fn().mockRejectedValue(new DOMException('Aborted', 'AbortError'));
+      ep.setPreviewPlayer({
+        play: vi.fn(), playSequence: vi.fn(), pause: vi.fn(), seek: vi.fn(), stop: rejectingStop,
+      } as Parameters<typeof ep.setPreviewPlayer>[0]);
+
+      mockFetch.mockResolvedValueOnce(okResponse({
+        book_id: 'book-rep', series_id: 's', book_number: 1, position: 1,
+        version: 2, chapters: 3, status: 'replaced',
+      }));
+      setReplaceFile('new.epub');
+      document.getElementById('btn-replace-epub')!.click();
+      await vi.advanceTimersByTimeAsync(0);
+
+      // The cleanup rejection was encountered but contained.
+      expect(rejectingStop).toHaveBeenCalled();
+      // The success path still reports success and clears the stale render state.
+      expect(showToast).toHaveBeenCalledWith(
+        expect.stringContaining('Book replaced successfully'),
+        'success',
+      );
+      expect(showToast).not.toHaveBeenCalledWith(expect.stringContaining('Replace failed'), 'error');
+      expect(state.pipelineRenderJobId).toBeNull();
+      expect((document.getElementById('btn-pipeline-download') as HTMLElement).style.display).toBe('none');
+    } finally {
+      // Restore the shared singleton for the rest of the suite — even if an
+      // assertion above rejects, never leave the injected rejecting player
+      // installed as the active preview singleton.
+      ep.setPreviewPlayer(origPlayer);
+    }
+  });
+
   // -- Separate Re-onboard behavior (generated-output reset) -----------------
 
   it('Re-onboard confirmation copy distinguishes generated-output reset from document replacement', async () => {

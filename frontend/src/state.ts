@@ -173,6 +173,15 @@ export function setPipelineBookId(bookId: string | null): void {
 }
 
 /**
+ * Forget the render job owned by the current book.  Render jobs are deleted
+ * when that book is replaced, so retaining this identifier would make the
+ * editor address a backend resource that no longer exists.
+ */
+export function clearPipelineRenderJob(): void {
+  state.pipelineRenderJobId = null;
+}
+
+/**
  * Restore persisted pipeline state from localStorage.
  * Call once on page load before any tab init runs.
  */

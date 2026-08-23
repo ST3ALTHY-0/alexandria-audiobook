@@ -16,6 +16,7 @@ import * as API from '../api';
 import { showToast, showConfirm, escapeHtml } from '../utils';
 import { state, setPipelineBookId } from '../state';
 import { WALK_ORDER, WALK_DISPLAY_NAMES } from '../pipeline/walks';
+import { resetRenderStateForBookReplacement } from './editor-pipeline';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -1190,6 +1191,11 @@ async function handleReplace(): Promise<void> {
 
   try {
     const result = await API.pipelineReplace(bookId, file);
+
+    // Replace deletes this book's render rows and artifacts. Invalidate the
+    // global job handle and every editor-local render/audio cache only after
+    // the backend confirms success; failed replaces retain the prior state.
+    await resetRenderStateForBookReplacement();
 
     // Book identity is preserved — currentBookId stays the same, so the
     // persisted pipelineBookId and polling target are unchanged. Only reset the

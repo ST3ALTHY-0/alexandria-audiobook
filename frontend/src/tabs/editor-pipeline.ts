@@ -28,7 +28,7 @@
  */
 
 import * as API from '../api';
-import { state } from '../state';
+import { clearPipelineRenderJob, state } from '../state';
 import { showToast, showConfirm, escapeHtml } from '../utils';
 import { getPreviewPlayer } from '../player';
 import type { PreviewPlayer } from '../player';
@@ -219,10 +219,71 @@ export async function pipelineUpdateSpanText(
  * merge, move, delete, or text edit can play a different span's audio.
  */
 export function invalidateRenderPreview(): void {
-  state.pipelineRenderJobId = null;
+  clearPipelineRenderJob();
   // Keep an in-flight job alive so its polling/finally path can clean up, but
   // prevent it from becoming the active preview job when it completes.
   if (_currentRenderJobId) _renderPreviewInvalidated = true;
+}
+
+/**
+ * Invalidate every render-derived editor surface after a successful book
+ * replacement.  Replace deletes the book's render rows and artifact
+ * directory, so neither the job handle nor any module cache may survive it.
+ */
+export async function resetRenderStateForBookReplacement(): Promise<void> {
+  if (_renderPollTimer) {
+    clearInterval(_renderPollTimer);
+    _renderPollTimer = null;
+  }
+  if (_currentRenderJobId) {
+    // Cancel the replaced book's in-flight render exactly once here. The
+    // pending render poll's finally path (if any) restores the render buttons
+    // via its own UI restore helper which does NOT re-cancel the API — so a
+    // replacement never issues a duplicate cancel_render request.
+    try {
+      await pipelineCancelRender(_currentRenderJobId);
+    } catch (e) {
+      console.error('Unable to cancel replaced book render:', e);
+    }
+  }
+  _currentRenderJobId = null;
+  _renderPreviewInvalidated = false;
+  clearPipelineRenderJob();
+  _cachedSpans = [];
+  _cachedReviewItems = [];
+  _selectedIndices = new Set();
+  clearUndoStack();
+
+  // Interrupt a mid-render poll: settling the pending pipelineRenderAll promise
+  // makes its finally path restore the render controls (btnRender/btnRegen) via
+  // cancelPipelineRender(true). Without this the poll promise would hang forever
+  // and the render buttons would stay hidden after the replacement.
+  if (_renderPollSettle) {
+    const settle = _renderPollSettle;
+    _renderPollSettle = null;
+    settle();
+  }
+
+  // Stop the preview player defensively: a cleanup rejection (e.g. an AbortError
+  // from an in-flight playback) must NOT surface as a failed Replace — the
+  // backend Replace already succeeded at this point.
+  try {
+    await _previewPlayer.stop();
+  } catch (e) {
+    console.error('Preview player cleanup failed during replace:', e);
+  }
+
+  // Hide + clear every result-surface affordance that revealed a now-deleted
+  // render job: the download / whole-book play buttons and the Export M4B card.
+  const btnDownload = document.getElementById('btn-pipeline-download');
+  if (btnDownload) {
+    btnDownload.style.display = 'none';
+    btnDownload.removeAttribute('data-job-id');
+  }
+  const btnPlayBook = document.getElementById('btn-pipeline-play-book');
+  if (btnPlayBook) btnPlayBook.style.display = 'none';
+  hideExportM4bForm();
+  resetRenderProgress();
 }
 
 // ---------------------------------------------------------------------------
@@ -1045,6 +1106,15 @@ let _renderPreviewInvalidated = false;
 let _renderPollTimer: ReturnType<typeof setInterval> | null = null;
 
 /**
+ * Resolver for the in-flight render-status poll promise owned by
+ * pipelineRenderAll (null when no poll is pending). A book replacement can
+ * interrupt the poll mid-render (see resetRenderStateForBookReplacement); the
+ * resolver lets the reset settle the pending promise instead of leaving
+ * pipelineRenderAll hanging forever with the render controls hidden.
+ */
+let _renderPollSettle: (() => void) | null = null;
+
+/**
  * Reset the render progress bar to its neutral state (Plan F).
  *
  * The bar is owned by RENDER progress — span loading no longer claims 100%
@@ -1197,15 +1267,26 @@ export async function pipelineRenderAll(): Promise<void> {
 
     // Poll for status every 2 seconds
     await new Promise<void>((resolve, reject) => {
+      // Pin the job this poll owns so a stale in-flight status response — e.g.
+      // one that resolves AFTER a book replacement released the job — cannot
+      // update progress, emit a toast, or mutate render state for a job that
+      // no longer exists.
+      const jobId = _currentRenderJobId as string;
+      _renderPollSettle = resolve;
       _renderPollTimer = setInterval(async () => {
-        if (!_currentRenderJobId) {
+        if (!_currentRenderJobId || _currentRenderJobId !== jobId) {
           if (_renderPollTimer) clearInterval(_renderPollTimer);
           _renderPollTimer = null;
           resolve();
           return;
         }
         try {
-          const status = await pipelineRenderStatus(_currentRenderJobId);
+          const status = await pipelineRenderStatus(jobId);
+          // Stale-job guard (post-await): a replacement or fresh render
+          // released this poll's job while the status request was in flight.
+          // Drop the stale response silently — the interrupted poll's finally
+          // path (resetRenderStateForBookReplacement) already cleaned up.
+          if (!_currentRenderJobId || _currentRenderJobId !== jobId) return;
           updateRenderProgress(status);
           if (status.status === 'completed') {
             if (_renderPollTimer) clearInterval(_renderPollTimer);
@@ -1252,6 +1333,9 @@ export async function pipelineRenderAll(): Promise<void> {
     showToast('Render failed: ' + msg, 'error');
   } finally {
     _currentRenderJobId = null;
+    _renderPollSettle = null;
+    // skipApi=true: restore the render buttons only — never re-cancel the API.
+    // A replacement that interrupted the poll already cancelled the job once.
     await cancelPipelineRender(true);
   }
 }
