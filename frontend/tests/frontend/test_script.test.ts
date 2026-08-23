@@ -2300,6 +2300,7 @@ describe('Script Tab — Walk-controller book-switch coordination (P4-S3)', () =
   // -- handleOnboard: cancel-before-switch -----------------------------------
 
   it('handleOnboard: cancels the prior book active walk and awaits cleanup before switching currentBookId', async () => {
+    const { showConfirm } = await import('../../src/utils');
     // Onboard book-a first (idle).
     vi.mocked(API.get).mockResolvedValue([]);
     await onboardViaUi('book-a');
@@ -2307,6 +2308,7 @@ describe('Script Tab — Walk-controller book-switch coordination (P4-S3)', () =
 
     // Book-a now has an active walk; the cancel is honored and the row goes
     // terminal, so the switch to book-b is permitted.
+    vi.mocked(showConfirm).mockResolvedValue(true);
     let cancelledA = false;
     mockFetch.mockImplementation((url: RequestInfo | URL) => {
       if (String(url).endsWith('/cancel_walks')) {
@@ -2337,12 +2339,14 @@ describe('Script Tab — Walk-controller book-switch coordination (P4-S3)', () =
 
   it('handleOnboard: on contention keeps the prior book identity and aborts BEFORE posting onboard (no orphaned book)', async () => {
     const { showToast } = await import('../../src/utils');
+    const { showConfirm } = await import('../../src/utils');
     vi.mocked(API.get).mockResolvedValue([]);
     await onboardViaUi('book-a');
     expect(state.pipelineBookId).toBe('book-a');
     mockFetch.mockClear(); // isolate the switch phase (setup onboard of book-a already fired)
 
     // FIX #4: the prior book's active walk cannot be cancelled (contention).
+    vi.mocked(showConfirm).mockResolvedValue(true);
     // The coordination check now happens BEFORE the onboard POST, so the fresh
     // book is never created/orphaned and the UI must NOT switch identity.
     mockFetch.mockImplementation((url: RequestInfo | URL) => {
@@ -2362,6 +2366,37 @@ describe('Script Tab — Walk-controller book-switch coordination (P4-S3)', () =
       expect.stringContaining('Onboard aborted'),
       'error',
     );
+  });
+
+  it('handleOnboard: declining the active-walk warning leaves the current book untouched', async () => {
+    const { showConfirm } = await import('../../src/utils');
+    vi.mocked(API.get).mockResolvedValue([]);
+    await onboardViaUi('book-a');
+    mockFetch.mockClear();
+    vi.mocked(API.get).mockResolvedValue([runRow('running')]);
+    vi.mocked(showConfirm).mockResolvedValue(false);
+
+    await clickSwitchOnboard('book-b');
+
+    expect(showConfirm).toHaveBeenCalledWith(expect.stringContaining('Unfinished work from this walk will be discarded'));
+    expect(mockFetch).not.toHaveBeenCalledWith('/api/pipeline/cancel_walks', expect.anything());
+    expect(mockFetch).not.toHaveBeenCalledWith('/api/pipeline/onboard', expect.anything());
+    expect(state.pipelineBookId).toBe('book-a');
+  });
+
+  it('handleOnboard: does not prompt when the current book has no active walk', async () => {
+    const { showConfirm } = await import('../../src/utils');
+    vi.mocked(API.get).mockResolvedValue([]);
+    await onboardViaUi('book-a');
+    mockFetch.mockClear();
+    vi.mocked(API.get).mockResolvedValue([]);
+    vi.mocked(showConfirm).mockClear();
+    mockFetch.mockResolvedValueOnce(okResponse({ book_id: 'book-b', series_id: 's', chapters: 3 }));
+
+    await clickSwitchOnboard('book-b');
+
+    expect(showConfirm).not.toHaveBeenCalled();
+    expect(state.pipelineBookId).toBe('book-b');
   });
 
   // -- handleReonboard: wait-for-cleanup before clearing ---------------------

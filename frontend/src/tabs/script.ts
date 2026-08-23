@@ -898,7 +898,9 @@ function updateRunAllButton(running: boolean): void {
 /**
  * Handle the "Onboard EPUB" button click.
  * Reads the file from #file-upload, POSTs to /api/pipeline/onboard,
- * stores the book_id, and renders walk status UI.
+ * stores the book_id, and renders walk status UI. When the current book has an
+ * active walk, prompts before cancelling it; declining leaves the current book
+ * and its processing untouched.
  */
 async function handleOnboard(): Promise<void> {
   const fileInput = document.getElementById('file-upload') as HTMLInputElement;
@@ -919,10 +921,6 @@ async function handleOnboard(): Promise<void> {
     return;
   }
 
-  if (statusEl) {
-    statusEl.innerHTML = '<span class="text-info"><i class="fas fa-spinner fa-spin me-1"></i>Onboarding EPUB...</span>';
-  }
-
   // Book switching coordination (P4-S3 / FIX #4): onboarding a NEW book
   // replaces the current one, so cancel the prior book's active walk(s) and
   // await their terminal cleanup BEFORE posting onboard. Checking the prior
@@ -931,6 +929,26 @@ async function handleOnboard(): Promise<void> {
   // cancellation + cleanup, never optimistically while an active writer could
   // still run.
   if (currentBookId) {
+    let activeWalk: boolean;
+    try {
+      activeWalk = await bookHasActiveWalk(currentBookId);
+    } catch (e) {
+      console.error('Unable to determine active walks; aborting switch', e);
+      if (statusEl) {
+        statusEl.innerHTML = '<span class="text-danger"><i class="fas fa-times me-1"></i>Onboard aborted: unable to determine whether a walk is active.</span>';
+      }
+      showToast('Onboard aborted because the current walk status could not be determined.', 'error');
+      return;
+    }
+
+    if (activeWalk && !await showConfirm(
+      'Active processing will stop. Unfinished work from this walk will be discarded; completed work remains. Continue onboarding another EPUB?',
+    )) return;
+
+    if (statusEl) {
+      statusEl.innerHTML = '<span class="text-info"><i class="fas fa-spinner fa-spin me-1"></i>Onboarding EPUB...</span>';
+    }
+
     const safe = await waitForWalkCleanup(currentBookId);
     if (!safe) {
       if (statusEl) {
@@ -945,6 +963,8 @@ async function handleOnboard(): Promise<void> {
     // Stop polling the old book before switching (no orphaned poller);
     // startWalkPolling() below opens the new book's poller.
     stopWalkPolling();
+  } else if (statusEl) {
+    statusEl.innerHTML = '<span class="text-info"><i class="fas fa-spinner fa-spin me-1"></i>Onboarding EPUB...</span>';
   }
 
   try {
