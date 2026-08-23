@@ -9,6 +9,7 @@ Covers:
 - reonboard_book clears character_book entries
 - reonboard_book clears span.instruct
 - reonboard_book clears character.voice_assignment_id
+- reonboard_book clears book-scoped persona revisions
 - reonboard_book preserves tree structure (book, chapters, paragraphs, spans)
 - reonboard_book preserves characters (shared across series)
 - reonboard_book on a book with no walk outputs still works
@@ -354,6 +355,66 @@ class TestReonboardClearsVoiceAssignment:
 # ---------------------------------------------------------------------------
 
 
+class TestReonboardClearsPersonaRevisions:
+    def test_clears_book_scoped_revisions_but_preserves_global(self, storage):
+        """Old book persona output cannot be used after re-onboarding."""
+        storage.execute_insert(
+            "INSERT INTO persona_revision (persona_id, character_id, book_id, "
+            "revision, fields_json, evidence_json, aliases_json, scene_scope, "
+            "review_state, protected, voice_consequences_json, author_id, "
+            "created_ms, superseded_by) VALUES "
+            "('book-persona', 'c1', 'b1', 1, '{}', '[]', '[]', 'book', "
+            "'accepted', 0, '{}', 'local', 1000, NULL)"
+        )
+        storage.execute_insert(
+            "INSERT INTO persona_revision (persona_id, character_id, book_id, "
+            "revision, fields_json, evidence_json, aliases_json, scene_scope, "
+            "review_state, protected, voice_consequences_json, author_id, "
+            "created_ms, superseded_by) VALUES "
+            "('global-persona', 'c1', NULL, 2, '{}', '[]', '[]', 'book', "
+            "'accepted', 1, '{}', 'local', 1001, NULL)"
+        )
+
+        reonboard_book("b1", storage)
+
+        assert (
+            storage.execute_query(
+                "SELECT persona_id FROM persona_revision WHERE book_id = 'b1'"
+            )
+            == []
+        )
+        assert storage.execute_query(
+            "SELECT persona_id FROM persona_revision WHERE persona_id = ?",
+            ("global-persona",),
+        ) == [{"persona_id": "global-persona"}]
+
+    def test_clears_fk_references_before_deleting_book_revisions(self, storage):
+        """A preserved global revision may reference deleted book output."""
+        storage.execute_insert(
+            "INSERT INTO persona_revision (persona_id, character_id, book_id, "
+            "revision, fields_json, evidence_json, aliases_json, scene_scope, "
+            "review_state, protected, voice_consequences_json, author_id, "
+            "created_ms, superseded_by) VALUES "
+            "('old-book-persona', 'c1', 'b1', 1, '{}', '[]', '[]', 'book', "
+            "'accepted', 0, '{}', 'local', 1000, NULL)"
+        )
+        storage.execute_insert(
+            "INSERT INTO persona_revision (persona_id, character_id, book_id, "
+            "revision, fields_json, evidence_json, aliases_json, scene_scope, "
+            "review_state, protected, voice_consequences_json, author_id, "
+            "created_ms, superseded_by) VALUES "
+            "('global-persona', 'c1', NULL, 2, '{}', '[]', '[]', 'book', "
+            "'accepted', 1, '{}', 'local', 1001, 'old-book-persona')"
+        )
+
+        reonboard_book("b1", storage)
+
+        assert storage.execute_query(
+            "SELECT superseded_by FROM persona_revision "
+            "WHERE persona_id = 'global-persona'"
+        ) == [{"superseded_by": None}]
+
+
 class TestReonboardPreservesTreeStructure:
     def test_preserves_book(self, storage):
         """Book row still exists after reonboard."""
@@ -515,7 +576,9 @@ class TestReonboardEmptyBook:
 # ---------------------------------------------------------------------------
 
 
-def _insert_walk_run(storage: InMemorySQLiteAdapter, run_id: str, book_id: str, status: str) -> None:
+def _insert_walk_run(
+    storage: InMemorySQLiteAdapter, run_id: str, book_id: str, status: str
+) -> None:
     """Insert a minimal walk_run row (status must be schema-valid)."""
     storage.execute_insert(
         "INSERT INTO walk_run (run_id, book_id, walk_name, status, created_ms) "

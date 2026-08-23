@@ -288,6 +288,18 @@ def _clear_memberships(
     storage.execute_delete("DELETE FROM character_book WHERE book_id = ?", (book_id,))
 
 
+def _clear_persona_revisions(storage: PipelineStorage, book_id: str) -> None:
+    """Discard book-scoped persona revisions from the prior onboarding."""
+    storage.execute_update(
+        """UPDATE persona_revision SET superseded_by = NULL
+           WHERE superseded_by IN (
+               SELECT persona_id FROM persona_revision WHERE book_id = ?
+           )""",
+        (book_id,),
+    )
+    storage.execute_delete("DELETE FROM persona_revision WHERE book_id = ?", (book_id,))
+
+
 def _clear_scene_entities(
     storage: PipelineStorage, book_id: str, scene_ids: list[str]
 ) -> None:
@@ -353,6 +365,7 @@ def reonboard_book(book_id: str, storage: PipelineStorage) -> int:
     * ``character_scene`` rows for the book's scenes
     * ``character_book`` rows for the book (**memberships are NOT
       carried over** — they must be re-created by the next walk run)
+    * book-scoped ``persona_revision`` rows from the prior onboarding
     * ``character_metadata`` rows for characters no longer linked to any book
     * ``chapter_scene`` edges for the book's chapters
     * ``scene`` rows that belong to this book
@@ -402,6 +415,9 @@ def reonboard_book(book_id: str, storage: PipelineStorage) -> int:
 
         # -- Phase 2: Clear character memberships and metadata --------------
         _clear_memberships(storage, book_id, character_ids)
+
+        # -- Phase 2b: Clear book-scoped persona output ----------------------
+        _clear_persona_revisions(storage, book_id)
 
         # -- Phase 3: Clear scene entities and edges ------------------------
         _clear_scene_entities(storage, book_id, scene_ids)
