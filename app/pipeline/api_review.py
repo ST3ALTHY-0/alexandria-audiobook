@@ -105,7 +105,9 @@ class ReviewUndoRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def get_review_manager(storage: PipelineStorage = Depends(get_storage)) -> ReviewManager:
+def get_review_manager(
+    storage: PipelineStorage = Depends(get_storage),
+) -> ReviewManager:
     """FastAPI dependency: return a ReviewManager."""
     return ReviewManager(storage)
 
@@ -271,7 +273,7 @@ def _resolve_junction_action(
     resolved by the existing ReviewManager (authority), then a human review
     decision is recorded in one transaction.
     """
-    stripped = item_id[len("junction:"):]
+    stripped = item_id[len("junction:") :]
     parts = stripped.split(":")
     if len(parts) != 3 or parts[0] not in _ALLOWED_JUNCTION_TABLES:
         raise HTTPException(
@@ -329,14 +331,22 @@ async def accept_review_item(
     walkitem | bare junction)."""
     if request.item_id.startswith("decision:"):
         return _resolve_decision_action(
-            "accept", request.item_id[len("decision:"):], request.new_value,
+            "accept",
+            request.item_id[len("decision:") :],
+            request.new_value,
             request.base_revision,
-            workbench, storage,
+            workbench,
+            storage,
         )
     if request.item_id.startswith("junction:"):
         return _resolve_junction_action(
-            "accept", request.item_id, request.new_value, request.base_revision,
-            manager, workbench, storage,
+            "accept",
+            request.item_id,
+            request.new_value,
+            request.base_revision,
+            manager,
+            workbench,
+            storage,
         )
     try:
         manager.resolve_review_action("accept", request.item_id)
@@ -363,14 +373,22 @@ async def reject_review_item(
     walkitem | bare junction)."""
     if request.item_id.startswith("decision:"):
         return _resolve_decision_action(
-            "reject", request.item_id[len("decision:"):], request.new_value,
+            "reject",
+            request.item_id[len("decision:") :],
+            request.new_value,
             request.base_revision,
-            workbench, storage,
+            workbench,
+            storage,
         )
     if request.item_id.startswith("junction:"):
         return _resolve_junction_action(
-            "reject", request.item_id, request.new_value, request.base_revision,
-            manager, workbench, storage,
+            "reject",
+            request.item_id,
+            request.new_value,
+            request.base_revision,
+            manager,
+            workbench,
+            storage,
         )
     try:
         manager.resolve_review_action("reject", request.item_id)
@@ -397,14 +415,22 @@ async def override_review_item(
     walkitem | bare junction)."""
     if request.item_id.startswith("decision:"):
         return _resolve_decision_action(
-            "override", request.item_id[len("decision:"):], request.new_value,
+            "override",
+            request.item_id[len("decision:") :],
+            request.new_value,
             request.base_revision,
-            workbench, storage,
+            workbench,
+            storage,
         )
     if request.item_id.startswith("junction:"):
         return _resolve_junction_action(
-            "override", request.item_id, request.new_value, request.base_revision,
-            manager, workbench, storage,
+            "override",
+            request.item_id,
+            request.new_value,
+            request.base_revision,
+            manager,
+            workbench,
+            storage,
         )
     try:
         manager.resolve_review_action("override", request.item_id, request.new_value)
