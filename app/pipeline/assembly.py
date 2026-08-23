@@ -186,6 +186,10 @@ def has_active_run(storage: PipelineStorage) -> bool:
     return bool(rows)
 
 
+class ActiveWalkError(RuntimeError):
+    """Raised when a destructive mutation meets an active walk transaction."""
+
+
 # ---------------------------------------------------------------------------
 # Plan T (P1-S2): Replace cleanup ownership ALLOWLIST
 # ---------------------------------------------------------------------------
@@ -464,6 +468,12 @@ def reonboard_book(book_id: str, storage: PipelineStorage) -> int:
         The new version number after incrementing.
     """
     with storage.transaction():
+        # The transaction itself is the admission gate: BEGIN IMMEDIATE makes
+        # this check mutually exclusive with walk admission's pending->running
+        # transition.  The API's earlier check is only a fast reject.
+        if has_active_run(storage):
+            raise ActiveWalkError
+
         # -- Snapshot IDs before destructive deletes ------------------------
         # character_ids: needed for metadata cleanup and voice_assignment reset.
         char_rows = storage.execute_query(
@@ -584,6 +594,12 @@ def replace_book_tree(
     retained = rows[0]
 
     with storage.transaction():
+        # The transaction itself is the admission gate: BEGIN IMMEDIATE makes
+        # this check mutually exclusive with walk admission's pending->running
+        # transition.  The API's earlier check is only a fast reject.
+        if has_active_run(storage):
+            raise ActiveWalkError
+
         # -- (1) Snapshot retained fields + book-owned ID sets --------------
         # The join chains below die with the tree, so snapshot BEFORE any
         # delete.  chapter_ids come straight off ``chapter.book_id``; the rest

@@ -19,8 +19,13 @@ import uuid
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
-from app.pipeline.adapter import PipelineStorage, SQLiteAdapter
+from app.pipeline.adapter import (
+    ConcurrentTransactionError,
+    PipelineStorage,
+    SQLiteAdapter,
+)
 from app.pipeline.assembly import (
+    ActiveWalkError,
     get_book_version,
     has_active_run,
     reonboard_book,
@@ -170,11 +175,25 @@ async def onboard_epub(
 
         # Populate spine
         try:
-            populate_spine(
-                result["series_id"],
-                result["book_id"],
-                result["chapters"],
-                storage,
+            with storage.transaction():
+                # The final check and insertion share BEGIN IMMEDIATE.  The
+                # earlier API check is only a fast reject for the common case.
+                if has_active_run(storage):
+                    raise ActiveWalkError
+                populate_spine(
+                    result["series_id"],
+                    result["book_id"],
+                    result["chapters"],
+                    storage,
+                )
+        except (ActiveWalkError, ConcurrentTransactionError):
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "A walk is still active — cancel it and retry "
+                    f"after {_REONBOARD_CONTENTION_RETRY_AFTER_SECONDS}s"
+                ),
+                headers={"Retry-After": str(_REONBOARD_CONTENTION_RETRY_AFTER_SECONDS)},
             )
         except Exception as exc:  # noqa: BLE001 — spine population may raise many types; mapped to HTTP 500
             raise HTTPException(
@@ -238,6 +257,15 @@ async def reonboard(
 
     try:
         new_version = reonboard_book(request.book_id, storage)
+    except (ActiveWalkError, ConcurrentTransactionError):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "A walk is still active — cancel it and retry "
+                f"after {_REONBOARD_CONTENTION_RETRY_AFTER_SECONDS}s"
+            ),
+            headers={"Retry-After": str(_REONBOARD_CONTENTION_RETRY_AFTER_SECONDS)},
+        )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
 
@@ -322,6 +350,15 @@ async def replace_epub(
         # Atomic replace: retains book identity/ordering, bumps version.
         try:
             outcome = replace_book_tree(book_id, result["chapters"], storage)
+        except (ActiveWalkError, ConcurrentTransactionError):
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "A walk is still active — cancel it and retry "
+                    f"after {_REONBOARD_CONTENTION_RETRY_AFTER_SECONDS}s"
+                ),
+                headers={"Retry-After": str(_REONBOARD_CONTENTION_RETRY_AFTER_SECONDS)},
+            )
         except Exception as exc:  # noqa: BLE001 — spine population may raise many types; mapped to HTTP 500
             raise HTTPException(
                 status_code=500, detail=f"Failed to replace book: {exc}"
