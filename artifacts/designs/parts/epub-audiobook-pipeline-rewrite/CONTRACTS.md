@@ -563,6 +563,194 @@ def reonboard_book(book_id: str, storage: PipelineStorage) -> int
 # Memberships NOT carried over by default
 ```
 
+### Replace workflow (Plan T) — request/response contract
+
+`POST /api/pipeline/replace` is the destructive EPUB replacement endpoint. It
+is a **file upload** (multipart `file` plus a `book_id` form field), distinct
+from the fileless `/reonboard` (generated-output reset) and from `/onboard`
+(Import-as-new, server-generated fresh `book_id`).
+
+**Request (multipart/form-data):**
+```
+file     — the replacement EPUB (must end in .epub)
+book_id  — the existing book to replace (identity/ordering retained)
+```
+
+**Success (200) response shape** — returns the retained identity, preserved
+series/ordering fields, replacement version, and chapter count:
+```json
+{
+  "book_id": "<retained>",
+  "series_id": "<retained>",
+  "book_number": <retained>,
+  "position": <retained>,
+  "version": <new>,
+  "chapters": <chapter_count>,
+  "status": "replaced"
+}
+```
+
+**Error codes:**
+- `400` — invalid EPUB (`file` missing / not `.epub`) or extraction
+  failure; state untouched.
+- `500` — population failure; state untouched.
+- `404` — unknown `book_id` (checked before the active-walk check and before
+  any mutation).
+- `503` + `Retry-After: 5` — any process-wide walk is pending/running
+  (contention; the global single-active-walk invariant spans books).
+
+**Ordering guarantees.** Extraction happens **before** the replacement
+transaction; failed extraction or population leaves the old tree and outputs
+intact. The transaction never becomes current while an active writer could
+still run (CONTRACTS "Onboarding / re-onboarding / book-switching
+coordination"). Only `book.id`, `series_id`, `book_number`, and `position` are
+retained — no series-position or visibility controls are introduced.
+
+### replace_book_tree — assembly-level seam
+
+```python
+def replace_book_tree(
+    book_id: str,
+    chapters_data: list[dict],
+    storage: PipelineStorage,
+) -> dict
+```
+Atomically replaces the selected book's document tree and book-owned generated
+outputs using staged extraction data (`chapters_data` is the same shape
+`extract_epub_text` returns: `[{id, paragraphs: [{id, spans: [{id, span_type,
+text}]}]}]`). **Retains** the existing `book.id`, `series_id`, `book_number`,
+and `position`; it never creates a new book row and never repopulates
+ordering. Shared characters (`character` identity), shared character state
+(`character_metadata`, `character.voice_assignment_id`), `voice_config`, global
+persona revisions (`persona_revision` rows with `NULL book_id`), `series`, and
+sibling-book rows are protected.
+
+**Returns** `{book_id, series_id, book_number, position, version, chapters}`
+(the retained identity + new `version` + replaced chapter count).
+
+The surface lives in `app/pipeline/assembly.py`. It reuses the
+spine-population helpers in `app/pipeline/populate.py` to build the new tree
+under the already-existing (retained) `book` row.
+
+### Replace ownership ALLOWLIST (P1-S2)
+
+`replace_book_tree` cleanup may touch **only** the tables below, each scoped to
+the retained book (mirrored as the module-level constant
+  `REPLACE_TABLE_SCOPE` in `app/pipeline/assembly.py`). Scope key semantics:
+
+| Scope key | Cleanup rule |
+|-----------|--------------|
+| `book_id` | row carries a `book_id` column; delete/update **MUST** filter on the exact retained `book_id` (`WHERE book_id = ?`) so sibling-book rows are never affected. |
+| `scene` | no `book_id` column; the row links a book-scoped scene/span/chapter and must be deleted **by reachability** FROM the retained book's tree, before the referenced tree node it holds an FK to. |
+| `render` | book-owned `render_job` rows (`book_id = ?`); `render_chunk` cascades by `job_id`; the durable `RENDER_ROOT/book-{book_id}/` directory is removed in step (d) with the job rows. |
+| `run` | book-owned `walk_run` rows (`book_id = ?`); `walk_undo_entry` cascades by `run_id`. |
+
+| Table | Scope | Notes |
+|-------|-------|-------|
+| `chapter`, `book_chapter` | `book_id` | document-tree nodes/edges owned by the retained book |
+| `scene`, `chapter_scene` | `scene` | reachable via the retained book's chapters |
+| `paragraph`, `scene_paragraph` | `scene` | reachable via the retained book's scenes |
+| `span`, `paragraph_span` | `scene` | reachable via the retained book's paragraphs |
+| `character_scene` | `scene` | `scene_id` reachable from the retained book |
+| `character_span` | `scene` | `span_id` reachable from the retained book |
+| `character_book` | `book_id` | memberships are NOT carried over |
+| `character_scene_generated`, `character_scene_manual`, `character_scene_absence` | `book_id` | generated/manual presence projections + tombstones |
+| `character_alias_merge`, `boundary_override` | `book_id` | reversible workbench merge/boundary history for this book |
+| `workbench_decision`, `workbench_provenance`, `workbench_generation` | `book_id` | book-scoped workbench records (generation has no FK to book but is book-keyed) |
+| `walk_review_item`, `walk_override` | `book_id` | book-scoped review/override rows |
+| `walk_run` | `run` | book-owned run history + journal referencing it |
+| `walk_undo_entry` | `run` | cascades by `walk_run.run_id` |
+| `persona_revision` | `book_id` | **book-scoped** only — global rows (`book_id IS NULL`) are protected |
+| `prompt_config_revision`, `project_snapshot` | `book_id` | book-owned config revision + saved snapshot |
+| `render_job`, `render_chunk` | `render` | book-owned render rows (chunks cascade by job) |
+
+**Tables that must NEVER be touched** (absent from the ALLOWLIST): `series`
+(shared across the series), `character` (shared identity, may span books),
+`character_metadata` (shared character state — conditionally cleared, guarded
+below, never blanket-deleted), `character_series` (series-scoped, shared),
+`voice_config` (global catalog), `clone_reference` (global, voice-scoped), and
+any sibling/other-book `book` row. `span.instruct` and `character_metadata`
+cleanup follows the guarded shared-state rules documented under **Re-onboarding
+cleanup paths** (P1-S4).
+
+### Replace transaction ordering (P1-S3)
+
+`replace_book_tree` runs inside **one** adapter-owned `transaction()`
+(`BEGIN IMMEDIATE` — the same atomic unit `reonboard_book` uses) so a
+failure anywhere rolls back the complete replacement (the old tree/outputs
+remain intact). The ordered steps:
+
+1. **Snapshot.** Read and retain the existing `book` row's
+   `{id, series_id, book_number, position}` (and current `version`). Bail with
+   `ValueError` (→ API `404`) if the book does not exist, and with `ValueError`
+   if `chapters_data` is empty. Snapshot the book's `chapter` IDs,
+   `scene` IDs (via `chapter_scene` joined to the book's chapters), `span` IDs
+   (via the tree join), and the `character_book.character_id` set — before any
+   destructive delete, because those joins die with the tree.
+2. **Remove old book-owned tree/output references in FK-safe order.**
+   Deep-first: delete leaf reachable rows before their parents. For the tree:
+   `span` + `paragraph_span`, then `paragraph` + `scene_paragraph`, then
+   `scene` + `chapter_scene`, then `chapter` + `book_chapter`. Also remove
+   every `scene`/`book_id`-keyed ALLOWLIST row that references the old tree
+   (`character_scene`, `character_span`, `character_scene_generated`,
+   `character_scene_manual`, `character_scene_absence`,
+   `character_alias_merge`, `boundary_override`, `workbench_decision`,
+   `workbench_provenance`, `character_book`, reviewed rows) **before** the
+   tree node it references is deleted, so no FK `NO ACTION` fires.
+3. **Populate the extracted tree under the retained book.** Reuse the
+   `populate.py` spine helpers against the retained `book` row (no new `book`
+   insert, no renumbered `book_number`/`position`, `version` not touched here).
+4. **Clear/reconcile generated outputs.** After the new tree is in place,
+   clear/remove book-scoped generated projections and records not consumed by
+   the tree (see ALLOWLIST) and reconcile render/walk records and the durable
+   render directory.
+5. **Commit only after all FK/ownership checks succeed.** On normal
+   `transaction()` exit the block commits; on `Exception`/`BaseException` the
+   transaction rolls back to its checkpoint and re-raises, leaving the prior
+   tree and outputs intact.
+
+The API layer additionally enforces: extraction before the transaction,
+unknown-book `404` first, and `503` + `Retry-After` while the process-wide
+active-walk invariant holds.
+
+### Re-onboarding cleanup paths — shared vs book-scoped vs preserved (P1-S4)
+
+`reonboard_book` (unchanged) clears walk-created outputs while preserving the
+document tree. Its destructive routes classify into three kinds, and
+`replace_book_tree` (full tree replacement) applies the **same** classification
+so Replace never broadens `reonboard_book`'s guarantees:
+
+- **Shared, conditionally cleared (guarded by `NOT EXISTS` another book):**
+  `character_metadata` rows and `character.voice_assignment_id` are shared
+  character state. They are cleared/reset **only** when the character has no
+  other `character_book` membership (`NOT EXISTS` a `character_book` row with a
+  different `book_id`). A character shared with a sibling book keeps its
+  metadata and voice assignment. This is `_clear_memberships` in assembly.py;
+  Replace reuses the identical guard.
+- **Book-scoped (cleared unconditionally for the book):**
+  - `character_book` memberships (NOT carried over by default — must be
+    re-created by the next walk run),
+  - `persona_revision` rows with `book_id = ?` (book-scoped persona output;
+    **global** persona revisions with `NULL book_id` are preserved),
+  - generated/manual presence projections, workbench records, walk/render
+    rows, and book-keyed ALLOWLIST rows listed above.
+- **Intentionally preserved (never touched by either utility):**
+  - sibling-book rows of every kind (all cleanup is scoped by the retained
+    `book_id` or tree reachability),
+  - shared `character` identity rows and `character_series` junctions,
+  - shared `character_metadata` / `character.voice_assignment_id` when another
+    book still references the character,
+  - `character_scene` / `character_span` / `character_book` rows owned by other
+    books (reachability from the tree is book-scoped),
+  - global `persona_revision` rows (`book_id IS NULL`),
+  - `voice_config` and `clone_reference` (global catalog),
+  - the `series` row and any `book` row that is not the retained one.
+
+`replace_book_tree` never touches shared character identity, sibling rows,
+global persona revisions, or unrelated render jobs. Where the new tree is
+populated under the retained book, the character set is entirely re-discovered
+by the subsequent walk run.
+
 ### get_book_version
 ```python
 def get_book_version(book_id: str, storage: PipelineStorage) -> int
@@ -573,6 +761,7 @@ def get_book_version(book_id: str, storage: PipelineStorage) -> int
 ### Pipeline Router (/api/pipeline/*)
 ```
 POST /api/pipeline/onboard
+POST /api/pipeline/replace       ← destructive EPUB replacement; retains book identity/position
 POST /api/pipeline/run_walk
 POST /api/pipeline/run_all_walks
 POST /api/pipeline/cancel_walks          ← Plan P (background walk cancellation)

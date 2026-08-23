@@ -2,10 +2,12 @@
  * Script tab module — Pipeline onboard, walk execution, and walk status display.
  *
  * The tab shows the pipeline UI:
- *   - Onboard EPUB → POST /api/pipeline/onboard
+ *   - Import-as-new EPUB → POST /api/pipeline/onboard
+ *   - Replace current book's EPUB → POST /api/pipeline/replace (destructive,
+ *     keeps book identity/series position)
  *   - Walk execution buttons (individual + Run All)
  *   - Walk status display with polling
- *   - Re-onboard button
+ *   - Re-onboard button (fileless /reonboard; resets generated outputs only)
  *   - Per-run log viewer (EventSource at /api/pipeline/walks/log/{run_id}) with
  *     keyed reconciliation, opaque-id dedup, and bounded textContent-only rendering
  */
@@ -1091,7 +1093,7 @@ async function handleReonboard(): Promise<void> {
   }
 
   if (!await showConfirm(
-    `Re-onboard book ${currentBookId}? This will clear all walk outputs and create a new version. This cannot be undone.`,
+    `Re-onboard book ${currentBookId}? This clears the generated walk outputs and bumps the version, but does NOT replace the document text. This cannot be undone.`,
   )) return;
 
   // Re-onboard coordination (P4-S3): a re-onboard clears ALL walk outputs and
@@ -1123,6 +1125,101 @@ async function handleReonboard(): Promise<void> {
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     showToast('Re-onboard failed: ' + msg, 'error');
+  }
+}
+
+/**
+ * Handle the "Replace Current Book" button click.
+ * A destructive, explicit action: reads the EPUB from #file-upload-replace,
+ * confirms with a message naming the current book, awaits terminal walk
+ * cleanup (so no writer is active before the swap), then POSTs to
+ * /api/pipeline/replace. The backend retains the book's identity and series
+ * position, clears book-owned generated outputs, and bumps the version.
+ *
+ * The frontend NEVER changes book state optimistically: currentBookId, the
+ * persisted pipelineBookId, walk polling, and the displayed book are all
+ * retained on any failed wait or request (including the backend's process-wide
+ * 503 guard, which can be triggered by a walk owned by ANOTHER book). Only on
+ * success is the walk status/run history reset — for the SAME book ID.
+ */
+async function handleReplace(): Promise<void> {
+  if (!currentBookId) {
+    showToast('No book onboarded yet. Please onboard an EPUB first.', 'warning');
+    return;
+  }
+
+  const fileInput = document.getElementById('file-upload-replace') as HTMLInputElement;
+  const statusEl = document.getElementById('replace-status');
+
+  if (!fileInput?.files || fileInput.files.length === 0) {
+    if (statusEl) {
+      statusEl.innerHTML = '<span class="text-danger"><i class="fas fa-exclamation-triangle me-1"></i>Please select an EPUB file first.</span>';
+    }
+    return;
+  }
+
+  const file = fileInput.files[0];
+  if (!file.name.toLowerCase().endsWith('.epub')) {
+    if (statusEl) {
+      statusEl.innerHTML = '<span class="text-danger"><i class="fas fa-exclamation-triangle me-1"></i>Replace requires an EPUB file (.epub).</span>';
+    }
+    return;
+  }
+
+  // Destructive confirmation naming the current book and stating exactly what
+  // is replaced vs preserved, and that the action cannot be undone.
+  if (!await showConfirm(
+    `Replace the EPUB for book ${currentBookId}? This replaces the document text and all book-owned generated outputs. The book ID, series, number, and series position remain unchanged. This action cannot be undone.`,
+  )) return;
+
+  const bookId = currentBookId;
+  if (statusEl) {
+    statusEl.innerHTML = '<span class="text-info"><i class="fas fa-spinner fa-spin me-1"></i>Replacing book EPUB...</span>';
+  }
+
+  // Reuse waitForWalkCleanup before Replace: cancel this book's active walk(s)
+  // and await their terminal cleanup. On failure keep the prior identity.
+  const clean = await waitForWalkCleanup(bookId);
+  if (!clean) {
+    if (statusEl) {
+      statusEl.innerHTML = '<span class="text-danger"><i class="fas fa-times me-1"></i>Replace aborted: a walk is still active. Cancel and wait for it to finish before replacing.</span>';
+    }
+    showToast('Replace aborted: a walk is still active. Cancel and wait for it to finish before replacing.', 'error');
+    return;
+  }
+
+  try {
+    const result = await API.pipelineReplace(bookId, file);
+
+    // Book identity is preserved — currentBookId stays the same, so the
+    // persisted pipelineBookId and polling target are unchanged. Only reset the
+    // walk status and run history for this same book.
+    if (statusEl) {
+      statusEl.innerHTML = `<span class="text-success"><i class="fas fa-check me-1"></i>Replaced: ${escapeHtml(file.name)} — Book ID <code>${escapeHtml(result.book_id)}</code> (${result.chapters} chapters, v${result.version})</span>`;
+    }
+
+    // Reset walk status display + run-all button to the fresh-book state.
+    const initialStatuses: WalkStatusMap = {};
+    for (const walkName of WALK_ORDER) {
+      initialStatuses[walkName] = 'pending';
+    }
+    renderWalkStatuses(initialStatuses);
+    updateRunAllButton(false);
+
+    // Clear the run history for this book (the backend removed its walk runs);
+    // renderWalkRuns reconciles nothing remaining into the empty state.
+    void refreshWalkRuns(bookId);
+
+    showToast(`Book replaced successfully. New version: ${result.version}.`, 'success');
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    // Retain prior state: request failed (e.g. 503 contention from another
+    // book's active walk, 404 unknown, or 400 extraction failure) — the book,
+    // persisted pipelineBookId, walk polling, and displayed book are untouched.
+    if (statusEl) {
+      statusEl.innerHTML = `<span class="text-danger"><i class="fas fa-times me-1"></i>Replace failed: ${escapeHtml(msg)}</span>`;
+    }
+    showToast('Replace failed: ' + msg, 'error');
   }
 }
 
@@ -1191,6 +1288,12 @@ function initPipelineUI(): void {
   const btnReonboard = document.getElementById('btn-reonboard');
   if (btnReonboard) {
     btnReonboard.addEventListener('click', () => handleReonboard());
+  }
+
+  // Replace Current Book button (destructive, explicit; keeps book identity)
+  const btnReplace = document.getElementById('btn-replace-epub');
+  if (btnReplace) {
+    btnReplace.addEventListener('click', () => handleReplace());
   }
 
   // Restored session (initState persisted pipelineBookId): load the runs

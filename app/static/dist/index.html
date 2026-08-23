@@ -91,7 +91,7 @@
             } catch (e) { /* localStorage unavailable; default to light */ }
         })();
     </script>
-  <script type="module" crossorigin src="/static/assets/index-D0Y0Qt5l.js"></script>
+  <script type="module" crossorigin src="/static/assets/index-z8AMFS4c.js"></script>
 </head>
 <body>
     <nav class="navbar navbar-expand-lg navbar-dark bg-dark mb-4">
@@ -476,9 +476,9 @@
 
                         <div class="d-grid gap-2 mb-3">
                             <button class="btn btn-success btn-lg" id="btn-onboard-epub">
-                                <i class="fas fa-book-open me-2"></i>Onboard EPUB
+                                <i class="fas fa-book-open me-2"></i>Import as New Book
                             </button>
-                            <small class="text-muted">Extracts text from the EPUB, populates the document spine, and returns a book ID for walk execution.</small>
+                            <small class="text-muted">Imports a fresh EPUB as a NEW book (new book ID). Extracts text, populates the document spine, and returns a book ID for walk execution.</small>
                         </div>
 
                         <!-- Walk execution section (shown after successful onboard) -->
@@ -497,6 +497,17 @@
                                 <button class="btn btn-outline-warning" id="btn-reonboard">
                                     <i class="fas fa-redo me-2"></i>Re-onboard
                                 </button>
+                                <button class="btn btn-outline-danger" id="btn-replace-epub">
+                                    <i class="fas fa-exchange-alt me-2"></i>Replace Current Book
+                                </button>
+                            </div>
+
+                            <!-- Replace current book's EPUB (destructive, keeps book identity) -->
+                            <div class="mb-3">
+                                <label class="form-label">Replace Current Book's EPUB</label>
+                                <input type="file" class="form-control" id="file-upload-replace" accept=".epub">
+                                <div id="replace-status" class="mt-2"></div>
+                                <small class="text-muted">Replaces the current book's document text and all book-owned generated outputs. The book ID and series position are preserved. This cannot be undone.</small>
                             </div>
 
                             <div class="card mb-3">

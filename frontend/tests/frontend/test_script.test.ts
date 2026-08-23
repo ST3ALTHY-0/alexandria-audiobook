@@ -31,14 +31,19 @@ import { fileURLToPath } from 'node:url';
 import { state } from '../../src/state';
 
 // Mock the API module — partial mock: get/post stay mocked, but the REAL
-// postWithRetryOnce is exposed so cancel-walks tests exercise the actual
-// 503+Retry-After retry-once wrapper against the module-scope mockFetch.
+// postWithRetryOnce / postFormWithRetryOnce / pipelineReplace are exposed so
+// cancel-walks and Replace tests exercise the actual retry-once wrappers
+// against the module-scope mockFetch. pipelineReplace routes through
+// postFormWithRetryOnce (raw fetch), so exposing the real implementation lets
+// the destructive-replace UI flow run against mockFetch.
 vi.mock('../../src/api', async () => {
   const actual = await vi.importActual<typeof import('../../src/api')>('../../src/api');
   return {
     get: vi.fn(),
     post: vi.fn(),
     postWithRetryOnce: actual.postWithRetryOnce,
+    postFormWithRetryOnce: actual.postFormWithRetryOnce,
+    pipelineReplace: actual.pipelineReplace,
   };
 });
 
@@ -2532,5 +2537,313 @@ describe('Script Tab — Walk-controller book-switch coordination (P4-S3)', () =
       expect.stringContaining('Onboard aborted'),
       'error',
     );
+  });
+});
+// ---------------------------------------------------------------------------
+// Replace Current Book (Plan T, Phase 5 — P5-S1)
+//
+// Frontend contract (frontend/src/tabs/script.ts handleReplace, implemented in
+// Phase 3): Replace is a destructive, EXPLICIT action. It reads the EPUB from
+// #file-upload-replace, shows a showConfirm naming the current book and stating
+// identity/series/position are preserved while document text + book-owned
+// outputs are replaced (cannot be undone), awaits waitForWalkCleanup (so no
+// writer is active before the swap), then POSTs /api/pipeline/replace through
+// pipelineReplace (postFormWithRetryOnce = one 503+Retry-After retry). The
+// frontend NEVER changes book state optimistically: on any failed wait or
+// request (503 contention, 404, 400) the current book identity, persisted
+// pipelineBookId, walk polling, and displayed book are all retained. Only on
+// success is the walk status/run history reset — for the SAME book ID.
+//
+// Import-as-new (/onboard, handleOnboard) is the SEPARATE non-destructive
+// action (no destructive confirmation, fresh book id from the server).
+// Re-onboard (/reonboard, handleReonboard) is the SEPARATE fileless
+// generated-output reset whose confirmation copy explicitly distinguishes it
+// from document replacement.
+//
+// The DOMContentLoaded wiring is registered exactly ONCE (earlier describe's
+// beforeAll -> initScript()). Reusing that single listener means #btn-replace-epub
+// must exist in the DOM when initPipelineUI() binds on the dispatched event.
+// ---------------------------------------------------------------------------
+
+describe('Script Tab — Replace current book (Plan T, Phase 5)', () => {
+  const okResponse = (body: unknown) => ({
+    ok: true,
+    status: 200,
+    statusText: 'OK',
+    headers: { get: () => null },
+    json: async () => body,
+  });
+  const replace503 = {
+    ok: false,
+    status: 503,
+    statusText: 'Service Unavailable',
+    headers: { get: (name: string) => (name === 'Retry-After' ? '1' : null) },
+    json: async () => ({ detail: 'transaction contention' }),
+  };
+  const okCancelled = okResponse({ status: 'cancelled' });
+
+  function statusesPending(): Record<string, string> {
+    const s: Record<string, string> = {};
+    for (const n of WALK_ORDER) s[n] = 'pending';
+    return s;
+  }
+
+  function runRow(status: string): Record<string, unknown> {
+    return {
+      run_id: 'r-1',
+      walk_name: 'walk_2b_character_discovery',
+      status,
+      heartbeat_ms: 0,
+      created_ms: 1000,
+      finished_ms: status === 'running' || status === 'pending' ? 0 : 2000,
+      error: null,
+    };
+  }
+
+  /** Idle polling: /runs -> [] (no active walk), walk_status -> 9 pending. */
+  function mockIdlePoll(): void {
+    vi.mocked(API.get).mockImplementation((endpoint: string) => {
+      if (String(endpoint).endsWith('/runs')) return Promise.resolve([]);
+      return Promise.resolve(statusesPending());
+    });
+  }
+
+  /** Drive a real Import-as-new through the UI so currentBookId gets set. */
+  async function onboardImportAsNew(bookId = 'book-rep'): Promise<void> {
+    resetScriptSessionForTests();
+    state.pipelineBookId = null;
+    mockIdlePoll();
+    const fileInput = document.getElementById('file-upload') as HTMLInputElement;
+    const file = new File(['test'], 'book.epub', { type: 'application/epub+zip' });
+    Object.defineProperty(fileInput, 'files', { value: [file], configurable: true });
+    mockFetch.mockResolvedValueOnce(okResponse({ book_id: bookId, series_id: 's', chapters: 3 }));
+    document.dispatchEvent(new Event('DOMContentLoaded'));
+    document.getElementById('btn-onboard-epub')!.click();
+    await vi.advanceTimersByTimeAsync(0); // flush pipelineOnboard + initial walk-status poll
+  }
+
+  /** Set the Replace file control so handleReplace reads a chosen EPUB. */
+  function setReplaceFile(name = 'new.epub'): void {
+    const el = document.getElementById('file-upload-replace') as HTMLInputElement;
+    const file = new File(['new epub'], name, { type: 'application/epub+zip' });
+    Object.defineProperty(el, 'files', { value: [file], configurable: true });
+  }
+
+  function assertReplaceBodyHasBookId(bookId: string): void {
+    const replaceCalls = mockFetch.mock.calls.filter(([url]) => String(url) === '/api/pipeline/replace');
+    expect(replaceCalls.length).toBeGreaterThan(0);
+    const body = replaceCalls[0][1].body as FormData;
+    expect(body).toBeInstanceOf(FormData);
+    expect(body.get('book_id')).toBe(bookId);
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockFetch.mockReset(); // also drops stale Once queues from earlier describes
+    state.pipelineBookId = null; // isolate from earlier describes (handleOnboard leaks it)
+    resetScriptSessionForTests(); // fresh page: currentBookId starts null
+    vi.useFakeTimers();
+    document.body.innerHTML = `
+      <input type="file" id="file-upload">
+      <span id="upload-status"></span>
+      <button id="btn-onboard-epub"></button>
+      <div id="walk-execution-section" style="display:none;"></div>
+      <div id="walk-status-container"></div>
+      <div id="walk-runs-container"></div>
+      <button id="btn-run-all-walks"></button>
+      <button id="btn-cancel-walks"></button>
+      <button id="btn-reonboard"></button>
+      <input type="file" id="file-upload-replace">
+      <span id="replace-status"></span>
+      <button id="btn-replace-epub"></button>
+    `;
+  });
+
+  afterEach(() => {
+    stopWalkPolling();
+    vi.useRealTimers();
+  });
+
+  // -- Explicit Import-as-new (non-destructive, distinct from Replace) -------
+
+  it('Import-as-new posts to /onboard and takes the server-assigned fresh book id without destructive confirmation', async () => {
+    const { showConfirm } = await import('../../src/utils');
+    await onboardImportAsNew('book-new');
+    expect(state.pipelineBookId).toBe('book-new');
+    // Non-destructive: no Replace confirmation was shown, and the request went
+    // to /onboard (Import-as-new), never /replace.
+    expect(showConfirm).not.toHaveBeenCalled();
+    expect(mockFetch).toHaveBeenCalledWith('/api/pipeline/onboard', expect.objectContaining({ method: 'POST' }));
+    expect(mockFetch).not.toHaveBeenCalledWith('/api/pipeline/replace', expect.anything());
+  });
+
+  // -- Replace confirmation flow: confirm vs decline -------------------------
+
+  it('Replace shows a destructive confirmation naming the book; declining posts nothing and keeps state', async () => {
+    const { showConfirm } = await import('../../src/utils');
+    await onboardImportAsNew('book-rep');
+    mockFetch.mockClear();
+    setReplaceFile('new.epub');
+    vi.mocked(showConfirm).mockResolvedValue(false); // user declines
+
+    document.getElementById('btn-replace-epub')!.click();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(showConfirm).toHaveBeenCalledWith(expect.stringContaining('book-rep'));
+    expect(showConfirm).toHaveBeenCalledWith(expect.stringContaining('This action cannot be undone.'));
+    expect(showConfirm).toHaveBeenCalledWith(expect.stringContaining('series position remain unchanged'));
+    // Declined: no replace POST, no cancel, no optimistic change.
+    expect(mockFetch).not.toHaveBeenCalledWith('/api/pipeline/replace', expect.anything());
+    expect(mockFetch).not.toHaveBeenCalledWith('/api/pipeline/cancel_walks', expect.anything());
+    expect(state.pipelineBookId).toBe('book-rep');
+  });
+
+  it('Replace posts to /replace with book_id + file only after confirmation; identity retained on success', async () => {
+    const { showConfirm } = await import('../../src/utils');
+    await onboardImportAsNew('book-rep');
+    mockFetch.mockClear();
+    setReplaceFile('new.epub');
+    vi.mocked(showConfirm).mockResolvedValue(true); // user confirms
+    mockFetch.mockResolvedValueOnce(okResponse({
+      book_id: 'book-rep', series_id: 's', book_number: 1, position: 1,
+      version: 2, chapters: 3, status: 'replaced',
+    }));
+
+    document.getElementById('btn-replace-epub')!.click();
+    await vi.advanceTimersByTimeAsync(0); // showConfirm + cleanup sniff (idle) + replace POST
+
+    assertReplaceBodyHasBookId('book-rep');
+    const replaceCalls = mockFetch.mock.calls.filter(([url]) => String(url) === '/api/pipeline/replace');
+    const body = replaceCalls[0][1].body as FormData;
+    expect(body.get('file')).toBeInstanceOf(File);
+    // Same identity retained: persisted pipelineBookId unchanged.
+    expect(state.pipelineBookId).toBe('book-rep');
+  });
+
+  // -- Active-walk wait before Replace ---------------------------------------
+
+  it('Replace cancels an active walk and awaits terminal cleanup BEFORE posting replace', async () => {
+    const { showConfirm } = await import('../../src/utils');
+    await onboardImportAsNew('book-rep');
+    expect(state.pipelineBookId).toBe('book-rep');
+    vi.mocked(showConfirm).mockResolvedValue(true);
+
+    let cancelled = false;
+    mockFetch.mockImplementation((url: RequestInfo | URL) => {
+      if (String(url).endsWith('/cancel_walks')) {
+        cancelled = true;
+        return Promise.resolve(okCancelled);
+      }
+      return Promise.resolve(okResponse({
+        book_id: 'book-rep', series_id: 's', book_number: 1, position: 1,
+        version: 2, chapters: 3, status: 'replaced',
+      }));
+    });
+    // Active run while not yet cancelled; terminal after the cancel.
+    vi.mocked(API.get).mockImplementation((endpoint: string) => {
+      if (String(endpoint).endsWith('/runs')) {
+        return Promise.resolve(cancelled ? [runRow('cancelled')] : [runRow('running')]);
+      }
+      return Promise.resolve(statusesPending());
+    });
+
+    setReplaceFile('new.epub');
+    document.getElementById('btn-replace-epub')!.click();
+    await vi.advanceTimersByTimeAsync(0); // showConfirm + cleanup sniff (active) + cancel
+    expect(cancelled).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(300); // cleanup poll observes terminal row -> proceed
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/api/pipeline/cancel_walks',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ book_id: 'book-rep' }) }),
+    );
+    expect(mockFetch).toHaveBeenCalledWith('/api/pipeline/replace', expect.anything());
+    // The cancel of the active walk happened BEFORE the replace POST: Replace
+    // honors the wait-for-cleanup gate and never races a running writer.
+    const cancelIdx = mockFetch.mock.calls.findIndex(
+      ([url]) => String(url).endsWith('/cancel_walks'),
+    );
+    const replaceIdx = mockFetch.mock.calls.findIndex(
+      ([url]) => String(url) === '/api/pipeline/replace',
+    );
+    expect(cancelIdx).toBeGreaterThanOrEqual(0);
+    expect(replaceIdx).toBeGreaterThan(cancelIdx);
+    expect(state.pipelineBookId).toBe('book-rep');
+  });
+
+  // -- 503 failure preservation (state retained, no optimistic change) -------
+
+  it('Replace surfacing a 503 contension retains the book identity and shows a failed status/toast', async () => {
+    const { showConfirm, showToast } = await import('../../src/utils');
+    await onboardImportAsNew('book-rep');
+    expect(state.pipelineBookId).toBe('book-rep');
+    mockFetch.mockClear();
+    vi.mocked(showConfirm).mockResolvedValue(true);
+    mockFetch.mockResolvedValue(replace503); // both attempts -> 503 (retry-once exhausted)
+    setReplaceFile('new.epub');
+
+    document.getElementById('btn-replace-epub')!.click();
+    await vi.advanceTimersByTimeAsync(0); // showConfirm + sniff + attempt 1 (503 -> delay scheduled)
+    await vi.advanceTimersByTimeAsync(1000); // retry delay elapses -> attempt 2 (503) -> fail
+
+    expect(mockFetch.mock.calls.filter(([u]) => String(u) === '/api/pipeline/replace')).toHaveLength(2);
+    expect(showToast).toHaveBeenCalledWith(expect.stringContaining('Replace failed'), 'error');
+    // No optimistic change: persisted identity, polling target, and current
+    // book are untouched after the failed request.
+    expect(state.pipelineBookId).toBe('book-rep');
+  });
+
+  // -- Successful same-ID replacement ----------------------------------------
+
+  it('Replace success keeps the same book id and resets walk status to pending for that book', async () => {
+    const { showConfirm, showToast } = await import('../../src/utils');
+    await onboardImportAsNew('book-rep');
+    mockFetch.mockClear();
+    vi.mocked(showConfirm).mockResolvedValue(true);
+    mockFetch.mockResolvedValueOnce(okResponse({
+      book_id: 'book-rep', series_id: 's', book_number: 1, position: 1,
+      version: 2, chapters: 3, status: 'replaced',
+    }));
+
+    setReplaceFile('new.epub');
+    document.getElementById('btn-replace-epub')!.click();
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Success status shows the RETAINED book id (same identity) + new version.
+    const statusEl = document.getElementById('replace-status')!;
+    expect(statusEl.innerHTML).toContain('Replaced');
+    expect(statusEl.innerHTML).toContain('book-rep');
+    expect(statusEl.innerHTML).toContain('v2');
+    expect(showToast).toHaveBeenCalledWith(
+      expect.stringContaining('Book replaced successfully'),
+      'success',
+    );
+    // Walk status reset to all-pending for the SAME book (identity unchanged).
+    const container = document.getElementById('walk-status-container')!;
+    const firstBadge = container.querySelector('[data-walk] .badge');
+    expect(firstBadge!.textContent).toContain('pending');
+    expect(state.pipelineBookId).toBe('book-rep'); // currentBookId NOT reassigned
+  });
+
+  // -- Separate Re-onboard behavior (generated-output reset) -----------------
+
+  it('Re-onboard confirmation copy distinguishes generated-output reset from document replacement', async () => {
+    const { showConfirm } = await import('../../src/utils');
+    await onboardImportAsNew('book-rep');
+    mockFetch.mockClear();
+    vi.mocked(showConfirm).mockResolvedValue(true);
+    vi.mocked(API.post).mockResolvedValue({ book_id: 'book-rep', version: 2, status: 'reonboarded' });
+
+    document.getElementById('btn-reonboard')!.click();
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Copy is the generated-output reset, NOT the destructive replace copy.
+    expect(showConfirm).toHaveBeenCalledWith(expect.stringContaining('does NOT replace the document text'));
+    expect(showConfirm).toHaveBeenCalledWith(expect.stringContaining('generated walk outputs'));
+    expect(showConfirm).not.toHaveBeenCalledWith(expect.stringContaining('series position remain unchanged'));
+    // Re-onboard is the fileless reset: posts to /reonboard (JSON body, no FormData).
+    expect(API.post).toHaveBeenCalledWith('/api/pipeline/reonboard', { book_id: 'book-rep' });
+    expect(mockFetch).not.toHaveBeenCalledWith('/api/pipeline/replace', expect.anything());
   });
 });

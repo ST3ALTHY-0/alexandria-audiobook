@@ -45,6 +45,8 @@ Plan Q (Pipeline-Only Cutover — terminal plan) ← NEW: delete legacy editor/v
 Plan R (Global Walk Lock + Cancellation Cleanup + Savepoint API) ← CRITICAL FIX, post-cutover
     ↓
 Plan S (Explicit Cancellation Rollback Override — Durable Walk Undo Journal) ← NEW, supersedes R cleanup only
+    ↓
+Plan T (Transactional Onboarding Replace + Import-as-New UX)
 ```
 
 ## Plan List
@@ -70,8 +72,9 @@ Plan S (Explicit Cancellation Rollback Override — Durable Walk Undo Journal) �
 | Q | Pipeline-Only Cutover (terminal) | 11 | 70 | ~38K |
 | R | Global Walk Lock, Cancellation Cleanup, Savepoint API (critical fix) | 5 | 25 | ~25K |
 | S | Explicit Cancellation Rollback Override, Durable Walk Undo Journal | 7 | 35 | ~30K |
+| T | Transactional Onboarding Replace + Import-as-New UX | 5 | 25 | ~24K |
 
-**Total:** 18 plans, 109 phases, 568 steps, ~409K weighted chars
+**Total:** 19 plans, 114 phases, 593 steps, ~433K weighted chars
 
 ## Execution Order
 
@@ -82,6 +85,11 @@ a durable writer-side undo journal. R's gate, checkpoint, savepoint, and API
 surface remain prerequisites, and Plan R itself is NOT overwritten — it stays
 the intact predecessor for that surface. R supersedes older
 cross-book concurrency and cancel-cleanup wording without invalidating Q.
+Plan T follows Plan S and implements the approved onboarding lifecycle:
+`/onboard` remains Import-as-new, `/replace` destructively replaces one book
+while retaining identity/series position, and `/reonboard` remains the
+fileless generated-output reset. It introduces no series-position or visibility
+controls.
 
 **Recommended execution:** Sequential, one plan at a time. Each plan should be validated (all tests pass) before proceeding to the next.
 

@@ -196,10 +196,11 @@ Configure your LLM connection and TTS engine. At minimum you need:
 - Click **Save Configuration** when done
 
 **Step 2 — Script**
-- Select your book file (EPUB only) using the file picker — it uploads and is onboarded into the pipeline automatically (converted to plain text server-side)
+- Select your book file (EPUB only) using the file picker — it uploads and is onboarded into the pipeline automatically (converted to plain text server-side). Each **Onboard / Import-as-new** upload creates a distinct book (own book ID and series).
 - Click **Run All Walks** — this runs the 9-walk LLM annotation pipeline (scene segmentation → character discovery → alias resolution → scene presence → span attribution → character description → voice audition → voice assignment → delivery) to build the annotated script
 - Watch walk progress in real time; each walk's status is shown as it completes
-- *(Optional)* Click **Re-onboard** if you need to reload the book from scratch
+- For an existing book, click **Replace** to swap its document text with a new EPUB. Replace keeps the book's ID and series/position, resets the book's generated output, and waits for (cancels) any still-active walk before proceeding. It never reorders the series or toggles export visibility.
+- *(Optional)* Click **Re-onboard** if you need to reload the book from scratch (resets generated output, keeps the run history — distinct from Replace)
 
 **Step 3 — Voices**
 The pipeline's voice assignment walk (2h) automatically assigns a voice to every character from your voice catalog:
@@ -334,7 +335,8 @@ Upload an EPUB file and run the annotation walks. Onboarding is EPUB-only — th
 - **Walk status** - Per-walk progress shown in real time; each walk can also be re-run individually
 - **Walk runs** - A run-history list below the walk badges (`GET /api/pipeline/walks/{book_id}/runs`) with created/finished times and a status badge per run
 - **Cancel Walks** - Stop a running walk cycle (the request retries once automatically on 503 contention)
-- **Re-onboard** - Reload the book and reset the pipeline state
+- **Re-onboard** - Reload the book and reset the pipeline state (clears generated output, bumps progression; the run/walk history is preserved — distinct from Replace)
+- **Replace** - Swap the current book's document with a new EPUB while retaining its book ID, series number, and position. All book-owned generated output (walks, renders, workbench, persist) is cleared and re-run; any still-active walk is cancelled/awaited first (the API returns HTTP 503 + `Retry-After` on contention). Replace never reorders or renumbers the series and exposes no export-visibility control by design — Import-as-new (Onboard) is the only way a differently-seriesed book is introduced
 
 ### Voices Tab
 The pipeline assigns a voice to every character during walk 2h. The Voices tab lets you review and adjust those assignments:

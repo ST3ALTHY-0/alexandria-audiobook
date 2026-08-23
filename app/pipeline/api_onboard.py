@@ -16,11 +16,16 @@ import os
 import tempfile
 import uuid
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
 from app.pipeline.adapter import PipelineStorage, SQLiteAdapter
-from app.pipeline.assembly import get_book_version, has_active_run, reonboard_book
+from app.pipeline.assembly import (
+    get_book_version,
+    has_active_run,
+    reonboard_book,
+    replace_book_tree,
+)
 from app.pipeline.extract import extract_epub_text
 from app.pipeline.populate import populate_spine
 from app.pipeline.tts_integration import get_render_root
@@ -241,3 +246,102 @@ async def reonboard(
         "version": new_version,
         "status": "reonboarded",
     }
+
+
+# ---------------------------------------------------------------------------
+# POST /api/pipeline/replace
+# ---------------------------------------------------------------------------
+
+
+@router.post("/replace")
+async def replace_epub(
+    file: UploadFile = File(...),
+    book_id: str = Form(...),
+    storage: PipelineStorage = Depends(get_storage),
+) -> dict:
+    """Destructively replace an existing book's document tree and outputs.
+
+    Accepts a multipart ``file`` (EPUB) plus ``book_id``.  The uploaded EPUB is
+    extracted into an uncommitted in-memory result BEFORE any mutation; a
+    failed extraction leaves the old tree and outputs fully intact (mapped to
+    HTTP ``400``).  Only after extraction succeeds is the process-wide
+    active-walk guard consulted (``503`` + ``Retry-After: 5``), and only then
+    does ``replace_book_tree`` atomically swap the document spine and all
+    book-owned generated DB/filesystem outputs while retaining the book's
+    identity and ordering fields.
+
+    Precedence (mirrors ``/reonboard``): EPUB extension is validated first
+    (``400``), then book existence (unknown book maps to ``404``) is checked
+    BEFORE the active-run guard, so an unknown book never races to ``503``.
+    Population errors are mapped to HTTP ``500``.
+
+    Ownership boundary: ``replace_book_tree`` clears ONLY rows/files owned by
+    the replaced book — its document spine, spine-linked junctions and
+    memberships, and its book-scoped ``walk_run``/render/workbench/persona
+    output plus the ``RENDER_ROOT/book-<id>/`` directory. No OTHER book, its
+    spine, characters, or output, and no global rows (``NULL``-book_id persona)
+    are touched; sibling and Import-as-new books are left byte-identical.
+
+    Deliberately NO series-position/visibility control: replace always retains
+    the book's ``series_id``, ``book_number``, and ``position`` — it never
+    renumbers, reorders, or moves the book within its series, and it exposes
+    no parameter to alter series position or any export/visibility setting.
+    Reordering/renumbering a series or toggling visibility is intentionally
+    out of scope for this endpoint; Import-as-new remains the only way a
+    differently-seriesed or differently-positioned book is introduced.
+    """
+    if not file.filename or not file.filename.lower().endswith(".epub"):
+        raise HTTPException(status_code=400, detail="File must be an EPUB (.epub)")
+
+    # 404 (unknown book) is preserved and checked BEFORE the active-run check.
+    try:
+        get_book_version(book_id, storage)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    # Save upload in the existing server-generated temp path pattern.
+    tmp_dir = tempfile.mkdtemp(prefix="pipeline_replace_")
+    # Never use the client-controlled filename as a filesystem path.
+    tmp_path = os.path.join(tmp_dir, f"{uuid.uuid4()}.epub")
+    try:
+        content = await file.read()
+        await asyncio.to_thread(_write_bytes, tmp_path, content)
+
+        # Extraction (uncommitted, in-memory) happens BEFORE any mutation; a
+        # failure maps to 400 without touching the database.
+        try:
+            result = extract_epub_text(tmp_path, book_id, storage)
+        except Exception as exc:  # noqa: BLE001 — EPUB extraction may raise many types; mapped to HTTP 400
+            raise HTTPException(
+                status_code=400, detail=f"Failed to extract EPUB: {exc}"
+            )
+
+        # 503 + Retry-After contention only after the staged extraction is safe.
+        _reject_if_walk_active(storage)
+
+        # Atomic replace: retains book identity/ordering, bumps version.
+        try:
+            outcome = replace_book_tree(book_id, result["chapters"], storage)
+        except Exception as exc:  # noqa: BLE001 — spine population may raise many types; mapped to HTTP 500
+            raise HTTPException(
+                status_code=500, detail=f"Failed to replace book: {exc}"
+            )
+
+        return {
+            "book_id": outcome["book_id"],
+            "series_id": outcome["series_id"],
+            "book_number": outcome["book_number"],
+            "position": outcome["position"],
+            "version": outcome["version"],
+            "chapters": outcome["chapters"],
+            "status": "replaced",
+        }
+    finally:
+        # Clean up temp file
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        if os.path.exists(tmp_dir):
+            try:
+                os.rmdir(tmp_dir)
+            except OSError:
+                pass

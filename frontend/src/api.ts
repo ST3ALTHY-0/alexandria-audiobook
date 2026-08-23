@@ -482,3 +482,42 @@ export async function rerunScopedWalk(
     rerun,
   );
 }
+
+// ---------------------------------------------------------------------------
+// Destructive book replacement (Transactional Replace, Plan T)
+// ---------------------------------------------------------------------------
+
+/**
+ * Response from POST /api/pipeline/replace.
+ * The retained `book_id`/`series_id`/`book_number`/`position` are unchanged;
+ * `version` is bumped and `chapters` is the new replaced chapter count.
+ */
+export interface PipelineReplaceResult {
+  book_id: string;
+  series_id: string;
+  book_number: number;
+  position: number;
+  version: number;
+  chapters: number;
+  status: 'replaced';
+}
+
+/**
+ * Destructively replace an existing book's EPUB (confirmed explicit action).
+ * POST /api/pipeline/replace — multipart `file` (the new EPUB) plus a `book_id`
+ * form field. The backend retains the book's identity and series position,
+ * clears book-owned generated outputs, and returns the retained fields with a
+ * bumped version. Error contract: 404 unknown book; 400 invalid/extraction
+ * failure; 503 + Retry-After while any process-wide walk is pending/running
+ * (retried exactly once by the wrapper). Never routes through the fileless
+ * `/reonboard` endpoint.
+ */
+export async function pipelineReplace(
+  bookId: string,
+  file: File | Blob,
+): Promise<PipelineReplaceResult> {
+  const form = new FormData();
+  form.append('file', file);
+  form.append('book_id', bookId);
+  return postFormWithRetryOnce<PipelineReplaceResult>('/api/pipeline/replace', form);
+}
