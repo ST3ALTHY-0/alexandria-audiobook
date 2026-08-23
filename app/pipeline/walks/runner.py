@@ -206,10 +206,28 @@ def _flip_all_running_to_interrupted(storage: PipelineStorage) -> list[str]:
     return run_ids
 
 
+def _flip_all_pending_to_interrupted(storage: PipelineStorage) -> list[str]:
+    """Start-of-day: resolve reservations left by the previous process."""
+    rows = storage.execute_query(
+        "SELECT run_id FROM walk_run WHERE status = 'pending'", ()
+    )
+    run_ids = [row["run_id"] for row in rows]
+    now = _now_ms()
+    for run_id in run_ids:
+        storage.execute_update(
+            "UPDATE walk_run SET status = 'interrupted', error = ?, "
+            "finished_ms = ?, heartbeat_ms = ? "
+            "WHERE run_id = ? AND status = 'pending'",
+            (_INTERRUPTED_ERROR, now, now, run_id),
+        )
+    return run_ids
+
+
 def reconcile_and_replay(
     storage: PipelineStorage,
     *,
     start_of_day: bool = False,
+    reconcile_stale: bool = True,
 ) -> dict:
     """Reconcile stale runs and replay interrupted-run journals (one entry point).
 
@@ -219,11 +237,11 @@ def reconcile_and_replay(
     — safe to call repeatedly.
 
     Steps:
-      1. ``storage.reconcile_stale_runs()`` — flip stale ``running`` rows (grace
-         window elapsed) to ``interrupted``. Never touches fresh-heartbeat rows.
-      2. When ``start_of_day`` is true (storage acquisition before any request/
-         admission), also flip every remaining ``running`` row to ``interrupted``
-         — the fresh-heartbeat crash gap (nothing is live at process start).
+      1. When ``reconcile_stale`` is true, ``storage.reconcile_stale_runs()``
+         flips stale ``running`` rows. Normal admission passes false and never
+         makes a heartbeat-age liveness decision.
+      2. When ``start_of_day`` is true, also flip every remaining ``running``
+         row to ``interrupted`` — the fresh-heartbeat crash gap.
       3. For every ``interrupted`` run that still holds journal rows, replay it
          (reverse ``seq``, per-entry auto-commit — no blanket transaction, so a
          crash mid-replay restarts safely) and clear the journal. The adapter's
@@ -232,11 +250,18 @@ def reconcile_and_replay(
          undone via safe insert-undo, decisions are marked ``undone`` (never
          deleted), and alias-merge history stays irrevocable.
 
-    Returns ``{"reconcile": {...counts}, "flipped_fresh_heartbeat": [run_id],
+    Returns ``{"reconcile": {...counts}, "flipped_start_of_day": [run_id],
     "replays": {run_id: {replayed, skipped, conflicts, reasons}}}``.
     """
-    counts = storage.reconcile_stale_runs()
-    flipped = _flip_all_running_to_interrupted(storage) if start_of_day else []
+    counts = (
+        storage.reconcile_stale_runs()
+        if reconcile_stale
+        else {"render_job": 0, "walk_run": 0}
+    )
+    flipped = []
+    if start_of_day:
+        flipped.extend(_flip_all_running_to_interrupted(storage))
+        flipped.extend(_flip_all_pending_to_interrupted(storage))
     journaled = storage.execute_query(
         "SELECT run_id FROM walk_run WHERE status = 'interrupted' "
         "AND run_id IN (SELECT DISTINCT run_id FROM walk_undo_entry)",
@@ -846,7 +871,7 @@ class WalkRunner:
         # writer. Grace-based only at admission (start_of_day=False) — a live
         # walk's fresh ``running`` row is never flipped here; the gate below
         # rejects it instead. Idempotent no-op on the common no-leftover path.
-        reconcile_and_replay(self._storage)
+        reconcile_and_replay(self._storage, reconcile_stale=False)
         admitted = False
         terminalized = False
         try:
@@ -855,7 +880,17 @@ class WalkRunner:
                     "SELECT status FROM walk_run WHERE run_id = ? AND book_id = ?",
                     (run_id, book_id),
                 )
-                if not rows or rows[0]["status"] != "pending":
+                if not rows:
+                    return {
+                        "status": "failed",
+                        "error": f"Reservation not pending for run '{run_id}'",
+                    }
+                if rows[0]["status"] != "pending":
+                    if rows[0]["status"] == "cancelled":
+                        return {
+                            "status": "cancelled",
+                            "error": "Walk cancelled by user",
+                        }
                     return {
                         "status": "failed",
                         "error": f"Reservation not pending for run '{run_id}'",
@@ -1351,8 +1386,8 @@ class WalkRunner:
 
         1. sets the in-process per-book event (existing semantics — tests
            assert the ``_cancelled`` dict directly),
-        2. writes ``cancel_requested=1`` on the book's active
-           (pending/running) ``walk_run`` rows,
+        2. immediately terminalizes pending rows and writes
+           ``cancel_requested=1`` on running rows,
         3. drops a stop-file per active run so the cancel intent survives
            a process restart.
 
@@ -1362,17 +1397,26 @@ class WalkRunner:
         """
         self._cancelled[book_id] = True
         rows = self._storage.execute_query(
-            "SELECT run_id FROM walk_run WHERE book_id = ? "
+            "SELECT run_id, status FROM walk_run WHERE book_id = ? "
             "AND status IN ('pending', 'running')",
             (book_id,),
         )
         for row in rows:
             run_id = row["run_id"]
-            self._storage.execute_update(
-                "UPDATE walk_run SET cancel_requested = 1, heartbeat_ms = ? "
-                "WHERE run_id = ?",
-                (_now_ms(), run_id),
-            )
+            now = _now_ms()
+            if row["status"] == "pending":
+                self._storage.execute_update(
+                    "UPDATE walk_run SET status = 'cancelled', "
+                    "cancel_requested = 1, finished_ms = ?, heartbeat_ms = ? "
+                    "WHERE run_id = ? AND status = 'pending'",
+                    (now, now, run_id),
+                )
+            else:
+                self._storage.execute_update(
+                    "UPDATE walk_run SET cancel_requested = 1, heartbeat_ms = ? "
+                    "WHERE run_id = ? AND status = 'running'",
+                    (now, run_id),
+                )
             self._write_stop_file(run_id)
         logger.info("Walks cancelled for book '%s'", book_id)
 
