@@ -330,6 +330,24 @@ def real_client(
 
 
 class TestOnboardEndpoint:
+    def test_onboard_rejects_global_active_walk(self, client, storage):
+        """Onboarding is blocked while a walk for any book is active."""
+        storage.execute_insert(
+            "INSERT INTO walk_run (run_id, book_id, walk_name, status, created_ms) "
+            "VALUES ('active-run', 'other-book', 'walk_2b_character_discovery', 'running', 1000)"
+        )
+        with patch("app.pipeline.api_onboard.extract_epub_text") as mock_extract:
+            response = client.post(
+                "/api/pipeline/onboard",
+                files={
+                    "file": ("test.epub", b"fake epub content", "application/epub+zip")
+                },
+            )
+
+        assert response.status_code == 503
+        assert response.headers["retry-after"] == "5"
+        mock_extract.assert_not_called()
+
     def test_onboard_rejects_non_epub(self, client):
         """Non-EPUB files are rejected with 400."""
         response = client.post(
@@ -2345,6 +2363,20 @@ class TestCancellation:
 
 
 class TestReonboardEndpoint:
+    def test_reonboard_rejects_global_active_walk(self, client, storage):
+        """Re-onboarding is blocked by an active walk on another book."""
+        storage.execute_insert(
+            "INSERT INTO walk_run (run_id, book_id, walk_name, status, created_ms) "
+            "VALUES ('active-run', 'other-book', 'walk_2b_character_discovery', 'pending', 1000)"
+        )
+        response = client.post(
+            "/api/pipeline/reonboard",
+            json={"book_id": "b1"},
+        )
+
+        assert response.status_code == 503
+        assert response.headers["retry-after"] == "5"
+
     def test_reonboard_valid_book(self, client):
         """Re-onboarding a valid book returns new version."""
         response = client.post(

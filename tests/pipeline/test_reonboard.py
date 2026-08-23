@@ -527,17 +527,17 @@ def _insert_walk_run(storage: InMemorySQLiteAdapter, run_id: str, book_id: str, 
 class TestHasActiveRun:
     def test_false_no_runs(self, storage):
         """A book with no walk_run rows has no active run."""
-        assert has_active_run("b1", storage) is False
+        assert has_active_run(storage) is False
 
     def test_true_pending(self, storage):
         """A pending run prevents replacement (writer not yet started)."""
         _insert_walk_run(storage, "r1", "b1", "pending")
-        assert has_active_run("b1", storage) is True
+        assert has_active_run(storage) is True
 
     def test_true_running(self, storage):
         """A running run prevents replacement (writer active)."""
         _insert_walk_run(storage, "r1", "b1", "running")
-        assert has_active_run("b1", storage) is True
+        assert has_active_run(storage) is True
 
     def test_false_terminal(self, storage):
         """Terminal rows (completed/cancelled/failed) do not block replacement."""
@@ -545,19 +545,19 @@ class TestHasActiveRun:
             s = InMemorySQLiteAdapter()
             s.init_db()
             _insert_walk_run(s, "r1", "b1", status)
-            assert has_active_run("b1", s) is False, status
+            assert has_active_run(s) is False, status
 
-    def test_scoped_to_book(self, storage):
-        """Active run on another book does not block this book."""
+    def test_global_across_books(self, storage):
+        """An active run on another book blocks replacement globally."""
         _insert_walk_run(storage, "r-other", "b-other", "running")
-        assert has_active_run("b1", storage) is False
+        assert has_active_run(storage) is True
 
-    def test_nonexistent_book_is_not_active(self, storage):
-        """A book with no rows at all is not active (replacement may be 404'd upstream)."""
-        assert has_active_run("does-not-exist", storage) is False
+    def test_no_rows_is_not_active(self, storage):
+        """No walk_run rows means there is no active walk."""
+        assert has_active_run(storage) is False
 
     def test_pending_sibling_rows_all_count(self, storage):
         """Multiple pending/running rows are all treated as active."""
         _insert_walk_run(storage, "r1", "b1", "pending")
         _insert_walk_run(storage, "r2", "b1", "running")
-        assert has_active_run("b1", storage) is True
+        assert has_active_run(storage) is True

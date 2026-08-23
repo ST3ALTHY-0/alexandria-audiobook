@@ -37,6 +37,19 @@ def _write_bytes(path: str, content: bytes) -> None:
 _REONBOARD_CONTENTION_RETRY_AFTER_SECONDS = 5
 
 
+def _reject_if_walk_active(storage: PipelineStorage) -> None:
+    """Reject book replacement while any walk writer is pending or running."""
+    if has_active_run(storage):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "A walk is still active — cancel it and retry "
+                f"after {_REONBOARD_CONTENTION_RETRY_AFTER_SECONDS}s"
+            ),
+            headers={"Retry-After": str(_REONBOARD_CONTENTION_RETRY_AFTER_SECONDS)},
+        )
+
+
 # ---------------------------------------------------------------------------
 # Pydantic request models
 # ---------------------------------------------------------------------------
@@ -116,6 +129,10 @@ async def onboard_epub(
     if not file.filename or not file.filename.lower().endswith(".epub"):
         raise HTTPException(status_code=400, detail="File must be an EPUB (.epub)")
 
+    # The server-side global walk invariant is authoritative; do not begin
+    # extraction/population while any book has a writer in flight.
+    _reject_if_walk_active(storage)
+
     # Save uploaded file to temp location
     tmp_dir = tempfile.mkdtemp(prefix="pipeline_onboard_")
     # Never use the client-controlled filename as a filesystem path.  A unique
@@ -178,8 +195,8 @@ async def reonboard(
     """Re-onboard a book: clear walk outputs, bump version.
 
     Coordinates with the global walk controller (CONTRACTS.md "Onboarding /
-    re-onboarding / book-switching coordination"): if any ``walk_run`` row for
-    the book is active (``pending``/``running``), replacement data may NOT
+    re-onboarding / book-switching coordination"): if any ``walk_run`` row is
+    active (``pending``/``running``), replacement data may NOT
     become current while that writer could still run, so the synchronous path
     does NOT clear/replace and instead returns a documented conflict —
     HTTP 503 + ``Retry-After`` (consistent with the app-level contention
@@ -196,16 +213,8 @@ async def reonboard(
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    # 503 + Retry-After contention (book replacement while a writer is active).
-    if has_active_run(request.book_id, storage):
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "A walk is still active for this book — cancel it and retry "
-                f"after {_REONBOARD_CONTENTION_RETRY_AFTER_SECONDS}s"
-            ),
-            headers={"Retry-After": str(_REONBOARD_CONTENTION_RETRY_AFTER_SECONDS)},
-        )
+    # 503 + Retry-After contention (global replacement while a writer is active).
+    _reject_if_walk_active(storage)
 
     try:
         new_version = reonboard_book(request.book_id, storage)

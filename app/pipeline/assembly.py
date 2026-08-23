@@ -144,8 +144,8 @@ def get_book_version(book_id: str, storage: PipelineStorage) -> int:
     return rows[0]["version"]
 
 
-def has_active_run(book_id: str, storage: PipelineStorage) -> bool:
-    """Return True if any ``walk_run`` row for *book_id* is active.
+def has_active_run(storage: PipelineStorage) -> bool:
+    """Return True if any ``walk_run`` row is active.
 
     Active means a ``pending`` or ``running`` run — a writer that could still
     execute or is currently executing. This is the single coordination check
@@ -156,22 +156,21 @@ def has_active_run(book_id: str, storage: PipelineStorage) -> bool:
     The ``walk_run`` table is authoritative for active runs (rows = truth), so
     this reads it directly rather than relying on in-memory status caches.
 
+    This is deliberately process-wide: the single-active-walk invariant spans
+    all books, so replacement of any book must wait for every active writer.
+
     Parameters
     ----------
-    book_id:
-        Primary key of the book (may or may not exist).
     storage:
         An active ``PipelineStorage`` implementation.
 
     Returns
     -------
     bool
-        True if at least one pending/running walk_run row exists for *book_id*.
+        True if at least one pending/running walk_run row exists.
     """
     rows = storage.execute_query(
-        "SELECT 1 FROM walk_run WHERE book_id = ? "
-        "AND status IN ('pending', 'running') LIMIT 1",
-        (book_id,),
+        "SELECT 1 FROM walk_run WHERE status IN ('pending', 'running') LIMIT 1",
     )
     return bool(rows)
 
