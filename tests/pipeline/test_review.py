@@ -13,6 +13,7 @@ Covers:
 
 from __future__ import annotations
 
+import json
 import sqlite3
 
 import pytest
@@ -346,6 +347,17 @@ class TestSupersedeTargets:
             (item_id, book_id, run_id, kind, target_id, status),
         )
 
+    def _reserve_run(self, storage, run_id, book_id="b1"):
+        """Create a matching walk_run row so the run_id FK on the undo-journal
+        capture (walk_undo_entry.run_id -> walk_run.run_id) is satisfied.
+        Mirrors the _reserve_run pattern used by walk 2g/2h/2i tests (P4); the
+        FK itself is CORRECT and must not be weakened."""
+        storage.execute_insert(
+            "INSERT INTO walk_run (run_id, book_id, walk_name, status, created_ms) "
+            "VALUES (?, ?, 'walk_2h_voice_match', 'completed', 1)",
+            (run_id, book_id),
+        )
+
     def test_empty_target_ids_is_noop(self):
         """Empty committed set → no-op: nothing is changed."""
         storage = self._make_storage()
@@ -364,6 +376,7 @@ class TestSupersedeTargets:
     def test_supersedes_matching_pending_items(self):
         """Committing targets supersedes prior pending same-kind items for them."""
         storage = self._make_storage()
+        self._reserve_run(storage, "run-2")
         self._insert_item(storage, "i1", "b1", "run-1", "voice_profile", "c1")
         self._insert_item(storage, "i2", "b1", "run-1", "voice_profile", "c2")
         self._insert_item(storage, "i3", "b1", "run-1", "voice_profile", "c3")
@@ -388,6 +401,7 @@ class TestSupersedeTargets:
     def test_excludes_same_run_items(self):
         """Rows belonging to the current run are never superseded."""
         storage = self._make_storage()
+        self._reserve_run(storage, "run-2")
         self._insert_item(storage, "i1", "b1", "run-1", "voice_profile", "c1")
         self._insert_item(storage, "i2", "b1", "run-2", "voice_profile", "c1")
 
@@ -410,6 +424,7 @@ class TestSupersedeTargets:
     def test_excludes_other_kinds(self):
         """Supersede is kind-scoped — items of other kinds are untouched."""
         storage = self._make_storage()
+        self._reserve_run(storage, "run-2")
         self._insert_item(storage, "i1", "b1", "run-1", "voice_profile", "c1")
         self._insert_item(storage, "i2", "b1", "run-1", "voice_assignment", "c1")
 
@@ -460,6 +475,7 @@ class TestSupersedeTargets:
     def test_excludes_other_books(self):
         """Supersede is scoped to the walk's book."""
         storage = self._make_storage()
+        self._reserve_run(storage, "run-2")
         self._insert_item(storage, "i1", "b1", "run-1", "voice_profile", "c1")
         self._insert_item(storage, "i2", "b2", "run-1", "voice_profile", "c1")
 
@@ -1646,3 +1662,163 @@ class TestReviewItemNeighborContext:
         )
         item = self._by_id(neighbor_manager)["walkitem:w-nb4"]
         assert item["neighbors"] == {"before": [], "after": []}
+
+
+# ---------------------------------------------------------------------------
+# P7-S6 — supersede journal atomicity + human-edit-racing-replay protection
+# ---------------------------------------------------------------------------
+
+
+class TestSupersedeJournalAtomicity:
+    """P7-S6: supersede_targets journals its updates atomically, and replay
+    (the cancelled-run rollback path) protects human edits via after-image CAS.
+
+    Locked here at the review surface:
+      * a supersede success writes a durable walk_undo_entry (op='update' on
+        walk_review_item) whose before/after images capture pending ->
+        superseded;
+      * replaying that journal atomically restores the prior pending status;
+      * a human edit racing the replay diverges the row from the after-image,
+        so replay SKIPS it (human edit preserved) and reports it as a conflict
+        (observable, not silently lost).
+    The walk_undo_entry.run_id -> walk_run FK is satisfied by the same
+    _reserve_run fixture used to fix the TestSupersedeTargets baseline — the
+    FK is correct and is never weakened.
+    """
+
+    def _make_storage(self):
+        storage = InMemorySQLiteAdapter()
+        storage.init_db()
+        return storage
+
+    def _reserve_run(self, storage, run_id, book_id="b1"):
+        storage.execute_insert(
+            "INSERT INTO walk_run (run_id, book_id, walk_name, status, created_ms) "
+            "VALUES (?, ?, 'walk_2h_voice_match', 'completed', 1)",
+            (run_id, book_id),
+        )
+
+    def _insert_item(self, storage, item_id, kind, target_id, run_id="run-1"):
+        storage.execute_insert(
+            "INSERT INTO walk_review_item "
+            "(id, book_id, run_id, kind, target_table, target_id, prior_value, status, created_ms) "
+            "VALUES (?, 'b1', ?, ?, 'character', ?, NULL, 'pending', 1)",
+            (item_id, run_id, kind, target_id),
+        )
+
+    def test_supersede_journals_update_atomically(self):
+        """A supersede success writes one op='update' undo entry capturing
+        pending before / superseded after for each superseded target."""
+        storage = self._make_storage()
+        self._reserve_run(storage, "run-2")
+        self._insert_item(storage, "i1", "voice_profile", "c1")
+        self._insert_item(storage, "i2", "voice_profile", "c2")
+
+        n = supersede_targets(
+            storage,
+            book_id="b1",
+            run_id="run-2",
+            kind="voice_profile",
+            target_ids=["c1", "c2"],
+        )
+        assert n == 2
+        entries = storage.list_undo_entries("run-2")
+        assert len(entries) == 2
+        for e in entries:
+            assert e["table_name"] == "walk_review_item"
+            assert e["op"] == "update"
+            before = json.loads(e["before_json"])
+            after = json.loads(e["after_json"])
+            assert before["status"] == "pending"
+            assert after["status"] == "superseded"
+
+    def test_replay_of_supersede_journal_restores_pending(self):
+        """Replaying a supersede run's journal restores each superseded row to
+        its prior pending state (the cancelled-run rollback for the journaled
+        supersede update)."""
+        storage = self._make_storage()
+        self._reserve_run(storage, "run-2")
+        self._insert_item(storage, "i1", "voice_profile", "c1")
+        supersede_targets(
+            storage,
+            book_id="b1",
+            run_id="run-2",
+            kind="voice_profile",
+            target_ids=["c1"],
+        )
+        assert (
+            storage.execute_query("SELECT status FROM walk_review_item WHERE id='i1'")[
+                0
+            ]["status"]
+            == "superseded"
+        )
+        result = storage.replay_run("run-2")
+        assert result["replayed"] == 1
+        assert result["conflicts"] == 0
+        assert (
+            storage.execute_query("SELECT status FROM walk_review_item WHERE id='i1'")[
+                0
+            ]["status"]
+            == "pending"
+        )
+        storage.clear_undo_journal("run-2")
+        assert storage.list_undo_entries("run-2") == []
+
+    def test_human_edit_racing_replay_is_preserved_as_conflict(self):
+        """A human edit that changes the row after supersede diverts it from the
+        after-image, so replay SKIPS it (preserves the human edit) and surfaces
+        it as a conflict rather than clobbering it back to pending."""
+        storage = self._make_storage()
+        self._reserve_run(storage, "run-2")
+        self._insert_item(storage, "i1", "voice_profile", "c1")
+        supersede_targets(
+            storage,
+            book_id="b1",
+            run_id="run-2",
+            kind="voice_profile",
+            target_ids=["c1"],
+        )
+        # Human edits the target while replay is pending (e.g. resolves it).
+        storage.execute_update(
+            "UPDATE walk_review_item SET status='resolved' WHERE id='i1'"
+        )
+        result = storage.replay_run("run-2")
+        # The diverged row is skipped + counted as a conflict.
+        assert result["skipped"] == 1
+        assert result["conflicts"] == 1
+        assert (
+            storage.execute_query("SELECT status FROM walk_review_item WHERE id='i1'")[
+                0
+            ]["status"]
+            == "resolved"
+        )
+
+    def test_conflict_is_reported_not_silently_lost(self):
+        """Replay's conflict count makes a human-edit collision observable (for
+        log/audit), and the human row is never overwritten or deleted."""
+        storage = self._make_storage()
+        self._reserve_run(storage, "run-2")
+        self._insert_item(storage, "i1", "voice_assignment", "c1")
+        self._insert_item(storage, "i2", "voice_assignment", "c2")
+        supersede_targets(
+            storage,
+            book_id="b1",
+            run_id="run-2",
+            kind="voice_assignment",
+            target_ids=["c1", "c2"],
+        )
+        # Human edits only i2; i1 is left in the after-image state.
+        storage.execute_update(
+            "UPDATE walk_review_item SET status='resolved' WHERE id='i2'"
+        )
+        result = storage.replay_run("run-2")
+        # i1 replays (restored to pending); i2 is a divergence conflict.
+        assert result["replayed"] == 1
+        assert result["skipped"] == 1
+        assert result["conflicts"] == 1
+        statuses = {
+            row["id"]: row["status"]
+            for row in storage.execute_query("SELECT id, status FROM walk_review_item")
+        }
+        assert statuses["i1"] == "pending"
+        assert statuses["i2"] == "resolved"  # human edit preserved

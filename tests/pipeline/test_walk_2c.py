@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 
 from app.pipeline.adapter import InMemorySQLiteAdapter
+from app.pipeline.walks.runner import HeartbeatStorage
 from app.pipeline.walks.walk_2c_alias_resolution import (
     _build_alias_resolution_prompt,
     _consolidate_aliases,
@@ -115,6 +116,25 @@ def _insert_char_metadata(storage, char_id: str, key: str, value: str):
         "INSERT INTO character_metadata (character_id, key, value) VALUES (?, ?, ?)",
         (char_id, key, value),
     )
+
+
+def _reserve_run(storage, run_id):
+    """Insert a reserved ``walk_run`` row (idempotent) for journal FK backing."""
+    existing = storage.execute_query(
+        "SELECT 1 FROM walk_run WHERE run_id = ?", (run_id,)
+    )
+    if not existing:
+        storage.execute_insert(
+            "INSERT INTO walk_run (run_id, book_id, walk_name, status, created_ms) "
+            "VALUES (?, ?, 'walk_test', 'running', ?)",
+            (run_id, "b1", 1700000000000),
+        )
+    return storage
+
+
+def _heartbeat(storage, run_id):
+    """Reserve *run_id* and wrap *storage* in a HeartbeatStorage with that run."""
+    return HeartbeatStorage(_reserve_run(storage, run_id), run_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1322,3 +1342,242 @@ class TestEndToEnd:
         assert "c2" in prompt
         assert "Bob" in prompt
         assert "Bobby" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Tests: journal coverage (P7-S4)
+# ---------------------------------------------------------------------------
+
+
+class TestJournalCoverage:
+    """P7-S4: walk 2c mutation inventory is journaled.
+
+    An in-progress alias merge journals the ``workbench_decision``, the
+    ``character_alias_merge`` record, the canonical ``character`` alias
+    consolidation (UPDATE), and the multi-row junction redirects/cleanup
+    (character_scene / character_span DELETE+UPDATE) so a cancelled run restores
+    the pre-merge junction topology.
+    """
+
+    def _seed(self, storage):
+        storage.execute_insert("INSERT INTO series (id) VALUES ('s1')")
+        storage.execute_insert("INSERT INTO book (id, series_id) VALUES ('b1', 's1')")
+        _insert_character(storage, "c1", "Alice")
+        _insert_character(storage, "c2", "Alicia")
+        _insert_char_book(storage, "c1", "b1", 0.9)
+        _insert_char_book(storage, "c2", "b1", 0.8)
+        storage.execute_insert("INSERT INTO scene (id) VALUES ('scene-1')")
+        storage.execute_insert(
+            "INSERT INTO span (id, span_type) VALUES ('span-1', 'sentence')"
+        )
+        _insert_char_scene(storage, "c2", "scene-1", 0.9)
+        _insert_char_span(storage, "c2", "span-1", 0.9)
+
+    def test_merge_journals_decision_merge_aliases_and_redirects(self):
+        storage = InMemorySQLiteAdapter()
+        storage.init_db()
+        self._seed(storage)
+        run = _heartbeat(storage, "run-c")
+        all_chars = [
+            {"id": "c1", "name": "Alice", "aliases": "[]"},
+            {"id": "c2", "name": "Alicia", "aliases": "[]"},
+        ]
+        _merge_group(
+            character_ids=["c1", "c2"],
+            canonical_name="Alice",
+            all_characters=all_chars,
+            storage=run,
+            merged_ids=set(),
+            result={"characters_merged": 0},
+            is_review=False,
+        )
+        ops = {(e["table_name"], e["op"]) for e in storage.list_undo_entries("run-c")}
+        assert ("workbench_decision", "insert") in ops
+        assert ("character_alias_merge", "insert") in ops
+        assert ("character", "update") in ops  # alias consolidation
+        # Junction redirects: redirected rows updated/deleted for the member.
+        assert any(
+            table in ("character_book", "character_scene", "character_span")
+            and op in ("update", "delete")
+            for table, op in ops
+        )
+
+
+class TestRedirectJournalCoverage:
+    """P7-S4: multi-row junction redirect/cleanup is journaled (2c _redirect_junctions).
+
+    Redirecting a member's junctions to the canonical touches character_book,
+    character_scene, and character_span; each mutation must be captured so a
+    cancelled run restores the member's pre-merge junction topology.
+    """
+
+    def test_redirect_journals_all_junction_tables(self):
+        storage = InMemorySQLiteAdapter()
+        storage.init_db()
+        storage.execute_insert("INSERT INTO series (id) VALUES ('s1')")
+        storage.execute_insert("INSERT INTO book (id, series_id) VALUES ('b1', 's1')")
+        _insert_character(storage, "canon", "Alice")
+        _insert_character(storage, "member", "Alicia")
+        _insert_char_book(storage, "canon", "b1", 0.9)
+        _insert_char_book(storage, "member", "b1", 0.8)
+        storage.execute_insert("INSERT INTO scene (id) VALUES ('scene-1')")
+        storage.execute_insert(
+            "INSERT INTO span (id, span_type) VALUES ('span-1', 'sentence')"
+        )
+        _insert_char_scene(storage, "member", "scene-1", 0.9)
+        _insert_char_span(storage, "member", "span-1", 0.9)
+
+        _redirect_junctions(_heartbeat(storage, "run-r"), "canon", "member")
+
+        ops = {(e["table_name"], e["op"]) for e in storage.list_undo_entries("run-r")}
+        # Every junction table the redirect mutates is captured.
+        assert ("character_book", "update") in ops or (
+            "character_book",
+            "delete",
+        ) in ops
+        assert ("character_scene", "update") in ops or (
+            "character_scene",
+            "delete",
+        ) in ops
+        assert ("character_span", "update") in ops or (
+            "character_span",
+            "delete",
+        ) in ops
+
+    def test_replay_restores_redirected_junction_topology(self):
+        """A real `_redirect_junctions` run, followed by `replay_run`, restores
+        the pre-merge junction topology.
+
+        The member's character_scene / character_span / character_book rows are
+        redirected to the canonical during the run; replay must point them back
+        at the member (update-undo restoring the recorded before-images).  This
+        pins the rowid-strip invariant: captured before/after images exclude the
+        `rowid` key so the after-image CAS against a ``SELECT *`` read succeeds
+        and the update-undo actually replays (replayed > 0, conflicts = 0).
+        """
+        storage = InMemorySQLiteAdapter()
+        storage.init_db()
+        storage.execute_insert("INSERT INTO series (id) VALUES ('s1')")
+        storage.execute_insert("INSERT INTO book (id, series_id) VALUES ('b1', 's1')")
+        _insert_character(storage, "canon", "Alice")
+        _insert_character(storage, "member", "Alicia")
+        _insert_char_book(storage, "canon", "b1", 0.9)
+        _insert_char_book(storage, "member", "b1", 0.8)
+        storage.execute_insert("INSERT INTO scene (id) VALUES ('scene-1')")
+        storage.execute_insert(
+            "INSERT INTO span (id, span_type) VALUES ('span-1', 'sentence')"
+        )
+        _insert_char_scene(storage, "member", "scene-1", 0.9)
+        _insert_char_span(storage, "member", "span-1", 0.9)
+
+        def topology():
+            return {
+                "cb": storage.execute_query(
+                    "SELECT character_id FROM character_book WHERE book_id='b1' "
+                    "ORDER BY character_id"
+                ),
+                "cs": storage.execute_query(
+                    "SELECT character_id FROM character_scene ORDER BY character_id"
+                ),
+                "csp": storage.execute_query(
+                    "SELECT character_id FROM character_span ORDER BY character_id"
+                ),
+            }
+
+        run = _heartbeat(storage, "run-restore")
+        _redirect_junctions(run, "canon", "member")
+
+        # Pre-replay topology: every junction points at the canonical.
+        post = topology()
+        assert all(r["character_id"] == "canon" for r in post["cb"])
+        assert all(r["character_id"] == "canon" for r in post["cs"])
+        assert all(r["character_id"] == "canon" for r in post["csp"])
+
+        res = storage.replay_run("run-restore")
+        assert res["conflicts"] == 0
+        assert res["replayed"] > 0
+
+        # Replay points every junction back at the member.
+        restored = topology()
+        # character_book: the member's row was deleted in-run (canon already
+        # had b1) and is re-inserted by delete-undo, so canon AND member both
+        # point at b1 again.
+        assert any(r["character_id"] == "member" for r in restored["cb"])
+        assert all(r["character_id"] == "member" for r in restored["cs"])
+        assert all(r["character_id"] == "member" for r in restored["csp"])
+
+    def test_replay_restores_junction_retains_alias_history_and_skips_divergence(self):
+        """A real redirect run replayed restores the junction topology, KEEPS
+        prior/human ``character_alias_merge`` history (irrevocable), and records
+        a conflict skip for any junction row a human/later-run overwrote."""
+        storage = InMemorySQLiteAdapter()
+        storage.init_db()
+        storage.execute_insert("INSERT INTO series (id) VALUES ('s1')")
+        storage.execute_insert("INSERT INTO book (id, series_id) VALUES ('b1', 's1')")
+        _insert_character(storage, "canon", "Alice")
+        _insert_character(storage, "member", "Alicia")
+        _insert_char_book(storage, "canon", "b1", 0.9)
+        _insert_char_book(storage, "member", "b1", 0.8)
+        storage.execute_insert("INSERT INTO scene (id) VALUES ('scene-1')")
+        storage.execute_insert(
+            "INSERT INTO span (id, span_type) VALUES ('span-1', 'sentence')"
+        )
+        _insert_char_scene(storage, "member", "scene-1", 0.9)
+        _insert_char_span(storage, "member", "span-1", 0.9)
+        # Prior/human alias-merge history — irrevocable, survives replay.
+        storage.execute_insert(
+            "INSERT INTO workbench_decision (decision_id, book_id, target_kind, "
+            "target_key, decision_type, base_revision, payload_json, status, "
+            "source, created_ms) VALUES ('dec-prior', 'b1', 'alias_merge', "
+            "'member', 'merge', 0, '{}', 'active', 'human', 1000)",
+            (),
+        )
+        storage.execute_insert(
+            "INSERT INTO character_alias_merge (merge_id, book_id, canonical_id, "
+            "member_id, merge_revision, decision_id, status, prior_member_name, "
+            "prior_member_aliases_json, prior_member_voice_assignment_id, "
+            "consequence_json, created_ms) VALUES ('mg-prior', 'b1', 'canon', "
+            "'member', 1, 'dec-prior', 'active', 'Alicia', '[]', NULL, '{}', 1000)",
+            (),
+        )
+
+        run = _heartbeat(storage, "run-keep")
+        _redirect_junctions(run, "canon", "member")
+        # Post-redirect: the member's junction now points at the canonical.
+        assert (
+            storage.execute_query(
+                "SELECT character_id FROM character_scene WHERE scene_id='scene-1'"
+            )[0]["character_id"]
+            == "canon"
+        )
+        # A human/later-run overwrites the redirected character_scene row.
+        storage.execute_update(
+            "UPDATE character_scene SET confidence = 0.1 "
+            "WHERE character_id = 'canon' AND scene_id = 'scene-1'",
+            (),
+        )
+
+        res = storage.replay_run("run-keep")
+
+        # character_span (not diverged) restored to the member — topology restored.
+        assert (
+            storage.execute_query(
+                "SELECT character_id FROM character_span WHERE span_id='span-1'"
+            )[0]["character_id"]
+            == "member"
+        )
+        # The human-diverged character_scene row survived replay as a conflict skip.
+        cs = storage.execute_query(
+            "SELECT character_id, confidence FROM character_scene "
+            "WHERE scene_id='scene-1'"
+        )[0]
+        assert cs["character_id"] == "canon"
+        assert cs["confidence"] == 0.1
+        assert res["conflicts"] >= 1
+        # Prior/human alias-merge history retained (irrevocable).
+        assert (
+            storage.execute_query(
+                "SELECT merge_id FROM character_alias_merge WHERE merge_id='mg-prior'"
+            )
+            != []
+        )

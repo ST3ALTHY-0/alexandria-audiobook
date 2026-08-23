@@ -295,6 +295,26 @@ def _process_character(
         result["descriptions_for_review"] += 1
 
 
+def _journal_capture(storage, run_id, table, op, row_pk=None, before=None, after=None):
+    """Append one walk_undo_entry capture, guarded on an active run.
+
+    Joins the caller's open ``savepoint()`` (capture_undo never commits inside a
+    transaction), so the entry is atomic with the accompanying write. ``run_id``
+    is ``None`` outside a reserved run (direct unit calls / raw-adapter paths), in
+    which case no journal entry is written.
+    """
+    if run_id is None:
+        return
+    storage.capture_undo(
+        run_id,
+        table,
+        op,
+        row_pk=str(row_pk) if row_pk is not None else None,
+        before_json=json.dumps(before) if before is not None else None,
+        after_json=json.dumps(after) if after is not None else None,
+    )
+
+
 def _store_description(
     book_id: str,
     character_id: str,
@@ -308,6 +328,16 @@ def _store_description(
 
     ``character_metadata`` is character-global and must not be overwritten by
     evidence collected for only one book.
+
+    Persona revisions are APPEND-ONLY history: a cancelled run's journal records
+    the insert (undoable on replay ONLY via safe insert-undo — the run-created
+    ``persona_revision`` row may be deleted when its after-image/key/FK guards
+    pass) and the superseded_by chaining update (restore to NULL on replay).
+    Human, other-run, and ``NULL``-run revisions remain protected; history is
+    never blanket-deleted.  Both captures join the caller's ``walk_2f_character``
+    savepoint so the journal entry and the adapter-helper write
+    (``insert_persona_revision`` / ``supersede_persona_revision``, which join the
+    open savepoint and never commit) are atomic.
     """
     previous = storage.execute_query(
         """SELECT persona_id, fields_json, protected FROM persona_revision
@@ -329,27 +359,49 @@ def _store_description(
     if not isinstance(fields, dict):
         fields = {}
     fields["identity"] = description
-    storage.insert_persona_revision(
-        {
-            "persona_id": persona_id,
-            "character_id": character_id,
-            "book_id": book_id,
-            "revision": revision,
-            "fields_json": json.dumps(fields),
-            "evidence_json": json.dumps(
-                [{"anchor": span["span_id"]} for span in sampled_spans]
-            ),
-            "aliases_json": character_aliases,
-            "scene_scope": "book",
-            "review_state": review_state,
-            "protected": 0,
-            "voice_consequences_json": "{}",
-            "author_id": "local",
-            "created_ms": int(time.time() * 1000),
-            "superseded_by": None,
-        }
+    run_id = getattr(storage, "run_id", None)
+    created_ms = int(time.time() * 1000)
+    record = {
+        "persona_id": persona_id,
+        "character_id": character_id,
+        "book_id": book_id,
+        "revision": revision,
+        "fields_json": json.dumps(fields),
+        "evidence_json": json.dumps(
+            [{"anchor": span["span_id"]} for span in sampled_spans]
+        ),
+        "aliases_json": character_aliases,
+        "scene_scope": "book",
+        "review_state": review_state,
+        "protected": 0,
+        "voice_consequences_json": "{}",
+        "author_id": "local",
+        "created_ms": created_ms,
+        "superseded_by": None,
+    }
+    _journal_capture(
+        storage,
+        run_id,
+        "persona_revision",
+        "insert",
+        row_pk=persona_id,
+        after=dict(record),
     )
+    storage.insert_persona_revision(record)
     if previous_id:
+        # Journal the append-only supersede chaining: the prior revision's only
+        # changed column is superseded_by (None -> persona_id).  A partial
+        # before/after image scoped to THIS mutation is a faithful capture for
+        # replay restore.
+        _journal_capture(
+            storage,
+            run_id,
+            "persona_revision",
+            "update",
+            row_pk=previous_id,
+            before={"superseded_by": None},
+            after={"superseded_by": persona_id},
+        )
         storage.supersede_persona_revision(previous_id, persona_id)
     return True
 

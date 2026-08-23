@@ -43,6 +43,8 @@ Plan P (Pipeline Frontend UX Fixes) ← NEW: index contract, observability, edit
 Plan Q (Pipeline-Only Cutover — terminal plan) ← NEW: delete legacy editor/voice/chunk/config paths, project.py, prompt files, legacy endpoints/tests/docs; engine factory decoupling; negative-space guard suite
     ↓
 Plan R (Global Walk Lock + Cancellation Cleanup + Savepoint API) ← CRITICAL FIX, post-cutover
+    ↓
+Plan S (Explicit Cancellation Rollback Override — Durable Walk Undo Journal) ← NEW, supersedes R cleanup only
 ```
 
 ## Plan List
@@ -67,13 +69,18 @@ Plan R (Global Walk Lock + Cancellation Cleanup + Savepoint API) ← CRITICAL FI
 | P | Pipeline Frontend UX Fixes | 8 | 69 | ~35K |
 | Q | Pipeline-Only Cutover (terminal) | 11 | 70 | ~38K |
 | R | Global Walk Lock, Cancellation Cleanup, Savepoint API (critical fix) | 5 | 25 | ~25K |
+| S | Explicit Cancellation Rollback Override, Durable Walk Undo Journal | 7 | 35 | ~30K |
 
 **Total:** 18 plans, 109 phases, 568 steps, ~409K weighted chars
 
 ## Execution Order
 
 Plans A→Q are complete in the original sequential order. Plan R is an appended
-post-cutover critical fix depending on the cutover surface; it supersedes older
+post-cutover critical fix depending on the cutover surface; Plan S is appended
+after R and supersedes only R's delete-based cancelled/interrupted cleanup with
+a durable writer-side undo journal. R's gate, checkpoint, savepoint, and API
+surface remain prerequisites, and Plan R itself is NOT overwritten — it stays
+the intact predecessor for that surface. R supersedes older
 cross-book concurrency and cancel-cleanup wording without invalidating Q.
 
 **Recommended execution:** Sequential, one plan at a time. Each plan should be validated (all tests pass) before proceeding to the next.

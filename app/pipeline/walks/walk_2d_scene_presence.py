@@ -24,6 +24,7 @@ with temperature=0.1 for format stability.
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from typing import TYPE_CHECKING, Any
@@ -167,28 +168,107 @@ def _now_ms():
     return int(time.time() * 1000)
 
 
+def _journal_capture(storage, run_id, table, op, row_pk=None, before=None, after=None):
+    """Append one walk_undo_entry capture, guarded on an active run.
+
+    Joins the caller's open ``savepoint()`` (capture_undo never commits inside a
+    transaction), so the entry is atomic with the accompanying write.  ``run_id``
+    is ``None`` outside a reserved run (direct unit calls), in which case no
+    journal entry is written.
+    """
+    if run_id is None:
+        return
+    storage.capture_undo(
+        run_id,
+        table,
+        op,
+        row_pk=str(row_pk) if row_pk is not None else None,
+        before_json=json.dumps(before) if before is not None else None,
+        after_json=json.dumps(after) if after is not None else None,
+    )
+
+
 def _record_provenance(storage, book_id, target_key, generation_revision, run_id):
     """Append a provenance row for a generated presence target."""
+    provenance_id = f"prov-{uuid.uuid4().hex}"
+    created_ms = _now_ms()
+    _journal_capture(
+        storage,
+        run_id,
+        "workbench_provenance",
+        "insert",
+        row_pk=provenance_id,
+        after={
+            "provenance_id": provenance_id,
+            "book_id": book_id,
+            "target_kind": "presence",
+            "target_key": target_key,
+            "run_id": run_id,
+            "generation_revision": generation_revision,
+            "source": "walk",
+            "created_ms": created_ms,
+        },
+    )
     storage.execute_insert(
         "INSERT INTO workbench_provenance "
         "(provenance_id, book_id, target_kind, target_key, run_id, "
         " generation_revision, source, created_ms) "
         "VALUES (?, ?, 'presence', ?, ?, ?, 'walk', ?)",
         (
-            f"prov-{uuid.uuid4().hex}",
+            provenance_id,
             book_id,
             target_key,
             run_id,
             generation_revision,
-            _now_ms(),
+            created_ms,
         ),
     )
 
 
 def _upsert_generated_presence(storage, book_id, character_id, scene_id, confidence):
-    """Upsert the generated presence projection by stable target key."""
+    """Upsert the generated presence projection by stable target key.
+
+    Pre-SELECTs the existing row by its stable target key to classify the upsert
+    as insert (row absent) vs update (row present), then journals the branch's
+    before/after image so the durable journal records the true mutation.
+    """
     run_id = getattr(storage, "run_id", None)
     generation_revision = _generation_revision(storage, book_id)
+    existing = storage.execute_query(
+        "SELECT * FROM character_scene_generated "
+        "WHERE book_id = ? AND character_id = ? AND scene_id = ? "
+        "AND relation_type = 'present'",
+        (book_id, character_id, scene_id),
+    )
+    after = {
+        "id": (existing[0]["id"] if existing else f"csg-{uuid.uuid4().hex}"),
+        "book_id": book_id,
+        "character_id": character_id,
+        "scene_id": scene_id,
+        "relation_type": "present",
+        "confidence": confidence,
+        "generation_revision": generation_revision,
+        "source_run_id": run_id,
+    }
+    if existing:
+        _journal_capture(
+            storage,
+            run_id,
+            "character_scene_generated",
+            "update",
+            row_pk=existing[0]["id"],
+            before=dict(existing[0]),
+            after=after,
+        )
+    else:
+        _journal_capture(
+            storage,
+            run_id,
+            "character_scene_generated",
+            "insert",
+            row_pk=after["id"],
+            after=after,
+        )
     storage.execute_insert(
         "INSERT INTO character_scene_generated "
         "(id, book_id, character_id, scene_id, relation_type, confidence, "
@@ -199,7 +279,7 @@ def _upsert_generated_presence(storage, book_id, character_id, scene_id, confide
         "              generation_revision = excluded.generation_revision, "
         "              source_run_id = excluded.source_run_id",
         (
-            f"csg-{uuid.uuid4().hex}",
+            after["id"],
             book_id,
             character_id,
             scene_id,
@@ -321,6 +401,18 @@ def _process_scene(
             )
 
 
+def _junction_image(row) -> dict:
+    """Project a junction row (selected as ``rowid, cols``) to a journal image
+    without the ``rowid`` key.
+
+    Loader ``_read_row`` reads via ``SELECT *`` (which has no ``rowid`` key) and
+    ``_image_equiv`` requires every recorded key to match the live row, so a
+    captured image carrying a ``rowid`` key would make every CAS replay fail.  Only
+    the real columns are journaled; the rowid lives in ``row_pk``.
+    """
+    return {k: v for k, v in dict(row).items() if k != "rowid"}
+
+
 def _process_presence(
     presence_data: dict,
     scene_id: str,
@@ -352,6 +444,23 @@ def _process_presence(
         return
 
     if character_id in existing_junctions:
+        run_id = getattr(storage, "run_id", None)
+        rows = storage.execute_query(
+            "SELECT rowid, character_id, scene_id, relation_type, source, confidence, human_override "
+            "FROM character_scene WHERE scene_id = ? AND character_id = ? "
+            "AND source = 'walk' AND human_override = 0",
+            (scene_id, character_id),
+        )
+        for row in rows:
+            _journal_capture(
+                storage,
+                run_id,
+                "character_scene",
+                "update",
+                row_pk=row["rowid"],
+                before=_junction_image(row),
+                after=_junction_image({**row, "confidence": confidence}),
+            )
         storage.execute_update(
             "UPDATE character_scene SET confidence = ? "
             "WHERE scene_id = ? AND character_id = ? AND source = 'walk' "
@@ -361,11 +470,27 @@ def _process_presence(
         _upsert_generated_presence(storage, book_id, character_id, scene_id, confidence)
         return
 
-    storage.execute_insert(
+    run_id = getattr(storage, "run_id", None)
+    rowid = storage.execute_insert(
         "INSERT INTO character_scene "
         "(character_id, scene_id, relation_type, source, confidence, human_override) "
         "VALUES (?, ?, 'present', 'walk', ?, 0)",
         (character_id, scene_id, confidence),
+    )
+    _journal_capture(
+        storage,
+        run_id,
+        "character_scene",
+        "insert",
+        row_pk=rowid,
+        after={
+            "character_id": character_id,
+            "scene_id": scene_id,
+            "relation_type": "present",
+            "source": "walk",
+            "confidence": confidence,
+            "human_override": 0,
+        },
     )
     _upsert_generated_presence(storage, book_id, character_id, scene_id, confidence)
     existing_junctions.add(character_id)
@@ -402,12 +527,45 @@ def _remove_omitted_generated_presence(
             storage, book_id, scene_id, character_id
         ) or _active_absence(storage, book_id, scene_id, character_id):
             continue
+        run_id = getattr(storage, "run_id", None)
+        # Pre-capture the generated row to be removed (explicit PK id).
+        gen_rows = storage.execute_query(
+            "SELECT id, book_id, character_id, scene_id, relation_type, confidence, generation_revision, source_run_id "
+            "FROM character_scene_generated WHERE book_id = ? AND scene_id = ? "
+            "AND character_id = ? AND relation_type = 'present'",
+            (book_id, scene_id, character_id),
+        )
+        for g in gen_rows:
+            _journal_capture(
+                storage,
+                run_id,
+                "character_scene_generated",
+                "delete",
+                row_pk=g["id"],
+                before=dict(g),
+            )
         storage.execute_update(
             "DELETE FROM character_scene_generated "
             "WHERE book_id = ? AND scene_id = ? AND character_id = ? "
             "AND relation_type = 'present'",
             (book_id, scene_id, character_id),
         )
+        # Pre-capture the walk-owned junction row(s) to be removed.
+        cs_rows = storage.execute_query(
+            "SELECT rowid, character_id, scene_id, relation_type, source, confidence, human_override "
+            "FROM character_scene WHERE scene_id = ? AND character_id = ? "
+            "AND source = 'walk' AND human_override = 0",
+            (scene_id, character_id),
+        )
+        for c in cs_rows:
+            _journal_capture(
+                storage,
+                run_id,
+                "character_scene",
+                "delete",
+                row_pk=c["rowid"],
+                before=_junction_image(c),
+            )
         storage.execute_update(
             "DELETE FROM character_scene WHERE scene_id = ? AND character_id = ? "
             "AND source = 'walk' AND human_override = 0",

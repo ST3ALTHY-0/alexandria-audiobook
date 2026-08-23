@@ -29,6 +29,7 @@ CRITICAL: This walk MUST use the LLM for every span — no rule-based fallback.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from typing import TYPE_CHECKING, Any
@@ -361,6 +362,16 @@ def _process_span(
 
     # Store instruct in span table
     with storage.savepoint("walk_2i_delivery"):
+        run_id = getattr(storage, "run_id", None)
+        _journal_capture(
+            storage,
+            run_id,
+            "span",
+            "update",
+            row_pk=span_id,
+            before={"instruct": prior_instruct},
+            after={"instruct": instruct},
+        )
         storage.execute_update(
             "UPDATE span SET instruct = ? WHERE id = ?",
             (instruct, span_id),
@@ -395,6 +406,26 @@ def _get_prior_instruct(span_id: str, storage: PipelineStorage) -> str | None:
     return None
 
 
+def _journal_capture(storage, run_id, table, op, row_pk=None, before=None, after=None):
+    """Append one walk_undo_entry capture, guarded on an active run.
+
+    Joins the caller's open ``savepoint()`` (capture_undo never commits inside a
+    transaction), so the entry is atomic with the accompanying write. ``run_id``
+    is ``None`` outside a reserved run (direct unit calls / raw-adapter paths), in
+    which case no journal entry is written.
+    """
+    if run_id is None:
+        return
+    storage.capture_undo(
+        run_id,
+        table,
+        op,
+        row_pk=str(row_pk) if row_pk is not None else None,
+        before_json=json.dumps(before) if before is not None else None,
+        after_json=json.dumps(after) if after is not None else None,
+    )
+
+
 def _insert_review_item(
     storage: PipelineStorage,
     book_id: str,
@@ -407,7 +438,27 @@ def _insert_review_item(
     back) atomically with the span.instruct update.  Auto-accept (>=0.7)
     and auto-reject (<0.5) paths never reach this helper.
     """
-    run_id = storage.run_id
+    run_id = getattr(storage, "run_id", None)
+    review_item_id = f"{run_id}:instruction:{span_id}"
+    after = {
+        "id": review_item_id,
+        "book_id": book_id,
+        "run_id": run_id,
+        "kind": "instruction",
+        "target_table": "span",
+        "target_id": span_id,
+        "prior_value": prior_value,
+        "status": "pending",
+        "created_ms": int(time.time() * 1000),
+    }
+    _journal_capture(
+        storage,
+        run_id,
+        "walk_review_item",
+        "insert",
+        row_pk=review_item_id,
+        after=after,
+    )
     storage.execute_insert(
         """
         INSERT INTO walk_review_item
@@ -416,12 +467,12 @@ def _insert_review_item(
         VALUES (?, ?, ?, 'instruction', 'span', ?, ?, 'pending', ?)
         """,
         (
-            f"{run_id}:instruction:{span_id}",
+            review_item_id,
             book_id,
             run_id,
             span_id,
             prior_value,
-            int(time.time() * 1000),
+            after["created_ms"],
         ),
     )
 

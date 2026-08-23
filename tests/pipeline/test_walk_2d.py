@@ -7,9 +7,11 @@ import pytest
 
 from app.pipeline.adapter import InMemorySQLiteAdapter
 from app.pipeline.populate import populate_initial_spine
+from app.pipeline.walks.runner import HeartbeatStorage
 from app.pipeline.walks.walk_2d_scene_presence import (
     _build_prompt,
     _parse_llm_response,
+    _process_presence,
     execute,
 )
 
@@ -36,20 +38,36 @@ def sample_chapters():
                 {
                     "id": "para-1",
                     "spans": [
-                        {"id": "span-1a", "span_type": "sentence", "text": "The sun rose over the mountains."},
-                        {"id": "span-1b", "span_type": "quotation", "text": '"Good morning," said John.'},
+                        {
+                            "id": "span-1a",
+                            "span_type": "sentence",
+                            "text": "The sun rose over the mountains.",
+                        },
+                        {
+                            "id": "span-1b",
+                            "span_type": "quotation",
+                            "text": '"Good morning," said John.',
+                        },
                     ],
                 },
                 {
                     "id": "para-2",
                     "spans": [
-                        {"id": "span-2a", "span_type": "sentence", "text": "Mary waved from across the room."},
+                        {
+                            "id": "span-2a",
+                            "span_type": "sentence",
+                            "text": "Mary waved from across the room.",
+                        },
                     ],
                 },
                 {
                     "id": "para-3",
                     "spans": [
-                        {"id": "span-3a", "span_type": "quotation", "text": '"Hello everyone," she said.'},
+                        {
+                            "id": "span-3a",
+                            "span_type": "quotation",
+                            "text": '"Hello everyone," she said.',
+                        },
                     ],
                 },
             ],
@@ -60,13 +78,21 @@ def sample_chapters():
                 {
                     "id": "para-4",
                     "spans": [
-                        {"id": "span-4a", "span_type": "sentence", "text": "Later that day, the scene shifted to the city."},
+                        {
+                            "id": "span-4a",
+                            "span_type": "sentence",
+                            "text": "Later that day, the scene shifted to the city.",
+                        },
                     ],
                 },
                 {
                     "id": "para-5",
                     "spans": [
-                        {"id": "span-5a", "span_type": "quotation", "text": '"Welcome," said Bob.'},
+                        {
+                            "id": "span-5a",
+                            "span_type": "quotation",
+                            "text": '"Welcome," said Bob.',
+                        },
                     ],
                 },
             ],
@@ -154,14 +180,33 @@ def _patch_llm(monkeypatch, mock_llm_client, response_content):
 # ---------------------------------------------------------------------------
 
 
+def _reserve_run(storage, run_id):
+    """Insert a reserved ``walk_run`` row (idempotent) for journal FK backing."""
+    existing = storage.execute_query(
+        "SELECT 1 FROM walk_run WHERE run_id = ?", (run_id,)
+    )
+    if not existing:
+        storage.execute_insert(
+            "INSERT INTO walk_run (run_id, book_id, walk_name, status, created_ms) "
+            "VALUES (?, ?, 'walk_test', 'running', ?)",
+            (run_id, "book-1", 1700000000000),
+        )
+    return storage
+
+
+def _heartbeat(storage, run_id):
+    """Reserve *run_id* and wrap *storage* in a HeartbeatStorage with that run."""
+    return HeartbeatStorage(_reserve_run(storage, run_id), run_id)
+
+
 class TestExecute:
     """Test the main execute() function."""
 
-    def test_execute_returns_summary_dict(self, seeded_storage, mock_llm_client, monkeypatch):
+    def test_execute_returns_summary_dict(
+        self, seeded_storage, mock_llm_client, monkeypatch
+    ):
         """execute() returns a summary dict with expected keys."""
-        response = json.dumps([
-            {"character_id": "char-john", "confidence": 0.9}
-        ])
+        response = json.dumps([{"character_id": "char-john", "confidence": 0.9}])
         _patch_llm(monkeypatch, mock_llm_client, response)
 
         result = execute("book-1", seeded_storage, {})
@@ -173,11 +218,11 @@ class TestExecute:
         assert "errors" in result
         assert result["book_id"] == "book-1"
 
-    def test_execute_processes_all_scenes(self, seeded_storage, mock_llm_client, monkeypatch):
+    def test_execute_processes_all_scenes(
+        self, seeded_storage, mock_llm_client, monkeypatch
+    ):
         """execute() processes all scenes in the book."""
-        response = json.dumps([
-            {"character_id": "char-john", "confidence": 0.9}
-        ])
+        response = json.dumps([{"character_id": "char-john", "confidence": 0.9}])
         _patch_llm(monkeypatch, mock_llm_client, response)
 
         result = execute("book-1", seeded_storage, {})
@@ -185,25 +230,33 @@ class TestExecute:
         # populate_initial_spine creates one placeholder scene per chapter = 2
         assert result["scenes_processed"] == 2
 
-    def test_presence_junctions_created(self, seeded_storage, mock_llm_client, monkeypatch):
+    def test_presence_junctions_created(
+        self, seeded_storage, mock_llm_client, monkeypatch
+    ):
         """character_scene junctions are inserted for characters present in scenes."""
         # Scene 1 (chapter-1): John and Mary present
         # Scene 2 (chapter-2): Bob present
         call_count = [0]
         responses = [
-            json.dumps([
-                {"character_id": "char-john", "confidence": 0.9},
-                {"character_id": "char-mary", "confidence": 0.85},
-            ]),
-            json.dumps([
-                {"character_id": "char-bob", "confidence": 0.9},
-            ]),
+            json.dumps(
+                [
+                    {"character_id": "char-john", "confidence": 0.9},
+                    {"character_id": "char-mary", "confidence": 0.85},
+                ]
+            ),
+            json.dumps(
+                [
+                    {"character_id": "char-bob", "confidence": 0.9},
+                ]
+            ),
         ]
 
         def mock_create(*args, **kwargs):
             idx = call_count[0]
             call_count[0] += 1
-            return _make_mock_response(responses[idx] if idx < len(responses) else responses[-1])
+            return _make_mock_response(
+                responses[idx] if idx < len(responses) else responses[-1]
+            )
 
         mock_llm_client.chat.completions.create.side_effect = mock_create
         monkeypatch.setattr(
@@ -235,11 +288,15 @@ class TestExecute:
             assert row["relation_type"] == "present"
             assert row["source"] == "walk"
 
-    def test_confidence_filter_high_accepted(self, seeded_storage, mock_llm_client, monkeypatch):
+    def test_confidence_filter_high_accepted(
+        self, seeded_storage, mock_llm_client, monkeypatch
+    ):
         """Characters with confidence >= 0.7 are auto-accepted."""
-        response = json.dumps([
-            {"character_id": "char-john", "confidence": 0.9},
-        ])
+        response = json.dumps(
+            [
+                {"character_id": "char-john", "confidence": 0.9},
+            ]
+        )
         _patch_llm(monkeypatch, mock_llm_client, response)
 
         result = execute("book-1", seeded_storage, {})
@@ -247,11 +304,15 @@ class TestExecute:
         assert result["junctions_created"] >= 1
         assert result["junctions_for_review"] == 0
 
-    def test_confidence_filter_low_rejected(self, seeded_storage, mock_llm_client, monkeypatch):
+    def test_confidence_filter_low_rejected(
+        self, seeded_storage, mock_llm_client, monkeypatch
+    ):
         """Characters with confidence < 0.5 are auto-rejected (no junction created)."""
-        response = json.dumps([
-            {"character_id": "char-john", "confidence": 0.3},
-        ])
+        response = json.dumps(
+            [
+                {"character_id": "char-john", "confidence": 0.3},
+            ]
+        )
         _patch_llm(monkeypatch, mock_llm_client, response)
 
         result = execute("book-1", seeded_storage, {})
@@ -263,11 +324,15 @@ class TestExecute:
         )
         assert rows[0]["cnt"] == 0
 
-    def test_confidence_filter_medium_review(self, seeded_storage, mock_llm_client, monkeypatch):
+    def test_confidence_filter_medium_review(
+        self, seeded_storage, mock_llm_client, monkeypatch
+    ):
         """Characters with 0.5 <= confidence < 0.7 are flagged for review."""
-        response = json.dumps([
-            {"character_id": "char-john", "confidence": 0.6},
-        ])
+        response = json.dumps(
+            [
+                {"character_id": "char-john", "confidence": 0.6},
+            ]
+        )
         _patch_llm(monkeypatch, mock_llm_client, response)
 
         result = execute("book-1", seeded_storage, {})
@@ -276,7 +341,9 @@ class TestExecute:
         assert result["junctions_created"] >= 1
         assert result["junctions_for_review"] >= 1
 
-    def test_duplicate_junction_avoided(self, seeded_storage, mock_llm_client, monkeypatch):
+    def test_duplicate_junction_avoided(
+        self, seeded_storage, mock_llm_client, monkeypatch
+    ):
         """If character_scene already exists for character+scene, don't create duplicate."""
         # Pre-seed a character_scene junction for char-john in scene 1
         scenes = seeded_storage.execute_query(
@@ -299,9 +366,11 @@ class TestExecute:
         )
 
         # LLM returns char-john for both scenes
-        response = json.dumps([
-            {"character_id": "char-john", "confidence": 0.9},
-        ])
+        response = json.dumps(
+            [
+                {"character_id": "char-john", "confidence": 0.9},
+            ]
+        )
         _patch_llm(monkeypatch, mock_llm_client, response)
 
         result = execute("book-1", seeded_storage, {})
@@ -317,7 +386,9 @@ class TestExecute:
         # junctions_created should be 1 (only the new one)
         assert result["junctions_created"] == 1
 
-    def test_nonexistent_book_returns_error(self, storage, mock_llm_client, monkeypatch):
+    def test_nonexistent_book_returns_error(
+        self, storage, mock_llm_client, monkeypatch
+    ):
         """execute() returns error for nonexistent book."""
         _patch_llm(monkeypatch, mock_llm_client, "[]")
 
@@ -326,13 +397,13 @@ class TestExecute:
         assert len(result["errors"]) > 0
         assert result["junctions_created"] == 0
 
+    # ---------------------------------------------------------------------------
+    # Tests: _build_prompt()
+    # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Tests: _build_prompt()
-# ---------------------------------------------------------------------------
-
-
-    def test_walk_override_drives_llm_config(self, seeded_storage, monkeypatch, tmp_path):
+    def test_walk_override_drives_llm_config(
+        self, seeded_storage, monkeypatch, tmp_path
+    ):
         """A walk_override row for (book, task) overrides the walk's LLM config.
 
         Phase 3 (Plan G): the walk resolves its LLM config via
@@ -362,7 +433,12 @@ class TestExecute:
         captured = {}
 
         def mock_call_llm(
-            client, model_name, temperature, reasoning_effort, system_prompt, user_prompt
+            client,
+            model_name,
+            temperature,
+            reasoning_effort,
+            system_prompt,
+            user_prompt,
         ):
             captured["temperature"] = temperature
             captured["model_name"] = model_name
@@ -399,7 +475,12 @@ class TestExecute:
         captured = {}
 
         def mock_call_llm(
-            client, model_name, temperature, reasoning_effort, system_prompt, user_prompt
+            client,
+            model_name,
+            temperature,
+            reasoning_effort,
+            system_prompt,
+            user_prompt,
         ):
             captured["system_prompt"] = system_prompt
             return "[]"
@@ -487,9 +568,7 @@ class TestParseResponse:
 
     def test_parse_valid_json(self):
         """Parse valid JSON response."""
-        response = json.dumps([
-            {"character_id": "uuid-john", "confidence": 0.9}
-        ])
+        response = json.dumps([{"character_id": "uuid-john", "confidence": 0.9}])
 
         presence_list = _parse_llm_response(response)
 
@@ -516,10 +595,12 @@ class TestParseResponse:
 
     def test_parse_skips_empty_character_ids(self):
         """Parse skips entries with empty character_ids."""
-        response = json.dumps([
-            {"character_id": "", "confidence": 0.9},
-            {"character_id": "uuid-john", "confidence": 0.9},
-        ])
+        response = json.dumps(
+            [
+                {"character_id": "", "confidence": 0.9},
+                {"character_id": "uuid-john", "confidence": 0.9},
+            ]
+        )
 
         presence_list = _parse_llm_response(response)
 
@@ -528,9 +609,11 @@ class TestParseResponse:
 
     def test_parse_defaults_missing_confidence(self):
         """Parse defaults missing confidence to 0.8."""
-        response = json.dumps([
-            {"character_id": "uuid-john"},
-        ])
+        response = json.dumps(
+            [
+                {"character_id": "uuid-john"},
+            ]
+        )
 
         presence_list = _parse_llm_response(response)
 
@@ -540,14 +623,114 @@ class TestParseResponse:
 
     def test_parse_skips_non_dict_items_in_array(self):
         """Parse skips non-dict items in the JSON array (e.g., strings, numbers)."""
-        response = json.dumps([
-            "just a string",
-            42,
-            {"character_id": "uuid-john", "confidence": 0.9},
-            None,
-        ])
+        response = json.dumps(
+            [
+                "just a string",
+                42,
+                {"character_id": "uuid-john", "confidence": 0.9},
+                None,
+            ]
+        )
 
         presence_list = _parse_llm_response(response)
 
         assert len(presence_list) == 1
         assert presence_list[0]["character_id"] == "uuid-john"
+
+
+class TestJournalCoverage:
+    """P7-S4: walk 2d mutation inventory is journaled.
+
+    The scene-presence walk captures ``character_scene`` junctions (INSERT /
+    rerun UPDATE), the ``character_scene_generated`` upsert (INSERT first run,
+    UPDATE on re-run), and ``workbench_provenance`` inserts — the presence /
+    generated-presence / provenance inventory items.
+    """
+
+    def _captured(self, storage, run_id):
+        return {(e["table_name"], e["op"]) for e in storage.list_undo_entries(run_id)}
+
+    def test_presence_junction_generated_and_provenance_journaled(
+        self, seeded_storage, mock_llm_client, monkeypatch
+    ):
+        _patch_llm(
+            monkeypatch,
+            mock_llm_client,
+            json.dumps([{"character_id": "char-john", "confidence": 0.9}]),
+        )
+        execute("book-1", _heartbeat(seeded_storage, "run-1"), {})
+        ops = self._captured(seeded_storage, "run-1")
+        assert ("character_scene", "insert") in ops
+        assert ("character_scene_generated", "insert") in ops
+        assert ("workbench_provenance", "insert") in ops
+
+    def test_generated_upsert_update_on_rerun(
+        self, seeded_storage, mock_llm_client, monkeypatch
+    ):
+        _patch_llm(
+            monkeypatch,
+            mock_llm_client,
+            json.dumps([{"character_id": "char-john", "confidence": 0.9}]),
+        )
+        execute("book-1", _heartbeat(seeded_storage, "run-1"), {})
+        _patch_llm(
+            monkeypatch,
+            mock_llm_client,
+            json.dumps([{"character_id": "char-john", "confidence": 0.85}]),
+        )
+        execute("book-1", _heartbeat(seeded_storage, "run-2"), {})
+        ops2 = self._captured(seeded_storage, "run-2")
+        # The already-present generated row is updated (upsert branch = update).
+        assert ("character_scene_generated", "update") in ops2
+
+    def test_replay_restores_pre_run_confidence(self, seeded_storage):
+        """A real `_process_presence` confidence update through a run, followed by
+        `replay_run`, restores the pre-run confidence.
+
+        The update branch journals a character_scene row's before/after images;
+        these must exclude the `rowid` key so the after-image CAS against a
+        ``SELECT *`` read passes and replay actually restores (replayed > 0,
+        conflicts = 0).
+        """
+        scene_id = seeded_storage.execute_query(
+            "SELECT cs.child_id AS scene_id FROM chapter_scene cs "
+            "JOIN chapter c ON cs.parent_id = c.id WHERE c.book_id = ? "
+            "LIMIT 1",
+            ("book-1",),
+        )[0]["scene_id"]
+        seeded_storage.execute_insert(
+            "INSERT INTO character_scene "
+            "(character_id, scene_id, relation_type, source, confidence, human_override) "
+            "VALUES (?, ?, 'present', 'walk', 0.5, 0)",
+            ("char-john", scene_id),
+        )
+
+        run = _heartbeat(seeded_storage, "run-d")
+
+        # The update branch fires when the character is already present.
+        _process_presence(
+            presence_data={"character_id": "char-john", "confidence": 0.9},
+            scene_id=scene_id,
+            book_id="book-1",
+            storage=run,
+            existing_junctions={"char-john"},
+            result={"junctions_created": 0, "junctions_for_review": 0},
+        )
+
+        row = seeded_storage.execute_query(
+            "SELECT confidence FROM character_scene "
+            "WHERE character_id='char-john' AND scene_id=?",
+            (scene_id,),
+        )[0]
+        assert row["confidence"] == 0.9  # updated by the run
+
+        res = seeded_storage.replay_run("run-d")
+        assert res["conflicts"] == 0
+        assert res["replayed"] > 0
+
+        restored = seeded_storage.execute_query(
+            "SELECT confidence FROM character_scene "
+            "WHERE character_id='char-john' AND scene_id=?",
+            (scene_id,),
+        )[0]
+        assert restored["confidence"] == 0.5  # pre-run confidence restored

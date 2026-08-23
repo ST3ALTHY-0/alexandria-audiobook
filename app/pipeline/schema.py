@@ -249,6 +249,21 @@ CREATE TABLE IF NOT EXISTS walk_run (
 CREATE INDEX IF NOT EXISTS idx_walk_run_book_status
     ON walk_run (book_id, status);
 
+CREATE TABLE IF NOT EXISTS walk_undo_entry (
+    run_id TEXT NOT NULL REFERENCES walk_run(run_id),
+    seq INTEGER NOT NULL,
+    table_name TEXT,
+    op TEXT NOT NULL CHECK (op IN ('insert', 'update', 'delete')),
+    row_pk TEXT,
+    before_json TEXT,
+    after_json TEXT,
+    created_ms INTEGER NOT NULL,
+    PRIMARY KEY (run_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_walk_undo_entry_run
+    ON walk_undo_entry (run_id);
+
 CREATE TABLE IF NOT EXISTS walk_review_item (
     id TEXT PRIMARY KEY,
     book_id TEXT,

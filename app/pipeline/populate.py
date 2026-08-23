@@ -9,6 +9,7 @@ chapters into multiple scenes by redistributing paragraphs.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import uuid
 from typing import TYPE_CHECKING
@@ -232,8 +233,33 @@ def _insert_span(
     )
 
 
+def _journal_capture(storage, run_id, table, op, row_pk=None, before=None, after=None):
+    """Append one walk_undo_entry capture, guarded on an active run.
+
+    Joins the caller's open ``savepoint()`` (capture_undo never commits inside a
+    transaction), so the entry is atomic with the accompanying write.  ``before``
+    / ``after`` are row dicts serialized to JSON (values must be JSON-compatible).
+    ``run_id`` is ``None`` outside a reserved run (e.g. initial spine population
+    or direct unit calls), in which case no journal entry is written.
+    """
+    if run_id is None:
+        return
+    storage.capture_undo(
+        run_id,
+        table,
+        op,
+        row_pk=str(row_pk) if row_pk is not None else None,
+        before_json=json.dumps(before) if before is not None else None,
+        after_json=json.dumps(after) if after is not None else None,
+    )
+
+
 def _insert_scene_row(scene_id: str, storage: PipelineStorage) -> None:
     """Insert a scene row."""
+    run_id = getattr(storage, "run_id", None)
+    _journal_capture(
+        storage, run_id, "scene", "insert", row_pk=scene_id, after={"id": scene_id}
+    )
     storage.execute_insert("INSERT INTO scene (id) VALUES (?)", (scene_id,))
 
 
@@ -251,9 +277,18 @@ def _insert_chapter_scene_edge(
     scene_id: str, chapter_id: str, position: int, storage: PipelineStorage
 ) -> None:
     """Insert chapter_scene edge."""
-    storage.execute_insert(
+    run_id = getattr(storage, "run_id", None)
+    rowid = storage.execute_insert(
         "INSERT INTO chapter_scene (child_id, parent_id, position) VALUES (?, ?, ?)",
         (scene_id, chapter_id, position),
+    )
+    _journal_capture(
+        storage,
+        run_id,
+        "chapter_scene",
+        "insert",
+        row_pk=rowid,
+        after={"child_id": scene_id, "parent_id": chapter_id, "position": position},
     )
 
 
@@ -261,18 +296,44 @@ def _redistribute_paragraphs(
     scene_id: str, paragraph_ids: list[str], storage: PipelineStorage
 ) -> None:
     """Move paragraphs from placeholder scene to new scene."""
+    run_id = getattr(storage, "run_id", None)
     for para_idx, paragraph_id in enumerate(paragraph_ids, start=1):
         rows = storage.execute_query(
-            "SELECT parent_id FROM scene_paragraph WHERE child_id = ?",
+            "SELECT rowid, parent_id, position FROM scene_paragraph WHERE child_id = ?",
             (paragraph_id,),
         )
         if rows:
+            old = rows[0]
+            _journal_capture(
+                storage,
+                run_id,
+                "scene_paragraph",
+                "delete",
+                row_pk=old["rowid"],
+                before={
+                    "child_id": paragraph_id,
+                    "parent_id": old["parent_id"],
+                    "position": old["position"],
+                },
+            )
             storage.execute_delete(
                 "DELETE FROM scene_paragraph WHERE child_id = ?", (paragraph_id,)
             )
-        storage.execute_insert(
+        new_rowid = storage.execute_insert(
             "INSERT INTO scene_paragraph (child_id, parent_id, position) VALUES (?, ?, ?)",
             (paragraph_id, scene_id, para_idx),
+        )
+        _journal_capture(
+            storage,
+            run_id,
+            "scene_paragraph",
+            "insert",
+            row_pk=new_rowid,
+            after={
+                "child_id": paragraph_id,
+                "parent_id": scene_id,
+                "position": para_idx,
+            },
         )
 
 

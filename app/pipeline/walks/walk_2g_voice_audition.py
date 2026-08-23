@@ -346,22 +346,92 @@ def _process_character(
         result["profiles_for_review"] += 1
 
 
+def _journal_capture(storage, run_id, table, op, row_pk=None, before=None, after=None):
+    """Append one walk_undo_entry capture, guarded on an active run.
+
+    Joins the caller's open ``savepoint()`` (capture_undo never commits inside a
+    transaction), so the entry is atomic with the accompanying write. ``run_id``
+    is ``None`` outside a reserved run (direct unit calls / raw-adapter paths), in
+    which case no journal entry is written.
+    """
+    if run_id is None:
+        return
+    storage.capture_undo(
+        run_id,
+        table,
+        op,
+        row_pk=str(row_pk) if row_pk is not None else None,
+        before_json=json.dumps(before) if before is not None else None,
+        after_json=json.dumps(after) if after is not None else None,
+    )
+
+
+def _metadata_image(row) -> dict:
+    """Project a character_metadata row (selected as ``rowid, cols``) to a
+    journal image without the ``rowid`` key (``_reinsert_row`` would otherwise
+    try to set ``rowid`` twice)."""
+    return {
+        "character_id": row["character_id"],
+        "key": row["key"],
+        "value": row["value"],
+    }
+
+
 def _store_voice_profile(
     character_id: str, voice_profile: dict, storage: PipelineStorage
 ) -> None:
     """Store voice profile in character_metadata with key='voice_profile'.
 
-    Uses SQLite UPSERT (INSERT OR REPLACE) to handle existing rows.
-    The voice_profile dict is serialized as a JSON string.
+    ``character_metadata`` is a rowid table with ``UNIQUE(character_id, key)``;
+    the INSERT..ON CONFLICT UPSERT is an insert-or-update in ONE statement, so
+    the writer must pre-SELECT the existing row to classify the branch and
+    journal the right op (insert vs update) with the rowid identity.
     """
-    storage.execute_insert(
-        """
-        INSERT INTO character_metadata (character_id, key, value)
-        VALUES (?, ?, ?)
-        ON CONFLICT(character_id, key) DO UPDATE SET value = excluded.value
-        """,
-        (character_id, "voice_profile", json.dumps(voice_profile)),
+    run_id = getattr(storage, "run_id", None)
+    new_value = json.dumps(voice_profile)
+    existing = storage.execute_query(
+        "SELECT rowid, character_id, key, value FROM character_metadata "
+        "WHERE character_id = ? AND key = 'voice_profile'",
+        (character_id,),
     )
+    if existing:
+        rowid = existing[0]["rowid"]
+        _journal_capture(
+            storage,
+            run_id,
+            "character_metadata",
+            "update",
+            row_pk=rowid,
+            before=_metadata_image(existing[0]),
+            after={
+                "character_id": character_id,
+                "key": "voice_profile",
+                "value": new_value,
+            },
+        )
+        storage.execute_update(
+            "UPDATE character_metadata SET value = ? "
+            "WHERE character_id = ? AND key = 'voice_profile'",
+            (new_value, character_id),
+        )
+    else:
+        rowid = storage.execute_insert(
+            "INSERT INTO character_metadata (character_id, key, value) "
+            "VALUES (?, ?, ?)",
+            (character_id, "voice_profile", new_value),
+        )
+        _journal_capture(
+            storage,
+            run_id,
+            "character_metadata",
+            "insert",
+            row_pk=rowid,
+            after={
+                "character_id": character_id,
+                "key": "voice_profile",
+                "value": new_value,
+            },
+        )
 
 
 def _get_prior_voice_profile(character_id: str, storage: PipelineStorage) -> str | None:
@@ -388,10 +458,31 @@ def _insert_review_item(
     """Write a walk_review_item row for a review-band voice profile.
 
     Called inside the per-unit savepoint so the item row commits (or rolls
-    back) atomically with the voice-profile UPSERT.  Auto-accept (>=0.7)
-    and auto-reject (<0.5) paths never reach this helper.
+    back) atomically with the voice-profile write.  Auto-accept (>=0.7)
+    and auto-reject (<0.5) paths never reach this helper.  The insert is
+    journaled (walk_review_item) so a reserved run's review item is replayable.
     """
-    run_id = storage.run_id
+    run_id = getattr(storage, "run_id", None)
+    review_item_id = f"{run_id}:voice_profile:{character_id}"
+    after = {
+        "id": review_item_id,
+        "book_id": book_id,
+        "run_id": run_id,
+        "kind": "voice_profile",
+        "target_table": "character_metadata",
+        "target_id": character_id,
+        "prior_value": prior_value,
+        "status": "pending",
+        "created_ms": int(time.time() * 1000),
+    }
+    _journal_capture(
+        storage,
+        run_id,
+        "walk_review_item",
+        "insert",
+        row_pk=review_item_id,
+        after=after,
+    )
     storage.execute_insert(
         """
         INSERT INTO walk_review_item
@@ -400,12 +491,12 @@ def _insert_review_item(
         VALUES (?, ?, ?, 'voice_profile', 'character_metadata', ?, ?, 'pending', ?)
         """,
         (
-            f"{run_id}:voice_profile:{character_id}",
+            review_item_id,
             book_id,
             run_id,
             character_id,
             prior_value,
-            int(time.time() * 1000),
+            after["created_ms"],
         ),
     )
 

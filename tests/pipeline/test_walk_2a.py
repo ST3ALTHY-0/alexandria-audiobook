@@ -7,6 +7,7 @@ import pytest
 
 from app.pipeline.adapter import InMemorySQLiteAdapter
 from app.pipeline.populate import populate_initial_spine
+from app.pipeline.walks.runner import HeartbeatStorage
 from app.pipeline.walks.walk_2a_scene_segmentation import (
     _build_scene_segmentation_prompt,
     _parse_llm_response,
@@ -37,20 +38,36 @@ def sample_chapters():
                 {
                     "id": "para-1",
                     "spans": [
-                        {"id": "span-1a", "span_type": "sentence", "text": "The sun rose over the mountains."},
-                        {"id": "span-1b", "span_type": "sentence", "text": "Birds began to sing."},
+                        {
+                            "id": "span-1a",
+                            "span_type": "sentence",
+                            "text": "The sun rose over the mountains.",
+                        },
+                        {
+                            "id": "span-1b",
+                            "span_type": "sentence",
+                            "text": "Birds began to sing.",
+                        },
                     ],
                 },
                 {
                     "id": "para-2",
                     "spans": [
-                        {"id": "span-2a", "span_type": "sentence", "text": "John woke up early."},
+                        {
+                            "id": "span-2a",
+                            "span_type": "sentence",
+                            "text": "John woke up early.",
+                        },
                     ],
                 },
                 {
                     "id": "para-3",
                     "spans": [
-                        {"id": "span-3a", "span_type": "sentence", "text": "He prepared breakfast."},
+                        {
+                            "id": "span-3a",
+                            "span_type": "sentence",
+                            "text": "He prepared breakfast.",
+                        },
                     ],
                 },
             ],
@@ -61,13 +78,21 @@ def sample_chapters():
                 {
                     "id": "para-4",
                     "spans": [
-                        {"id": "span-4a", "span_type": "sentence", "text": "Later that day, the scene shifted to the city."},
+                        {
+                            "id": "span-4a",
+                            "span_type": "sentence",
+                            "text": "Later that day, the scene shifted to the city.",
+                        },
                     ],
                 },
                 {
                     "id": "para-5",
                     "spans": [
-                        {"id": "span-5a", "span_type": "sentence", "text": "Mary was waiting at the cafe."},
+                        {
+                            "id": "span-5a",
+                            "span_type": "sentence",
+                            "text": "Mary was waiting at the cafe.",
+                        },
                     ],
                 },
             ],
@@ -97,16 +122,18 @@ def mock_llm_client():
 class TestExecute:
     """Test the main execute() function."""
 
-    def test_execute_returns_summary_dict(self, populated_storage, mock_llm_client, monkeypatch):
+    def test_execute_returns_summary_dict(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
         """execute() returns a summary dict with expected keys."""
         # Mock LLM response: single scene with all paragraphs
         mock_response = Mock()
         mock_response.choices = [
             Mock(
                 message=Mock(
-                    content=json.dumps([
-                        {"paragraph_ids": ["P1", "P2", "P3"], "confidence": 0.9}
-                    ])
+                    content=json.dumps(
+                        [{"paragraph_ids": ["P1", "P2", "P3"], "confidence": 0.9}]
+                    )
                 )
             )
         ]
@@ -123,7 +150,11 @@ class TestExecute:
 
         # Mock resolve_task_config
         def mock_resolve_task_config(task, storage, book_id):
-            return {"model_name": "test-model", "reasoning_effort": None, "temperature": 0.1}
+            return {
+                "model_name": "test-model",
+                "reasoning_effort": None,
+                "temperature": 0.1,
+            }
 
         monkeypatch.setattr(
             "app.utils.resolve_task_config",
@@ -139,16 +170,18 @@ class TestExecute:
         assert "scenes_for_review" in result
         assert "errors" in result
 
-    def test_execute_processes_all_chapters(self, populated_storage, mock_llm_client, monkeypatch):
+    def test_execute_processes_all_chapters(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
         """execute() processes all chapters in the book."""
         # Mock LLM response for each chapter
         mock_response = Mock()
         mock_response.choices = [
             Mock(
                 message=Mock(
-                    content=json.dumps([
-                        {"paragraph_ids": ["P1", "P2", "P3"], "confidence": 0.9}
-                    ])
+                    content=json.dumps(
+                        [{"paragraph_ids": ["P1", "P2", "P3"], "confidence": 0.9}]
+                    )
                 )
             )
         ]
@@ -163,7 +196,11 @@ class TestExecute:
         )
 
         def mock_resolve_task_config(task, storage, book_id):
-            return {"model_name": "test-model", "reasoning_effort": None, "temperature": 0.1}
+            return {
+                "model_name": "test-model",
+                "reasoning_effort": None,
+                "temperature": 0.1,
+            }
 
         monkeypatch.setattr(
             "app.utils.resolve_task_config",
@@ -175,17 +212,21 @@ class TestExecute:
         # Should process 2 chapters
         assert result["chapters_processed"] == 2
 
-    def test_execute_creates_scenes_with_high_confidence(self, populated_storage, mock_llm_client, monkeypatch):
+    def test_execute_creates_scenes_with_high_confidence(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
         """execute() creates scenes when confidence >= 0.7."""
         # Mock LLM response: two scenes, both high confidence
         mock_response = Mock()
         mock_response.choices = [
             Mock(
                 message=Mock(
-                    content=json.dumps([
-                        {"paragraph_ids": ["P1", "P2"], "confidence": 0.9},
-                        {"paragraph_ids": ["P3"], "confidence": 0.8},
-                    ])
+                    content=json.dumps(
+                        [
+                            {"paragraph_ids": ["P1", "P2"], "confidence": 0.9},
+                            {"paragraph_ids": ["P3"], "confidence": 0.8},
+                        ]
+                    )
                 )
             )
         ]
@@ -200,7 +241,11 @@ class TestExecute:
         )
 
         def mock_resolve_task_config(task, storage, book_id):
-            return {"model_name": "test-model", "reasoning_effort": None, "temperature": 0.1}
+            return {
+                "model_name": "test-model",
+                "reasoning_effort": None,
+                "temperature": 0.1,
+            }
 
         monkeypatch.setattr(
             "app.utils.resolve_task_config",
@@ -212,16 +257,18 @@ class TestExecute:
         # Chapter 1 should have 2 scenes created
         assert result["scenes_created"] >= 2
 
-    def test_execute_rejects_scenes_with_low_confidence(self, populated_storage, mock_llm_client, monkeypatch):
+    def test_execute_rejects_scenes_with_low_confidence(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
         """execute() rejects scenes when confidence < 0.5."""
         # Mock LLM response: one scene with low confidence
         mock_response = Mock()
         mock_response.choices = [
             Mock(
                 message=Mock(
-                    content=json.dumps([
-                        {"paragraph_ids": ["P1", "P2", "P3"], "confidence": 0.3}
-                    ])
+                    content=json.dumps(
+                        [{"paragraph_ids": ["P1", "P2", "P3"], "confidence": 0.3}]
+                    )
                 )
             )
         ]
@@ -236,7 +283,11 @@ class TestExecute:
         )
 
         def mock_resolve_task_config(task, storage, book_id):
-            return {"model_name": "test-model", "reasoning_effort": None, "temperature": 0.1}
+            return {
+                "model_name": "test-model",
+                "reasoning_effort": None,
+                "temperature": 0.1,
+            }
 
         monkeypatch.setattr(
             "app.utils.resolve_task_config",
@@ -248,16 +299,18 @@ class TestExecute:
         # Scene should be rejected
         assert result["scenes_rejected"] >= 1
 
-    def test_execute_flags_scenes_for_review_with_medium_confidence(self, populated_storage, mock_llm_client, monkeypatch):
+    def test_execute_flags_scenes_for_review_with_medium_confidence(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
         """execute() flags scenes for review when 0.5 <= confidence < 0.7."""
         # Mock LLM response: one scene with medium confidence
         mock_response = Mock()
         mock_response.choices = [
             Mock(
                 message=Mock(
-                    content=json.dumps([
-                        {"paragraph_ids": ["P1", "P2", "P3"], "confidence": 0.6}
-                    ])
+                    content=json.dumps(
+                        [{"paragraph_ids": ["P1", "P2", "P3"], "confidence": 0.6}]
+                    )
                 )
             )
         ]
@@ -272,7 +325,11 @@ class TestExecute:
         )
 
         def mock_resolve_task_config(task, storage, book_id):
-            return {"model_name": "test-model", "reasoning_effort": None, "temperature": 0.1}
+            return {
+                "model_name": "test-model",
+                "reasoning_effort": None,
+                "temperature": 0.1,
+            }
 
         monkeypatch.setattr(
             "app.utils.resolve_task_config",
@@ -284,13 +341,13 @@ class TestExecute:
         # Scene should be flagged for review
         assert result["scenes_for_review"] >= 1
 
+    # ---------------------------------------------------------------------------
+    # Tests: _build_scene_segmentation_prompt()
+    # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Tests: _build_scene_segmentation_prompt()
-# ---------------------------------------------------------------------------
-
-
-    def test_walk_override_drives_llm_config(self, populated_storage, monkeypatch, tmp_path):
+    def test_walk_override_drives_llm_config(
+        self, populated_storage, monkeypatch, tmp_path
+    ):
         """A walk_override row for (book, task) overrides the walk's LLM config.
 
         Phase 3 (Plan G): the walk resolves its LLM config via
@@ -320,7 +377,12 @@ class TestExecute:
         captured = {}
 
         def mock_call_llm(
-            client, model_name, temperature, reasoning_effort, system_prompt, user_prompt
+            client,
+            model_name,
+            temperature,
+            reasoning_effort,
+            system_prompt,
+            user_prompt,
         ):
             captured["temperature"] = temperature
             captured["model_name"] = model_name
@@ -357,7 +419,12 @@ class TestExecute:
         captured = {}
 
         def mock_call_llm(
-            client, model_name, temperature, reasoning_effort, system_prompt, user_prompt
+            client,
+            model_name,
+            temperature,
+            reasoning_effort,
+            system_prompt,
+            user_prompt,
         ):
             captured["system_prompt"] = system_prompt
             return "[]"
@@ -414,7 +481,12 @@ class TestExecute:
         captured = {}
 
         def mock_call_llm(
-            client, model_name, temperature, reasoning_effort, system_prompt, user_prompt
+            client,
+            model_name,
+            temperature,
+            reasoning_effort,
+            system_prompt,
+            user_prompt,
         ):
             captured["system_prompt"] = system_prompt
             return "[]"
@@ -472,9 +544,7 @@ class TestParseResponse:
             {"paragraph_id": "para-2", "text": "Second."},
         ]
 
-        response = json.dumps([
-            {"paragraph_ids": ["P1", "P2"], "confidence": 0.9}
-        ])
+        response = json.dumps([{"paragraph_ids": ["P1", "P2"], "confidence": 0.9}])
 
         scenes = _parse_llm_response(response, paragraphs)
 
@@ -488,7 +558,9 @@ class TestParseResponse:
             {"paragraph_id": "para-1", "text": "First."},
         ]
 
-        response = 'Here is the JSON:\n[{"paragraph_ids": ["P1"], "confidence": 0.8}]\nDone.'
+        response = (
+            'Here is the JSON:\n[{"paragraph_ids": ["P1"], "confidence": 0.8}]\nDone.'
+        )
 
         scenes = _parse_llm_response(response, paragraphs)
 
@@ -515,9 +587,7 @@ class TestParseResponse:
             {"paragraph_id": "uuid-3", "text": "Third."},
         ]
 
-        response = json.dumps([
-            {"paragraph_ids": ["P1", "P3"], "confidence": 0.9}
-        ])
+        response = json.dumps([{"paragraph_ids": ["P1", "P3"], "confidence": 0.9}])
 
         scenes = _parse_llm_response(response, paragraphs)
 
@@ -529,9 +599,7 @@ class TestParseResponse:
             {"paragraph_id": "para-1", "text": "First."},
         ]
 
-        response = json.dumps([
-            {"paragraph_ids": ["P1", "P99"], "confidence": 0.9}
-        ])
+        response = json.dumps([{"paragraph_ids": ["P1", "P99"], "confidence": 0.9}])
 
         scenes = _parse_llm_response(response, paragraphs)
 
@@ -573,3 +641,69 @@ class TestValidateScenePartition:
         ]
 
         assert _validate_scene_partition(scenes, paragraphs)
+
+
+def _reserve_run(storage, run_id):
+    """Insert a reserved ``walk_run`` row (idempotent) for journal FK backing."""
+    existing = storage.execute_query(
+        "SELECT 1 FROM walk_run WHERE run_id = ?", (run_id,)
+    )
+    if not existing:
+        storage.execute_insert(
+            "INSERT INTO walk_run (run_id, book_id, walk_name, status, created_ms) "
+            "VALUES (?, ?, 'walk_test', 'running', ?)",
+            (run_id, "book-1", 1700000000000),
+        )
+    return storage
+
+
+def _heartbeat(storage, run_id):
+    """Reserve *run_id* and wrap *storage* in a HeartbeatStorage with that run."""
+    return HeartbeatStorage(_reserve_run(storage, run_id), run_id)
+
+
+class TestJournalCoverage:
+    """P7-S4: walk 2a mutation inventory is journaled.
+
+    Scene segmentation creates ``scene`` rows and their spine edges — the
+    ``chapter_scene`` link and the ``scene_paragraph`` remap (DELETE + INSERT)
+    — all captured so a cancelled segmentation run restores the pre-run spine.
+    """
+
+    def _run(self, populated_storage, mock_llm_client, monkeypatch, responses):
+        mock_response = Mock()
+        mock_response.choices = [Mock(message=Mock(content=json.dumps(responses)))]
+        mock_llm_client.chat.completions.create.return_value = mock_response
+
+        def mock_create_llm_client(config_path=None):
+            return mock_llm_client, "test-model"
+
+        monkeypatch.setattr("app.utils.create_llm_client", mock_create_llm_client)
+
+        def mock_resolve_task_config(task, storage, book_id):
+            return {
+                "model_name": "test-model",
+                "reasoning_effort": None,
+                "temperature": 0.1,
+            }
+
+        monkeypatch.setattr("app.utils.resolve_task_config", mock_resolve_task_config)
+        return execute("book-1", _heartbeat(populated_storage, "run-a"), {})
+
+    def test_scene_segmentation_inventory_journaled(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
+        self._run(
+            populated_storage,
+            mock_llm_client,
+            monkeypatch,
+            [{"paragraph_ids": ["P1", "P2", "P3"], "confidence": 0.9}],
+        )
+        ops = {
+            (e["table_name"], e["op"])
+            for e in populated_storage.list_undo_entries("run-a")
+        }
+        assert ("scene", "insert") in ops
+        assert ("chapter_scene", "insert") in ops
+        # scene_paragraph remap appears as delete + insert (or just insert).
+        assert any(table == "scene_paragraph" for table, _op in ops)

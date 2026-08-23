@@ -437,6 +437,26 @@ def _now_ms():
     return int(time.time() * 1000)
 
 
+def _journal_capture(storage, run_id, table, op, row_pk=None, before=None, after=None):
+    """Append one walk_undo_entry capture, guarded on an active run.
+
+    Joins the caller's open ``savepoint()`` (capture_undo never commits inside a
+    transaction), so the entry is atomic with the accompanying write.  ``run_id``
+    is ``None`` outside a reserved run (direct unit calls), in which case no
+    journal entry is written.
+    """
+    if run_id is None:
+        return
+    storage.capture_undo(
+        run_id,
+        table,
+        op,
+        row_pk=str(row_pk) if row_pk is not None else None,
+        before_json=json.dumps(before) if before is not None else None,
+        after_json=json.dumps(after) if after is not None else None,
+    )
+
+
 def _record_merge_decision(storage, book_id, canonical_id, member_ids, result):
     """Record a generated workbench decision documenting the merge group.
 
@@ -449,6 +469,28 @@ def _record_merge_decision(storage, book_id, canonical_id, member_ids, result):
         "member_ids": sorted(member_ids),
         "source": "walk_2c_alias_resolution",
     }
+    created_ms = _now_ms()
+    _journal_capture(
+        storage,
+        getattr(storage, "run_id", None),
+        "workbench_decision",
+        "insert",
+        row_pk=decision_id,
+        after={
+            "decision_id": decision_id,
+            "book_id": book_id,
+            "target_kind": "alias_merge",
+            "target_key": f"{canonical_id}:{','.join(sorted(member_ids))}",
+            "decision_type": "alias_merge:merge",
+            "base_revision": revision,
+            "payload_json": json.dumps(payload),
+            "status": "active",
+            "source": "generated",
+            "created_ms": created_ms,
+            "undone_by": None,
+            "supersedes_id": None,
+        },
+    )
     storage.execute_insert(
         "INSERT INTO workbench_decision "
         "(decision_id, book_id, target_kind, target_key, decision_type, "
@@ -461,7 +503,7 @@ def _record_merge_decision(storage, book_id, canonical_id, member_ids, result):
             f"{canonical_id}:{','.join(sorted(member_ids))}",
             revision,
             json.dumps(payload),
-            _now_ms(),
+            created_ms,
         ),
     )
     return decision_id
@@ -497,6 +539,29 @@ def _record_member_merge(
     )
 
     revision = _generation_revision(storage, book_id)
+    merge_id = f"merge-{uuid.uuid4().hex}"
+    created_ms = _now_ms()
+    _journal_capture(
+        storage,
+        getattr(storage, "run_id", None),
+        "character_alias_merge",
+        "insert",
+        row_pk=merge_id,
+        after={
+            "merge_id": merge_id,
+            "book_id": book_id,
+            "canonical_id": canonical_id,
+            "member_id": member_id,
+            "merge_revision": revision,
+            "decision_id": decision_id,
+            "status": "active",
+            "prior_member_name": name,
+            "prior_member_aliases_json": aliases_json,
+            "prior_member_voice_assignment_id": voice_id,
+            "consequence_json": consequence_json,
+            "created_ms": created_ms,
+        },
+    )
     storage.execute_insert(
         "INSERT INTO character_alias_merge "
         "(merge_id, book_id, canonical_id, member_id, merge_revision, decision_id, "
@@ -504,7 +569,7 @@ def _record_member_merge(
         " prior_member_voice_assignment_id, consequence_json, created_ms) "
         "VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)",
         (
-            f"merge-{uuid.uuid4().hex}",
+            merge_id,
             book_id,
             canonical_id,
             member_id,
@@ -514,20 +579,101 @@ def _record_member_merge(
             aliases_json,
             voice_id,
             consequence_json,
-            _now_ms(),
+            created_ms,
         ),
     )
 
 
 def _invalidate_downstream(storage, book_id):
-    """Mark pending review items from downstream (2d) runs as stale."""
+    """Mark pending review items from downstream (2d) runs as stale.
+
+    Pre-SELECTs the affected rows, journals each stale flip (before
+    status='pending', after status='stale') and performs the multi-row UPDATE
+    inside one atomic ``savepoint`` so the journal entry and the write commit
+    together (the old autocommit write left these flips outside the capture
+    seam).
+    """
+    run_id = getattr(storage, "run_id", None)
     placeholders = ",".join("?" for _ in _DOWNSTREAM_WALKS)
-    storage.execute_update(
-        f"UPDATE walk_review_item SET status = 'stale' "
-        f"WHERE book_id = ? AND status = 'pending' AND run_id IN "
-        f"(SELECT run_id FROM walk_run WHERE walk_name IN ({placeholders}))",
+    where = (
+        "WHERE book_id = ? AND status = 'pending' AND run_id IN "
+        f"(SELECT run_id FROM walk_run WHERE walk_name IN ({placeholders}))"
+    )
+    rows = storage.execute_query(
+        f"SELECT * FROM walk_review_item {where}",
         (book_id, *_DOWNSTREAM_WALKS),
     )
+    with storage.savepoint("walk_2c_invalidate"):
+        for item in rows:
+            _journal_capture(
+                storage,
+                run_id,
+                "walk_review_item",
+                "update",
+                row_pk=item["id"],
+                before=dict(item),
+                after={**item, "status": "stale"},
+            )
+        storage.execute_update(
+            f"UPDATE walk_review_item SET status = 'stale' {where}",
+            (book_id, *_DOWNSTREAM_WALKS),
+        )
+
+
+def _junction_image(row) -> dict:
+    """Project a junction row (selected as ``rowid, cols``) to a journal image
+    without the ``rowid`` key.
+
+    Loader ``_read_row`` reads via ``SELECT *`` (which has no ``rowid`` key) and
+    ``_image_equiv`` requires every recorded key to match the live row, so a
+    captured image carrying a ``rowid`` key would make every CAS replay fail.  Only
+    the real columns are journaled; the rowid lives in ``row_pk``.
+    """
+    return {k: v for k, v in dict(row).items() if k != "rowid"}
+
+
+def _capture_junction_delete(storage, run_id, table, select_sql, params):
+    """Pre-capture the rows a set-based DELETE will remove, then return them.
+
+    Selects the affected rows (by rowid for the rowid junction tables,
+    ``table``), journals each as a ``delete`` (before image = real columns,
+    row_pk=rowid) so replay can restore them, and returns the matching rows
+    (for the caller to run the actual DELETE against the same predicate).  The
+    captured before-image excludes the ``rowid`` key (see ``_junction_image``).
+    """
+    rows = storage.execute_query(select_sql, params)
+    for row in rows:
+        _journal_capture(
+            storage,
+            run_id,
+            table,
+            "delete",
+            row_pk=row["rowid"],
+            before=_junction_image(row),
+        )
+    return rows
+
+
+def _capture_junction_update(storage, run_id, table, select_sql, params, canonical_id):
+    """Pre-capture the rows a set-based UPDATE will redirect to canonical.
+
+    Selects the affected rows (by rowid), journals each as an ``update``
+    (before = current row, after = row with ``character_id=canonical_id``,
+    row_pk=rowid).  Both images exclude the ``rowid`` key (see ``_junction_image``)
+    so the after-image CAS against a ``SELECT *`` read succeeds on replay.
+    """
+    rows = storage.execute_query(select_sql, params)
+    for row in rows:
+        _journal_capture(
+            storage,
+            run_id,
+            table,
+            "update",
+            row_pk=row["rowid"],
+            before=_junction_image(row),
+            after=_junction_image({**row, "character_id": canonical_id}),
+        )
+    return rows
 
 
 def _redirect_junctions(
@@ -539,16 +685,38 @@ def _redirect_junctions(
     """Update all junction tables to point from non-canonical to canonical.
 
     Handles potential duplicate rows by deleting conflicting rows first.
+    Every set-based DELETE/UPDATE is pre-captured as per-row undo entries
+    (rowid identity) so replay can reverse it row-by-row.
     """
+    run_id = getattr(storage, "run_id", None)
     book_filter = "" if book_id is None else " AND book_id = ?"
     book_params = () if book_id is None else (book_id,)
     # character_book: delete non-canonical rows where canonical already has
     # the same book_id, then update remaining
+    _capture_junction_delete(
+        storage,
+        run_id,
+        "character_book",
+        "SELECT rowid, character_id, book_id, source, confidence, human_override "
+        "FROM character_book "
+        "WHERE character_id = ?" + book_filter + " AND book_id IN "
+        "(SELECT book_id FROM character_book WHERE character_id = ?)",
+        (non_canonical_id, *book_params, canonical_id),
+    )
     storage.execute_update(
         "DELETE FROM character_book "
         "WHERE character_id = ?" + book_filter + " AND book_id IN "
         "(SELECT book_id FROM character_book WHERE character_id = ?)",
         (non_canonical_id, *book_params, canonical_id),
+    )
+    _capture_junction_update(
+        storage,
+        run_id,
+        "character_book",
+        "SELECT rowid, character_id, book_id, source, confidence, human_override "
+        "FROM character_book WHERE character_id = ?" + book_filter,
+        (non_canonical_id, *book_params),
+        canonical_id,
     )
     storage.execute_update(
         "UPDATE character_book SET character_id = ? WHERE character_id = ?"
@@ -562,11 +730,31 @@ def _redirect_junctions(
         else " AND scene_id IN (SELECT chs.child_id FROM chapter_scene chs JOIN book_chapter bc ON chs.parent_id = bc.child_id WHERE bc.parent_id = ?)"
     )
     scene_params = () if book_id is None else (book_id,)
+    _capture_junction_delete(
+        storage,
+        run_id,
+        "character_scene",
+        "SELECT rowid, character_id, scene_id, relation_type, source, confidence, human_override "
+        "FROM character_scene WHERE character_id = ?"
+        + scene_filter
+        + " AND (scene_id, relation_type) IN "
+        "(SELECT scene_id, relation_type FROM character_scene WHERE character_id = ?)",
+        (non_canonical_id, *scene_params, canonical_id),
+    )
     storage.execute_update(
         "DELETE FROM character_scene "
         "WHERE character_id = ?" + scene_filter + " AND (scene_id, relation_type) IN "
         "(SELECT scene_id, relation_type FROM character_scene WHERE character_id = ?)",
         (non_canonical_id, *scene_params, canonical_id),
+    )
+    _capture_junction_update(
+        storage,
+        run_id,
+        "character_scene",
+        "SELECT rowid, character_id, scene_id, relation_type, source, confidence, human_override "
+        "FROM character_scene WHERE character_id = ?" + scene_filter,
+        (non_canonical_id, *scene_params),
+        canonical_id,
     )
     storage.execute_update(
         "UPDATE character_scene SET character_id = ? WHERE character_id = ?"
@@ -580,11 +768,31 @@ def _redirect_junctions(
         else " AND span_id IN (SELECT psp.child_id FROM paragraph_span psp JOIN scene_paragraph scp ON psp.parent_id = scp.child_id JOIN chapter_scene chs ON scp.parent_id = chs.child_id JOIN book_chapter bc ON chs.parent_id = bc.child_id WHERE bc.parent_id = ?)"
     )
     span_params = () if book_id is None else (book_id,)
+    _capture_junction_delete(
+        storage,
+        run_id,
+        "character_span",
+        "SELECT rowid, character_id, span_id, relation_type, source, confidence, human_override "
+        "FROM character_span WHERE character_id = ?"
+        + span_filter
+        + " AND (span_id, relation_type) IN "
+        "(SELECT span_id, relation_type FROM character_span WHERE character_id = ?)",
+        (non_canonical_id, *span_params, canonical_id),
+    )
     storage.execute_update(
         "DELETE FROM character_span "
         "WHERE character_id = ?" + span_filter + " AND (span_id, relation_type) IN "
         "(SELECT span_id, relation_type FROM character_span WHERE character_id = ?)",
         (non_canonical_id, *span_params, canonical_id),
+    )
+    _capture_junction_update(
+        storage,
+        run_id,
+        "character_span",
+        "SELECT rowid, character_id, span_id, relation_type, source, confidence, human_override "
+        "FROM character_span WHERE character_id = ?" + span_filter,
+        (non_canonical_id, *span_params),
+        canonical_id,
     )
     storage.execute_update(
         "UPDATE character_span SET character_id = ? WHERE character_id = ?"
@@ -663,6 +871,20 @@ def _consolidate_aliases(
 
     aliases_json = json.dumps(sorted(alias_set))
     if persist_global:
+        before = storage.execute_query(
+            "SELECT * FROM character WHERE id = ?", (canonical_id,)
+        )
+        _journal_capture(
+            storage,
+            getattr(storage, "run_id", None),
+            "character",
+            "update",
+            row_pk=canonical_id,
+            before=dict(before[0]) if before else None,
+            after=dict(before[0], aliases=aliases_json)
+            if before
+            else {"id": canonical_id, "aliases": aliases_json},
+        )
         storage.execute_update(
             "UPDATE character SET aliases = ? WHERE id = ?",
             (aliases_json, canonical_id),

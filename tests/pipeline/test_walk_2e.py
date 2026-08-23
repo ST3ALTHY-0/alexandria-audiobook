@@ -7,6 +7,7 @@ import pytest
 
 from app.pipeline.adapter import InMemorySQLiteAdapter
 from app.pipeline.populate import populate_initial_spine
+from app.pipeline.walks.runner import HeartbeatStorage
 from app.pipeline.walks.walk_2e_span_attribution import (
     _build_speaker_attribution_prompt,
     _get_surrounding_context,
@@ -182,6 +183,25 @@ def _patch_llm(monkeypatch, mock_llm_client, response_content):
 # ---------------------------------------------------------------------------
 # Tests: execute()
 # ---------------------------------------------------------------------------
+
+
+def _reserve_run(storage, run_id):
+    """Insert a reserved ``walk_run`` row (idempotent) for journal FK backing."""
+    existing = storage.execute_query(
+        "SELECT 1 FROM walk_run WHERE run_id = ?", (run_id,)
+    )
+    if not existing:
+        storage.execute_insert(
+            "INSERT INTO walk_run (run_id, book_id, walk_name, status, created_ms) "
+            "VALUES (?, ?, 'walk_test', 'running', ?)",
+            (run_id, "book-1", 1700000000000),
+        )
+    return storage
+
+
+def _heartbeat(storage, run_id):
+    """Reserve *run_id* and wrap *storage* in a HeartbeatStorage with that run."""
+    return HeartbeatStorage(_reserve_run(storage, run_id), run_id)
 
 
 class TestExecute:
@@ -786,3 +806,50 @@ class TestGetSurroundingContext:
             "before": ["Span 7", "Span 8", "Span 9"],
             "after": ["Span 11", "Span 12", "Span 13"],
         }
+
+
+class TestJournalCoverage:
+    """P7-S4: walk 2e mutation inventory is journaled.
+
+    The span-attribution walk captures every ``character_span`` change: new
+    speaker junctions (INSERT), replacement of a prior generated guess (UPDATE
+    or DELETE), as required for cancellation rollback of attribution.
+    """
+
+    def _captured(self, storage, run_id):
+        return {(e["table_name"], e["op"]) for e in storage.list_undo_entries(run_id)}
+
+    def test_speaker_junction_insert_journaled(
+        self, seeded_storage, mock_llm_client, monkeypatch
+    ):
+        _patch_llm(
+            monkeypatch,
+            mock_llm_client,
+            json.dumps({"character_id": "char-john", "confidence": 0.9}),
+        )
+        execute("book-1", _heartbeat(seeded_storage, "run-1"), {})
+        ops = self._captured(seeded_storage, "run-1")
+        assert ("character_span", "insert") in ops
+
+    def test_correction_journals_delete_or_update(
+        self, seeded_storage, mock_llm_client, monkeypatch
+    ):
+        # Prior generated guess that this run replaces.
+        seeded_storage.execute_insert(
+            "INSERT INTO character_span (character_id, span_id, relation_type,"
+            " source, confidence, human_override)"
+            " VALUES (?, ?, 'speaker', 'walk', 0.6, 0)",
+            ("char-mary", "span-1b"),
+        )
+        _patch_llm(
+            monkeypatch,
+            mock_llm_client,
+            json.dumps({"character_id": "char-john", "confidence": 0.9}),
+        )
+        execute("book-1", _heartbeat(seeded_storage, "run-1"), {})
+        ops = self._captured(seeded_storage, "run-1")
+        changed = {op for (table, op) in ops if table == "character_span"}
+        # The new attribution is an insert; replacing the old guess is a
+        # delete or update — at least one of the correction ops must appear.
+        assert "insert" in changed
+        assert changed & {"delete", "update"}

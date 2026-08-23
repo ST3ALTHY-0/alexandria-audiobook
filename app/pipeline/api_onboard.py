@@ -24,6 +24,7 @@ from app.pipeline.assembly import get_book_version, has_active_run, reonboard_bo
 from app.pipeline.extract import extract_epub_text
 from app.pipeline.populate import populate_spine
 from app.pipeline.tts_integration import get_render_root
+from app.pipeline.walks.runner import reconcile_and_replay
 
 
 def _write_bytes(path: str, content: bytes) -> None:
@@ -73,8 +74,10 @@ def _get_production_storage() -> PipelineStorage:
     """Lazily create and return the production SQLiteAdapter singleton.
 
     Startup-only side effects on first acquisition: stale running
-    render_job/walk_run rows are flipped to ``interrupted``
-    (``reconcile_stale_runs``), then manifests are rebuilt for completed
+    render_job/walk_run rows are flipped to ``interrupted`` and every
+    newly-interrupted ``walk_run``'s durable undo journal is replayed and
+    cleared before any admission (``reconcile_and_replay``, which also covers
+    the fresh-heartbeat crash gap), then manifests are rebuilt for completed
     render_job rows whose run dir exists and artifact-missing jobs are
     flagged (``rebuild_manifests``).
     """
@@ -83,12 +86,14 @@ def _get_production_storage() -> PipelineStorage:
         db_path = os.environ.get("PIPELINE_DB_PATH", "./data/pipeline.db")
         adapter = SQLiteAdapter(db_path)
         adapter.init_db()
-        # Startup-only reconciliation (contract rule #5): one pass flips stale
-        # running render_job/walk_run rows to interrupted BEFORE the API serves
-        # any request.  No on-read sweeper, no periodic reaper — single-process
-        # deployment is race-free by construction.  Runs once, on first
-        # acquisition, before any request can be handled.
-        adapter.reconcile_stale_runs()
+        # Startup-only reconciliation + journal replay (contract rule #5 / Plan S
+        # P5-S3): one pass flips stale running render_job/walk_run rows to
+        # interrupted BEFORE the API serves any request, then replays and clears
+        # every interrupted walk_run's undo journal. ``start_of_day=True`` also
+        # flips any still-``running`` row (fresh-heartbeat crash gap: nothing can
+        # be live at first acquisition). Runs once, on first acquisition, before
+        # any request can be handled or replacement writer admitted.
+        reconcile_and_replay(adapter, start_of_day=True)
         # Startup-only manifest rebuild (contract rule #3 — rows = truth,
         # manifest = derived): regenerate manifest.json for completed jobs
         # whose run dir exists and flag artifact-missing jobs.  Runs AFTER
@@ -123,7 +128,12 @@ async def onboard_epub(
 ) -> dict:
     """Accept an EPUB file, extract text, populate the spine, return book_id.
 
-    The uploaded file is saved to a temporary location, then processed through
+    A leftover interrupted-run undo journal from a prior crash is replayed at
+    storage acquisition (``reconcile_and_replay``) before any admission
+    proceeds, so a cancelled/interrupted run's journal is fully replayed before
+    this new book is created. A walk still active (pending/running) is rejected
+    with HTTP 503 + ``Retry-After`` (contention contract retained). The uploaded
+    file is saved to a temporary location, then processed through
     extract_epub_text and populate_spine.
     """
     if not file.filename or not file.filename.lower().endswith(".epub"):
@@ -206,6 +216,11 @@ async def reonboard(
     Existence is checked first: unknown books map to 404. Only after
     confirming the book exists and no active run remains does
     ``reonboard_book`` clear outputs / bump ``version``.
+
+    Storage acquisition re-runs ``reconcile_and_replay`` before admission, so a
+    leftover interrupted-run undo journal is fully replayed before this
+    replacement clears outputs. The HTTP ``503`` + ``Retry-After`` contention
+    contract is retained unchanged.
     """
     # 404 (unknown book) is preserved and checked BEFORE the active-run check.
     try:

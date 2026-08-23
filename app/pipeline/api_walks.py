@@ -177,6 +177,12 @@ async def run_walk(
     That terminal ``failed`` row surfaces to the frontend through
     ``GET /walks/{book_id}/runs`` (walk_run rows = truth) and the status/SSE
     surfaces, so global contention is observably reported rather than hanging.
+
+    Before this reserved run is admitted, any leftover interrupted-run undo
+    journal from a prior crash is replayed and cleared (``reconcile_and_replay``
+    runs at admission), so replay completes before this walk starts. The HTTP
+    response contract and Plan R's ``503``/``Retry-After`` + frontend
+    identity/polling behavior are retained unchanged.
     """
     if request.walk_name not in WALK_ORDER:
         raise HTTPException(
@@ -254,6 +260,12 @@ async def run_all_walks(
     surface to the frontend through ``GET /walks/{book_id}/runs`` and the
     status/SSE surfaces, so global contention is observably reported rather
     than hanging.
+
+    Before the first child is admitted, any leftover interrupted-run undo
+    journal is replayed and cleared (``reconcile_and_replay`` at admission), so
+    replay completes before the batch starts. The HTTP response contract and
+    Plan R's ``503``/``Retry-After`` + frontend identity/polling behavior are
+    retained unchanged.
     """
     # One canonical batch_id + nine canonical child UUIDs in WALK_ORDER.
     batch_id = str(uuid.uuid4())
@@ -319,9 +331,10 @@ async def cancel_walks(
     Cancellation is a REQUEST honored at safe checkpoints, not an immediate
     abort. After active execution stops, the run terminalizes to ``cancelled``
     (a cancelled-before-start run finalizes ``cancelled`` with no sink), and —
-    per the CONTRACTS.md run-owned cleanup semantics — the runner purges only
-    output owned by that run while the global gate is held, then finalizes the
-    row. Those terminal ``cancelled`` rows surface through
+    per the CONTRACTS.md rollback policy — while the global gate is held the
+    runner replays the run's durable undo journal (undoing its captured walk
+    progress in reverse seq) and clears it, then finalizes the row. Those
+    terminal ``cancelled`` rows surface through
     ``GET /walks/{book_id}/runs`` and the status/SSE surfaces.
 
     Idempotent: re-calling cancel for a book with no active runs is a safe no-op
@@ -357,8 +370,8 @@ async def get_walk_runs(
         that ``failed`` row appears here via DB truth, even though the in-memory
         ``/walk_status`` dict is not updated on the early-return path;
       * a cancelled run terminalizes to ``cancelled`` and (for non-completed
-        runs) runs run-owned cleanup before finalizing — that ``cancelled`` row
-        appears here as well.
+        runs) replays its durable undo journal before finalizing — that
+        ``cancelled`` row appears here as well.
     Frontends use ``GET /walk_status/{book_id}`` for per-walk progress and this
     endpoint for run-row activity/terminal truth.
     """

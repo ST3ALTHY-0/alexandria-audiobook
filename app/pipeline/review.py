@@ -23,6 +23,7 @@ Usage::
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from app.pipeline.adapter import PipelineStorage
@@ -126,10 +127,16 @@ def supersede_targets(
 ) -> int:
     """Mark prior pending walk_review_item rows as superseded (completion-time).
 
-    Runs in ONE transaction (the walk's FINAL transaction per contract rule
-    #9): ``UPDATE walk_review_item SET status = 'superseded'`` for rows of the
-    same *kind* whose ``target_id`` is in *target_ids*, scoped to *book_id*,
-    still ``pending``, and belonging to a different run (``run_id <> ?``).
+    Runs in ONE journal-covered savepoint (the walk's FINAL transaction per
+    contract rule #9): the affected rows are pre-SELECTed and every
+    pending->superseded transition is captured per-row under THIS run's id
+    before a batch ``UPDATE`` inside the ``review_supersede`` savepoint, so no
+    unjournaled review-status change can survive a failed/cancelled run — a
+    rollback reverts the flips and discards the entries, while a committed
+    supersede is replayable (after-image CAS restores pending only if the flip
+    landed and this run is later rolled back).  Scoped to rows of the
+    same *kind* whose ``target_id`` is in *target_ids*, still ``pending``, and
+    belonging to a different run (``run_id <> ?``).
     An empty *target_ids* is a no-op — nothing was regenerated this run, so
     nothing is superseded.  On failure or cancel the walk never reaches this
     helper, so nothing is superseded there either.
@@ -140,15 +147,62 @@ def supersede_targets(
         return 0
 
     placeholders = ", ".join("?" for _ in target_ids)
-    sql = (
-        "UPDATE walk_review_item SET status = 'superseded' "
-        "WHERE book_id = ? AND run_id <> ? AND status = 'pending' AND kind = ? "
+    where = (
+        "book_id = ? AND run_id <> ? AND status = 'pending' AND kind = ? "
         f"AND target_id IN ({placeholders})"
     )
-    params = (book_id, run_id, kind, *target_ids)
+    args = (book_id, run_id, kind, *target_ids)
 
-    with storage.transaction():
-        return storage.execute_update(sql, params)
+    # Pre-SELECT the exact rows this completion-time supersede will flip, so
+    # each pending->superseded transition is journaled under THIS run's id.  On
+    # replay, the after-image CAS restores them to pending only if the supersede
+    # actually landed (i.e. this run was cancelled AFTER committing supersede),
+    # while on cancellation INSIDE a savepoint the ROLLBACK already reverts the
+    # flip and discards the journal entry.  No unjournaled review-status change
+    # can survive a failed/cancelled run.
+    rows = storage.execute_query(
+        f"SELECT id, prior_value FROM walk_review_item WHERE {where}",
+        args,
+    )
+    if not rows:
+        with storage.savepoint("review_supersede"):
+            return storage.execute_update(
+                f"UPDATE walk_review_item SET status = 'superseded' WHERE {where}",
+                args,
+            )
+
+    with storage.savepoint("review_supersede"):
+        for item in rows:
+            status_after = storage.execute_query(
+                "SELECT status FROM walk_review_item WHERE id = ?",
+                (item["id"],),
+            )
+            if not status_after or status_after[0]["status"] != "pending":
+                continue
+            storage.capture_undo(
+                run_id,
+                "walk_review_item",
+                "update",
+                row_pk=item["id"],
+                before_json=json.dumps(
+                    {
+                        "id": item["id"],
+                        "prior_value": item["prior_value"],
+                        "status": "pending",
+                    }
+                ),
+                after_json=json.dumps(
+                    {
+                        "id": item["id"],
+                        "prior_value": item["prior_value"],
+                        "status": "superseded",
+                    }
+                ),
+            )
+        return storage.execute_update(
+            f"UPDATE walk_review_item SET status = 'superseded' WHERE {where}",
+            args,
+        )
 
 
 class ReviewItemNotFoundError(LookupError):
@@ -506,6 +560,12 @@ class ReviewManager:
         ``resolved``.  The target write + status update run inside ONE
         ``storage.transaction()`` so the pair commits atomically and rolls
         back together on failure.
+
+        This is the HUMAN resolution branch — it sets the item ``resolved`` and
+        is DISTINCT from automatic cancelled-run replay (which restores the
+        run's captured writes). A human accept/reject/override and an
+        auto-replayed cancelled-run write are separate, and both remain
+        preserved and queryable in the item's status history.
         """
         row = self._storage.execute_query(
             "SELECT kind, target_id, prior_value "

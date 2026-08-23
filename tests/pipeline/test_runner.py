@@ -29,7 +29,12 @@ import pytest
 
 from app.pipeline.adapter import ConcurrentTransactionError, InMemorySQLiteAdapter
 from app.pipeline.walks.order import WALK_ORDER
-from app.pipeline.walks.runner import HeartbeatStorage, WalkRunner
+from app.pipeline.walks.runner import (
+    HeartbeatStorage,
+    WalkCancelledError,
+    WalkRunner,
+    reconcile_and_replay,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -2345,7 +2350,10 @@ class TestWalkModuleStaticAudit:
     deliberately no longer byte-identical to HEAD. This structural audit
     replaces the byte-equality assertion: every module must parse, no raw
     SAVEPOINT / ROLLBACK TO / RELEASE statement may remain executed through
-    ``get_connection()``, and every migrated walk must use ``storage.savepoint()``.
+    ``get_connection()``, every migrated walk must use ``storage.savepoint()``,
+    and every migrated walk must journal its writes via ``capture_undo`` (the
+    Phase 3/4 `_journal_capture` pattern) so a reserved run's mutations are
+    replayable end-to-end.
     Walk modules still never import the Part B seam (implementation imports
     forbidden). The final representative-execution test drives a
     helper-instrumented walk through the reserved runner seam and asserts the
@@ -2364,7 +2372,11 @@ class TestWalkModuleStaticAudit:
         "WalkLogSink",
         "log_service",
     )
-    #: Walks that were migrated to ``storage.savepoint()`` in Phase 3.
+    #: Walks migrated to ``storage.savepoint()`` AND journal-covered writes via
+    #: ``capture_undo`` (Phase 3 for 2b/2c/2d; Phase 4 for 2e/2f/2g/2h/2i).  These
+    #: are the modules the structural audit requires to (a) use
+    #: ``storage.savepoint()``, (b) never execute raw SAVEPOINT control through
+    #: ``get_connection()``, and (c) reference the walk_undo_entry journal.
     MIGRATED_SAVEPOINT_WALKS: ClassVar[set[str]] = {
         "2b",
         "2c",
@@ -2405,6 +2417,14 @@ class TestWalkModuleStaticAudit:
             if label in self.MIGRATED_SAVEPOINT_WALKS:
                 assert "with storage.savepoint(" in source, (
                     f"{path.name} should use storage.savepoint() after migration"
+                )
+                # Journal coverage: every migrated walk captures its writes via
+                # the walk_undo_entry journal (the _journal_capture pattern), so
+                # a reserved run's mutations are replayable.  presence of the
+                # capture_undo call is the seam the P4 instrumentation added.
+                assert "capture_undo" in source, (
+                    f"{path.name} should journal its writes via capture_undo "
+                    "(Phase 4 journal coverage)"
                 )
                 seen_migrated.add(label)
         assert seen_migrated == self.MIGRATED_SAVEPOINT_WALKS, (
@@ -2783,14 +2803,19 @@ class TestGlobalSingleActiveWalk:
 
 
 class TestRunOwnedCleanup:
-    """Regression coverage for ``_cleanup_run_owned``.
+    """Regression coverage for the retained failed-run/no-journal cleanup path.
 
-    Base on the actual tables per schema: walk_review_item (run_id + status
-    pending), character_scene_generated (source_run_id), workbench_provenance
-    (run_id). The cleanup must delete only run-Owned generated rows; protected
-    rows (later-run overwrites, manual/human/absence, resolved/superseded
-    items, NULL-run direct-call rows, alias-merge undo history) are preserved,
-    the run_history (walk_run row) is retained, and re-invoking is a no-op.
+    Plan S re-targeted cancelled/interrupted rollback to durable journal replay
+    (see TestRunJournalReplay, the parallel replay-driven class below).
+    ``_cleanup_run_owned`` now serves ONLY the failed-run policy (Plan S
+    CONTRACTS rollback): a ``failed`` run with no safely-available journal, or a
+    cancelled-before-start run that captured nothing. These tests lock the
+    delete-based cleanup against the actual tables per schema: walk_review_item
+    (run_id + status pending), character_scene_generated (source_run_id),
+    workbench_provenance (run_id). Protected rows (later-run overwrites,
+    manual/human/absence, resolved/superseded items, NULL-run direct-call rows,
+    alias-merge undo history) are preserved, walk_run history retained, and
+    re-invoking is a no-op.
     """
 
     BOOK = "11111111-2222-3333-4444-555555555555"
@@ -3042,3 +3067,973 @@ class TestRunOwnedCleanup:
             "'human', 1000)",
             (decision_id, self.BOOK),
         )
+
+
+# ---------------------------------------------------------------------------
+# P7-S3: Plan R cleanup protections carried into journal replay
+# ---------------------------------------------------------------------------
+# TestRunOwnedCleanup covered Plan R's delete-based cleanup. Since Plan S,
+# a cancelled/interrupted (or journal-backed failed) run is undone by durable
+# journal replay (_replay_and_clear) — reverse-seq with after-image/key-free/
+# reverse-FK guards — while the failed-run/no-journal policy retains
+# _cleanup_run_owned. TestRunJournalReplay re-targets the SAME protections to
+# the real rollback path: captured run writes are undone, but protected data
+# (human edits, later-run overwrites, manual/absence, NULL-run rows, alias-merge
+# history, append-only decisions) is a SUPERSET of the old delete-cleanup
+# guarantees. Each test drives storage.replay_run + clear_undo_journal, mirroring
+# WalkRunner._replay_and_clear.
+
+
+class TestRunJournalReplay:
+    """Journal replay (cancelled/interrupted rollback) protects Plan R data.
+
+    Coverage retained from TestRunOwnedCleanup, now through the journal-replay
+    path: pending review items undone; resolved/superseded items and later-run
+    overwrites preserved via after-image CAS; manual/absence tombstones and
+    NULL-run rows never touched (journal-scoped); alias-merge history retained;
+    decisions marked 'undone' never deleted; walk_run history retained.
+    """
+
+    BOOK = "11111111-2222-3333-4444-555555555555"
+    SERIES = "ser-1"
+    WALK = "walk_2b_character_discovery"
+
+    def _run(self, storage, run_id):
+        _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
+
+    def _replay(self, storage, run_id):
+        storage.replay_run(run_id)
+        storage.clear_undo_journal(run_id)
+
+    def _capture_review_insert(self, storage, run_id, item_id, status="pending"):
+        """Insert a run-owned review item AND journal its insert atomically."""
+        img = json.dumps(
+            {
+                "id": item_id,
+                "book_id": self.BOOK,
+                "run_id": run_id,
+                "kind": "instruction",
+                "status": status,
+            }
+        )
+        with storage.savepoint("cap"):
+            storage.capture_undo(
+                run_id, "walk_review_item", "insert", item_id, after_json=img
+            )
+            self._review_item(storage, item_id, run_id, status=status)
+
+    def _review_item(self, storage, item_id, run_id, status="pending"):
+        storage.execute_insert(
+            "INSERT INTO walk_review_item (id, book_id, run_id, kind, status) "
+            "VALUES (?, ?, ?, 'instruction', ?)",
+            (item_id, self.BOOK, run_id, status),
+        )
+
+    def _generated(self, storage, gid, run_id, char_id, scene_id, rev=1, conf=0.9):
+        _seed_book(storage, self.BOOK, self.SERIES)
+        _seed_character(storage, char_id)
+        _seed_scene(storage, scene_id)
+        storage.execute_insert(
+            "INSERT INTO character_scene_generated (id, book_id, character_id, "
+            "scene_id, relation_type, confidence, generation_revision, "
+            "source_run_id) VALUES (?, ?, ?, ?, 'present', ?, ?, ?)",
+            (gid, self.BOOK, char_id, scene_id, conf, rev, run_id),
+        )
+
+    def _capture_generated_insert(
+        self, storage, run_id, gid, char_id, scene_id, rev=1, conf=0.9
+    ):
+        img = json.dumps(
+            {
+                "id": gid,
+                "book_id": self.BOOK,
+                "character_id": char_id,
+                "scene_id": scene_id,
+                "relation_type": "present",
+                "confidence": conf,
+                "generation_revision": rev,
+                "source_run_id": run_id,
+            }
+        )
+        with storage.savepoint("cap"):
+            storage.capture_undo(
+                run_id, "character_scene_generated", "insert", gid, after_json=img
+            )
+            self._generated(storage, gid, run_id, char_id, scene_id, rev=rev, conf=conf)
+
+    def _provenance(self, storage, pid, run_id, rev=1, source="walk"):
+        _seed_book(storage, self.BOOK, self.SERIES)
+        storage.execute_insert(
+            "INSERT INTO workbench_provenance (provenance_id, book_id, target_kind, "
+            "target_key, run_id, generation_revision, source, created_ms) "
+            "VALUES (?, ?, 'review', 'k', ?, ?, ?, 1000)",
+            (pid, self.BOOK, run_id, rev, source),
+        )
+
+    def _capture_provenance_insert(self, storage, run_id, pid, rev=1):
+        img = json.dumps(
+            {
+                "provenance_id": pid,
+                "book_id": self.BOOK,
+                "target_kind": "review",
+                "target_key": "k",
+                "run_id": run_id,
+                "generation_revision": rev,
+                "source": "walk",
+                "created_ms": 1000,
+            }
+        )
+        with storage.savepoint("cap"):
+            storage.capture_undo(
+                run_id, "workbench_provenance", "insert", pid, after_json=img
+            )
+            self._provenance(storage, pid, run_id, rev=rev)
+
+    def _capture_decision_insert(self, storage, run_id, decision_id):
+        img = json.dumps(
+            {
+                "decision_id": decision_id,
+                "book_id": self.BOOK,
+                "target_kind": "presence",
+                "target_key": "k",
+                "decision_type": "auto",
+                "base_revision": 0,
+                "payload_json": "{}",
+                "status": "active",
+                "source": "human",
+                "created_ms": 1000,
+            }
+        )
+        with storage.savepoint("cap"):
+            storage.capture_undo(
+                run_id, "workbench_decision", "insert", decision_id, after_json=img
+            )
+            self._seed_decision(storage, decision_id)
+
+    def _seed_book_row(self, storage):
+        _seed_book(storage, self.BOOK, self.SERIES)
+
+    def _seed_decision(self, storage, decision_id):
+        _seed_book(storage, self.BOOK, self.SERIES)
+        storage.execute_insert(
+            "INSERT INTO workbench_decision (decision_id, book_id, target_kind, "
+            "target_key, decision_type, base_revision, payload_json, status, source, "
+            "created_ms) VALUES (?, ?, 'presence', 'k', 'auto', 0, '{}', 'active', "
+            "'human', 1000)",
+            (decision_id, self.BOOK),
+        )
+
+    # -- retained protections -------------------------------------------------
+
+    def test_run_inserts_undone_by_replay(self, storage):
+        run_id = str(uuid.uuid4())
+        self._run(storage, run_id)
+        self._capture_review_insert(storage, run_id, "ri-1")
+        self._capture_generated_insert(storage, run_id, "g-1", "ch-1", "sc-1")
+        self._capture_provenance_insert(storage, run_id, "prov-1")
+        self._replay(storage, run_id)
+        # The run's own inserts are undone (the cancelled-run rollback).
+        assert (
+            storage.execute_query(
+                "SELECT id FROM walk_review_item WHERE run_id = ?", (run_id,)
+            )
+            == []
+        )
+        assert (
+            storage.execute_query(
+                "SELECT id FROM character_scene_generated WHERE id = 'g-1'"
+            )
+            == []
+        )
+        assert (
+            storage.execute_query(
+                "SELECT provenance_id FROM workbench_provenance WHERE run_id = ?",
+                (run_id,),
+            )
+            == []
+        )
+
+    def test_pending_removed_resolved_and_superseded_retained(self, storage):
+        run_id = str(uuid.uuid4())
+        self._run(storage, run_id)
+        # pending: run insert -> undone by replay.
+        self._capture_review_insert(storage, run_id, "ri-pending")
+        # resolved: run inserted, then a human resolved it -> CAS divergence.
+        self._capture_review_insert(storage, run_id, "ri-resolved")
+        storage.execute_update(
+            "UPDATE walk_review_item SET status='resolved' WHERE id='ri-resolved'", ()
+        )
+        # superseded: run inserted, then a later run superseded it -> CAS skip.
+        self._capture_review_insert(storage, run_id, "ri-superseded")
+        storage.execute_update(
+            "UPDATE walk_review_item SET status='superseded' WHERE id='ri-superseded'",
+            (),
+        )
+        self._replay(storage, run_id)
+        assert (
+            storage.execute_query(
+                "SELECT id FROM walk_review_item WHERE id='ri-pending'"
+            )
+            == []
+        )
+        resolved = storage.execute_query(
+            "SELECT status FROM walk_review_item WHERE id='ri-resolved'"
+        )
+        assert resolved and resolved[0]["status"] == "resolved"
+        superseded = storage.execute_query(
+            "SELECT status FROM walk_review_item WHERE id='ri-superseded'"
+        )
+        assert superseded and superseded[0]["status"] == "superseded"
+
+    def test_later_run_overwrite_preserved(self, storage):
+        this_run = str(uuid.uuid4())
+        later_run = str(uuid.uuid4())
+        self._run(storage, this_run)
+        self._run(storage, later_run)
+        self._capture_generated_insert(
+            storage, this_run, "g-this", "ch-a", "sc-a", conf=0.9
+        )
+        # A later run overwrites the row (higher revision, different confidence).
+        storage.execute_update(
+            "UPDATE character_scene_generated SET confidence=0.2, generation_revision=2,"
+            " source_run_id=? WHERE id='g-this'",
+            (later_run,),
+        )
+        self._replay(storage, this_run)
+        remaining = storage.execute_query(
+            "SELECT id, confidence FROM character_scene_generated WHERE id='g-this'"
+        )
+        assert remaining and remaining[0]["confidence"] == 0.2  # later value kept
+
+    def test_manual_and_absence_rows_preserved(self, storage):
+        run_id = str(uuid.uuid4())
+        self._run(storage, run_id)
+        self._seed_book_row(storage)
+        self._seed_decision(storage, "dec-abs")
+        _seed_character(storage, "ch-m")
+        _seed_scene(storage, "sc-m")
+        _seed_character(storage, "ch-a")
+        _seed_scene(storage, "sc-a")
+        storage.execute_insert(
+            "INSERT INTO character_scene_manual (id, book_id, character_id, scene_id, "
+            "relation_type, decision_id) VALUES ('m-1', ?, ?, ?, 'present', 'dec-abs')",
+            (self.BOOK, "ch-m", "sc-m"),
+        )
+        storage.execute_insert(
+            "INSERT INTO character_scene_absence (book_id, scene_id, character_id, "
+            "decision_id, active, created_ms) VALUES (?, ?, ?, 'dec-abs', 1, 1000)",
+            (self.BOOK, "sc-a", "ch-a"),
+        )
+        # The run journals its OWN decision; replay touches only that one.
+        self._capture_decision_insert(storage, run_id, "dec-run")
+        self._replay(storage, run_id)
+        assert (
+            storage.execute_query(
+                "SELECT id FROM character_scene_manual WHERE id='m-1'"
+            )
+            != []
+        )
+        assert (
+            storage.execute_query(
+                "SELECT character_id FROM character_scene_absence "
+                "WHERE character_id='ch-a'"
+            )
+            != []
+        )
+        assert (
+            storage.execute_query(
+                "SELECT status FROM workbench_decision WHERE decision_id='dec-abs'"
+            )[0]["status"]
+            == "active"  # untouched
+        )
+
+    def test_null_run_direct_rows_preserved(self, storage):
+        run_id = str(uuid.uuid4())
+        self._run(storage, run_id)
+        self._seed_book_row(storage)
+        # NULL-run direct-call rows are never journaled -> replay leaves them.
+        storage.execute_insert(
+            "INSERT INTO walk_review_item (id, book_id, run_id, kind, status) "
+            "VALUES ('ri-null', ?, NULL, 'instruction', 'pending')",
+            (self.BOOK,),
+        )
+        _seed_character(storage, "ch-n")
+        _seed_scene(storage, "sc-n")
+        storage.execute_insert(
+            "INSERT INTO character_scene_generated (id, book_id, character_id, "
+            "scene_id, relation_type, confidence, generation_revision, "
+            "source_run_id) VALUES ('g-null', ?, ?, ?, 'present', 0.8, 1, NULL)",
+            (self.BOOK, "ch-n", "sc-n"),
+        )
+        storage.execute_insert(
+            "INSERT INTO workbench_provenance (provenance_id, book_id, target_kind, "
+            "target_key, run_id, generation_revision, source, created_ms) "
+            "VALUES ('prov-null', ?, 'review', 'k', NULL, 1, 'human', 1000)",
+            (self.BOOK,),
+        )
+        # The run journals a DISTINCT generated insert that replay must undo.
+        self._capture_generated_insert(storage, run_id, "g-run", "ch-r", "sc-r")
+        self._replay(storage, run_id)
+        assert (
+            storage.execute_query(
+                "SELECT id FROM character_scene_generated WHERE id='g-run'"
+            )
+            == []
+        )
+        assert (
+            storage.execute_query("SELECT id FROM walk_review_item WHERE id='ri-null'")
+            != []
+        )
+        assert (
+            storage.execute_query(
+                "SELECT id FROM character_scene_generated WHERE id='g-null'"
+            )
+            != []
+        )
+        assert (
+            storage.execute_query(
+                "SELECT provenance_id FROM workbench_provenance "
+                "WHERE provenance_id='prov-null'"
+            )
+            != []
+        )
+
+    def test_alias_merge_history_retained(self, storage):
+        run_id = str(uuid.uuid4())
+        self._run(storage, run_id)
+        self._seed_book_row(storage)
+        self._seed_decision(storage, "dec-m")
+        _seed_character(storage, "ch-can")
+        _seed_character(storage, "ch-mem")
+        # A merge row created by an EARLIER run is not in THIS run's journal.
+        storage.execute_insert(
+            "INSERT INTO character_alias_merge (merge_id, book_id, canonical_id, "
+            "member_id, merge_revision, decision_id, status, prior_member_name, "
+            "prior_member_aliases_json, consequence_json, created_ms) "
+            "VALUES ('mg-1', ?, ?, ?, 1, 'dec-m', 'active', 'Old', '[]', '{}', 1000)",
+            (self.BOOK, "ch-can", "ch-mem"),
+        )
+        self._capture_decision_insert(storage, run_id, "dec-run2")
+        self._replay(storage, run_id)
+        row = storage.execute_query(
+            "SELECT merge_id, prior_member_name, consequence_json "
+            "FROM character_alias_merge WHERE merge_id='mg-1'"
+        )
+        assert row and row[0]["prior_member_name"] == "Old"  # history intact
+
+    def test_decision_marked_undone_never_deleted(self, storage):
+        run_id = str(uuid.uuid4())
+        self._run(storage, run_id)
+        self._capture_decision_insert(storage, run_id, "d1")
+        self._replay(storage, run_id)
+        row = storage.execute_query(
+            "SELECT decision_id, status FROM workbench_decision WHERE decision_id='d1'"
+        )
+        assert row and row[0]["status"] == "undone"  # never deleted
+
+    def test_walk_run_history_retained_after_replay(self, storage):
+        run_id = str(uuid.uuid4())
+        self._run(storage, run_id)
+        self._capture_decision_insert(storage, run_id, "d-h")
+        self._replay(storage, run_id)
+        assert (
+            storage.execute_query(
+                "SELECT run_id FROM walk_run WHERE run_id = ?", (run_id,)
+            )
+            != []
+        )
+        # The journal itself is cleared after replay (mirrors _replay_and_clear).
+        assert storage.list_undo_entries(run_id) == []
+
+
+# ---------------------------------------------------------------------------
+# P7-S5 — startup reconcile / admission / runner undo-journal replay
+# ---------------------------------------------------------------------------
+
+
+class TestStartupReconcileAndReplay:
+    """P7-S5: startup reconcile_and_replay + admission-adjacent undo.
+
+    Locks Plan S contracts (CONTRACTS.md / reconcile_and_replay):
+      * a stale 'running' walk_run row (older than the grace window) is flipped
+        to 'interrupted' by ``reconcile_stale_runs`` and its durable journal is
+        then replayed + cleared;
+      * a fresh-heartbeat 'running' row is left untouched by the grace-window
+        reconcile, but ``start_of_day=True`` flips every live row (the
+        nothing-is-live-at-process-start gap) and replays it;
+      * replay runs in reverse ``seq`` order and clears the journal only after
+        it returns (crash-mid-replay is resumable: entries already restored
+        replay as no-ops);
+      * interruption is resumable across restarts — an already-'interrupted'
+        run that still holds journal rows is replayed at the next startup;
+      * terminal (non-running) rows are never flipped.
+    """
+
+    BOOK = "11111111-2222-3333-4444-555555555555"
+    WALK = "walk_2b_character_discovery"
+    GRACE_S = 5 * 60  # adapter._STALE_RUN_GRACE_MS = 5 minutes
+
+    def _aged_running_row(
+        self, storage, run_id, *, created_age_s, heartbeat_age_s=None
+    ):
+        """Insert a 'running' walk_run row with controllable age stamps.
+
+        ``None`` heartbeat_age defaults to created_age (a stale crash).
+        """
+        if heartbeat_age_s is None:
+            heartbeat_age_s = created_age_s
+        now = int(time.time() * 1000)
+        storage.execute_insert(
+            "INSERT INTO walk_run (run_id, book_id, walk_name, status, "
+            "cancel_requested, heartbeat_ms, created_ms) "
+            "VALUES (?, ?, ?, 'running', 0, ?, ?)",
+            (
+                run_id,
+                self.BOOK,
+                self.WALK,
+                now - heartbeat_age_s * 1000,
+                now - created_age_s * 1000,
+            ),
+        )
+
+    def _fresh_running_row(self, storage, run_id):
+        now = int(time.time() * 1000)
+        storage.execute_insert(
+            "INSERT INTO walk_run (run_id, book_id, walk_name, status, "
+            "cancel_requested, heartbeat_ms, created_ms) "
+            "VALUES (?, ?, ?, 'running', 0, ?, ?)",
+            (run_id, self.BOOK, self.WALK, now, now),
+        )
+
+    def _capsule_character_insert(self, storage, run_id, char_id, name="Char"):
+        """Insert a character AND journal its insert atomically (mirrors walks)."""
+        img = json.dumps({"id": char_id, "name": name})
+        with storage.savepoint("cap"):
+            storage.capture_undo(run_id, "character", "insert", char_id, after_json=img)
+            storage.execute_insert(
+                "INSERT INTO character (id, name) VALUES (?, ?)", (char_id, name)
+            )
+
+    def _capsule_character_update(self, storage, run_id, char_id, before, after):
+        """Update a character AND journal its update atomically."""
+        storage.execute_insert(
+            "INSERT INTO character (id, name) VALUES (?, ?)", (char_id, before)
+        )
+        bimg = json.dumps({"id": char_id, "name": before})
+        aimg = json.dumps({"id": char_id, "name": after})
+        with storage.savepoint("cap"):
+            storage.capture_undo(
+                run_id,
+                "character",
+                "update",
+                char_id,
+                before_json=bimg,
+                after_json=aimg,
+            )
+            storage.execute_update(
+                "UPDATE character SET name = ? WHERE id = ?", (after, char_id)
+            )
+
+    def _char_name(self, storage, char_id):
+        rows = storage.execute_query(
+            "SELECT name FROM character WHERE id = ?", (char_id,)
+        )
+        return rows[0]["name"] if rows else None
+
+    # -- startup reconcile ---------------------------------------------------
+
+    def test_stale_crash_run_flipped_and_journal_replayed(self, storage):
+        run_id = str(uuid.uuid4())
+        self._aged_running_row(storage, run_id, created_age_s=self.GRACE_S + 60)
+        self._capsule_character_insert(storage, run_id, "c-stale")
+        result = reconcile_and_replay(storage)
+        assert result["reconcile"]["walk_run"] == 1
+        # Flipped to interrupted, journal replayed (character undone) + cleared.
+        rows = storage.execute_query(
+            "SELECT status FROM walk_run WHERE run_id = ?", (run_id,)
+        )
+        assert rows[0]["status"] == "interrupted"
+        assert self._char_name(storage, "c-stale") is None
+        assert storage.list_undo_entries(run_id) == []
+        assert run_id in result["replays"]
+
+    def test_fresh_heartbeat_running_row_not_flipped_without_start_of_day(
+        self, storage
+    ):
+        run_id = str(uuid.uuid4())
+        # Old created_ms but a FRESH heartbeat: still live, must not be flipped.
+        self._aged_running_row(
+            storage, run_id, created_age_s=self.GRACE_S + 60, heartbeat_age_s=1
+        )
+        self._capsule_character_insert(storage, run_id, "c-fresh")
+        result = reconcile_and_replay(storage)
+        assert result["reconcile"]["walk_run"] == 0
+        rows = storage.execute_query(
+            "SELECT status FROM walk_run WHERE run_id = ?", (run_id,)
+        )
+        assert rows[0]["status"] == "running"
+        # Journal untouched — the row is not interrupted so nothing to replay.
+        assert len(storage.list_undo_entries(run_id)) == 1
+        assert run_id not in result["replays"]
+
+    def test_start_of_day_flips_fresh_heartbeat_and_replays(self, storage):
+        run_id = str(uuid.uuid4())
+        self._fresh_running_row(storage, run_id)
+        self._capsule_character_insert(storage, run_id, "c-sod")
+        result = reconcile_and_replay(storage, start_of_day=True)
+        rows = storage.execute_query(
+            "SELECT status FROM walk_run WHERE run_id = ?", (run_id,)
+        )
+        assert rows[0]["status"] == "interrupted"
+        assert run_id in result["flipped_fresh_heartbeat"]
+        assert self._char_name(storage, "c-sod") is None
+        assert storage.list_undo_entries(run_id) == []
+
+    def test_terminal_rows_never_flipped(self, storage):
+        run_id = str(uuid.uuid4())
+        storage.execute_insert(
+            "INSERT INTO walk_run (run_id, book_id, walk_name, status, "
+            "cancel_requested, heartbeat_ms, created_ms) "
+            "VALUES (?, ?, ?, 'completed', 0, ?, ?)",
+            (
+                run_id,
+                self.BOOK,
+                self.WALK,
+                int(time.time() * 1000) - (self.GRACE_S + 120) * 1000,
+                int(time.time() * 1000) - (self.GRACE_S + 120) * 1000,
+            ),
+        )
+        result = reconcile_and_replay(storage)
+        assert result["reconcile"]["walk_run"] == 0
+        rows = storage.execute_query(
+            "SELECT status FROM walk_run WHERE run_id = ?", (run_id,)
+        )
+        assert rows[0]["status"] == "completed"
+
+    # -- replay semantics ----------------------------------------------------
+
+    def test_replay_runs_in_reverse_seq_order(self, storage):
+        """startup replay restores entries newest-first (reverse seq)."""
+        run_id = str(uuid.uuid4())
+        self._aged_running_row(storage, run_id, created_age_s=self.GRACE_S + 60)
+        # seq0: insert c-old. seq1: update c-later M->N. Reverse replay undoes
+        # the update first (restores M), then deletes the insert (c-old gone).
+        self._capsule_character_insert(storage, run_id, "c-old", name="Base")
+        self._capsule_character_update(
+            storage, run_id, "c-later", before="M", after="N"
+        )
+        reconcile_and_replay(storage)
+        assert storage.list_undo_entries(run_id) == []
+        assert self._char_name(storage, "c-old") is None
+        assert self._char_name(storage, "c-later") == "M"
+
+    def test_already_interrupted_run_still_holding_journal_is_replayed(self, storage):
+        """Crash-mid-replay resumability: across a restart an interrupted run
+        that still holds journal rows is replayed and cleared again."""
+        run_id = str(uuid.uuid4())
+        storage.execute_insert(
+            "INSERT INTO walk_run (run_id, book_id, walk_name, status, "
+            "cancel_requested, heartbeat_ms, created_ms) "
+            "VALUES (?, ?, ?, 'interrupted', 0, ?, ?)",
+            (
+                run_id,
+                self.BOOK,
+                self.WALK,
+                1,
+                int(time.time() * 1000) - (self.GRACE_S + 60) * 1000,
+            ),
+        )
+        self._capsule_character_insert(storage, run_id, "c-resume")
+        result = reconcile_and_replay(storage)
+        assert run_id in result["replays"]
+        assert self._char_name(storage, "c-resume") is None
+        assert storage.list_undo_entries(run_id) == []
+
+    # -- admission-adjacent: active cancellation / BaseException / blocking --
+
+    def test_active_cancellation_finish_replays_journal(self, storage):
+        """_finish_run(status='cancelled') on a journal-backed running row
+        replays the journal (mutations undone) and terminalizes the row."""
+        run_id = str(uuid.uuid4())
+        self._fresh_running_row(storage, run_id)
+        self._capsule_character_insert(storage, run_id, "c-can")
+        runner = WalkRunner(storage)
+        runner._finish_run(
+            run_id,
+            self.BOOK,
+            self.WALK,
+            "cancelled",
+            error="cancelled",
+            emit_terminal=False,
+        )
+        rows = storage.execute_query(
+            "SELECT status FROM walk_run WHERE run_id = ?", (run_id,)
+        )
+        assert rows[0]["status"] == "cancelled"
+        assert self._char_name(storage, "c-can") is None
+        assert storage.list_undo_entries(run_id) == []
+
+    def test_base_exception_interrupted_finish_replays_journal(self, storage):
+        """_finish_run(status='interrupted') (a BaseException-process-kill
+        path) replays the journal before finalizing."""
+        run_id = str(uuid.uuid4())
+        self._fresh_running_row(storage, run_id)
+        self._capsule_character_insert(storage, run_id, "c-kill")
+        runner = WalkRunner(storage)
+        runner._finish_run(
+            run_id,
+            self.BOOK,
+            self.WALK,
+            "interrupted",
+            error="interrupted",
+            emit_terminal=False,
+        )
+        rows = storage.execute_query(
+            "SELECT status FROM walk_run WHERE run_id = ?", (run_id,)
+        )
+        assert rows[0]["status"] == "interrupted"
+        assert self._char_name(storage, "c-kill") is None
+        assert storage.list_undo_entries(run_id) == []
+
+    def test_replay_completes_before_gate_released_for_replacement(self, storage):
+        """Replay runs while the row is still 'running' (gate held); a
+        replacement run for another book is admitted only after the row is
+        finalized terminal."""
+        run_id = str(uuid.uuid4())
+        self._fresh_running_row(storage, run_id)
+        self._capsule_character_insert(storage, run_id, "c-blocked")
+
+        seen_gating = {}
+
+        real_replay = storage.replay_run
+
+        def recording_replay(rid):
+            # While _finish_run calls replay_run, the implementing row must
+            # STILL be 'running' — the gate is held throughout the replay.
+            rows = storage.execute_query(
+                "SELECT status FROM walk_run WHERE run_id = ?", (rid,)
+            )
+            seen_gating["status_during_replay"] = rows[0]["status"]
+            seen_gating["journal_still_held"] = len(storage.list_undo_entries(rid)) == 1
+            return real_replay(rid)
+
+        runner = WalkRunner(storage)
+        with patch.object(type(storage), "replay_run", side_effect=recording_replay):
+            runner._finish_run(
+                run_id,
+                self.BOOK,
+                self.WALK,
+                "cancelled",
+                error="cancelled",
+                emit_terminal=False,
+            )
+        assert seen_gating["status_during_replay"] == "running"
+        assert seen_gating["journal_still_held"] is True
+        rows = storage.execute_query(
+            "SELECT status FROM walk_run WHERE run_id = ?", (run_id,)
+        )
+        assert rows[0]["status"] == "cancelled"
+        assert storage.list_undo_entries(run_id) == []
+
+
+class TestFailedRunJournalReplay:
+    """P8-S4: failed-run rollback policy.
+
+    A failed run WITH a safely available ``walk_undo_entry`` journal replays
+    before finalization (reverse-seq inserts/updates undone), while a failed run
+    with NO journal retains Plan R's ``_cleanup_run_owned`` delete-based cleanup.
+    ``walk_run`` history is retained in BOTH paths.
+    """
+
+    BOOK = "11111111-2222-3333-4444-555555555555"
+    SERIES = "ser-1"
+    WALK = "walk_2b_character_discovery"
+
+    def _fail(self, storage, run_id, *, with_journal):
+        _seed_book(storage, self.BOOK, self.SERIES)
+        _insert_running_row(storage, run_id, self.BOOK, self.WALK)
+        if with_journal:
+            # A journaled run-created insert that replay must undo.
+            with storage.savepoint("cap"):
+                img = json.dumps({"id": "c-fail"})
+                storage.capture_undo(
+                    run_id, "character", "insert", "c-fail", after_json=img
+                )
+                storage.execute_insert(
+                    "INSERT INTO character (id, name) VALUES ('c-fail', 'X')", ()
+                )
+        else:
+            # Plan R style: a run-owned pending review item with NO journal.
+            storage.execute_insert(
+                "INSERT INTO walk_review_item (id, book_id, run_id, kind, status) "
+                "VALUES ('ri-fail', ?, ?, 'instruction', 'pending')",
+                (self.BOOK, run_id),
+            )
+        runner = WalkRunner(storage)
+        runner._finish_run(
+            run_id,
+            self.BOOK,
+            self.WALK,
+            "failed",
+            error="boom",
+            emit_terminal=False,
+        )
+
+    def test_failed_run_with_journal_replays_before_finalization(self, storage):
+        run_id = str(uuid.uuid4())
+        self._fail(storage, run_id, with_journal=True)
+        # The run-created insert was undone by journal replay, not left behind.
+        assert storage.execute_query("SELECT id FROM character WHERE id='c-fail'") == []
+        # Journal cleared and the row terminalized failed with history retained.
+        assert storage.list_undo_entries(run_id) == []
+        rows = storage.execute_query(
+            "SELECT status FROM walk_run WHERE run_id = ?", (run_id,)
+        )
+        assert rows and rows[0]["status"] == "failed"
+        assert (
+            storage.execute_query(
+                "SELECT run_id FROM walk_run WHERE run_id = ?", (run_id,)
+            )
+            != []
+        )
+
+    def test_failed_run_without_journal_retains_plan_r_cleanup(self, storage):
+        run_id = str(uuid.uuid4())
+        self._fail(storage, run_id, with_journal=False)
+        # Plan R _cleanup_run_owned removed the run-owned pending review item.
+        assert (
+            storage.execute_query("SELECT id FROM walk_review_item WHERE id='ri-fail'")
+            == []
+        )
+        # No journal was involved and the row terminalized failed.
+        assert storage.list_undo_entries(run_id) == []
+        rows = storage.execute_query(
+            "SELECT status FROM walk_run WHERE run_id = ?", (run_id,)
+        )
+        assert rows and rows[0]["status"] == "failed"
+        # walk_run history retained in the no-journal fallback too.
+        assert (
+            storage.execute_query(
+                "SELECT run_id FROM walk_run WHERE run_id = ?", (run_id,)
+            )
+            != []
+        )
+
+
+class TestRunAllActiveChildJournalReplay:
+    """P8-S7: run_all cancellation replays ONLY the active child's journal.
+
+    When the active child of a run_all batch is cancelled mid-execution while
+    holding a journal, ONLY its journal is replayed + cleared before
+    finalization; pending siblings (with or without their own journals) are NOT
+    replayed and their journals (if any) are left untouched — each sibling is
+    terminalized per the run_all abort semantics.
+    """
+
+    BOOK = "11111111-2222-3333-4444-555555555555"
+    SERIES = "ser-1"
+
+    def _insert_reserved_rows(self, storage, reservations):
+        for walk_name, run_id in reservations:
+            _insert_pending_row(storage, run_id, self.BOOK, walk_name)
+
+    def test_run_all_replays_only_active_child_journal(self, storage):
+        _seed_book(storage, self.BOOK, self.SERIES)
+        reservations = [(w, str(uuid.uuid4())) for w in WALK_ORDER]
+        active_run_id = reservations[0][1]  # WALK_ORDER[0] = the active child
+        # A pending sibling ALSO holds a journal — it must NOT be replayed.
+        sibling_journal_run_id = reservations[3][1]
+        self._insert_reserved_rows(storage, reservations)
+
+        # Active child journals a character insert that replay must undo.
+        with storage.savepoint("cap"):
+            storage.capture_undo(
+                active_run_id,
+                "character",
+                "insert",
+                "c-act",
+                after_json=json.dumps({"id": "c-act"}),
+            )
+            storage.execute_insert(
+                "INSERT INTO character (id, name) VALUES ('c-act', 'A')", ()
+            )
+        # Pending sibling's own journal — must remain untouched.
+        with storage.savepoint("cap"):
+            storage.capture_undo(
+                sibling_journal_run_id,
+                "character",
+                "insert",
+                "c-sib",
+                after_json=json.dumps({"id": "c-sib"}),
+            )
+            storage.execute_insert(
+                "INSERT INTO character (id, name) VALUES ('c-sib', 'S')", ()
+            )
+
+        runner = WalkRunner(storage)
+
+        def execute_fn(book_id, hbs, config):
+            # The active child is cancelled mid-execution (after writing).
+            raise WalkCancelledError()
+
+        mock_module = _make_mock_walk_module(execute_fn)
+        batch_id = str(uuid.uuid4())
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
+            results = runner.run_all_walks_reserved(
+                batch_id, reservations, self.BOOK, {}
+            )
+
+        # Active child: cancelled, its journal REVERSED+cleared, insert undone.
+        assert results[WALK_ORDER[0]]["status"] == "cancelled"
+        assert storage.execute_query("SELECT id FROM character WHERE id='c-act'") == []
+        assert storage.list_undo_entries(active_run_id) == []
+
+        # Pending sibling with its own journal: NOT replayed, journal intact.
+        assert len(storage.list_undo_entries(sibling_journal_run_id)) == 1
+        assert storage.execute_query("SELECT id FROM character WHERE id='c-sib'") != []
+
+        # Each sibling terminalized per run_all abort semantics (no replay).
+        rows = storage.execute_query(
+            "SELECT walk_name, status FROM walk_run WHERE book_id = ?", (self.BOOK,)
+        )
+        by_name = {r["walk_name"]: r["status"] for r in rows}
+        assert by_name[WALK_ORDER[0]] == "cancelled"
+        for w in WALK_ORDER[1:]:
+            assert by_name[w] == "cancelled"
+
+
+# ---------------------------------------------------------------------------
+# P7-S5 — admission wiring: run_walk_reserved replays leftover interrupted journals
+# ---------------------------------------------------------------------------
+
+
+class TestAdmissionReconcileWiring:
+    """P7-S5: the `reconcile_and_replay` admission hook (runner.py:849) is wired.
+
+    ``run_walk_reserved`` replays and clears any leftover 'interrupted' run's
+    durable undo journal BEFORE admitting a replacement writer on the same book.
+    These tests drive the REAL ``run_walk_reserved`` seam — they never call
+    ``reconcile_and_replay`` directly — so deleting the admission hook (the
+    ``reconcile_and_replay(self._storage)`` call at runner.py:849) would fail
+    the primary test: the leftover journal would survive and its mutation would
+    not be undone, even though the new run still completes.
+    """
+
+    BOOK = "11111111-2222-3333-4444-555555555555"
+    WALK = "walk_2b_character_discovery"
+
+    def _seed_book(self, storage):
+        """Ambient book row the runs belong to (mirrors populate._insert_series_and_book)."""
+        storage.execute_insert(
+            "INSERT OR IGNORE INTO series (id) VALUES (?)", ("s-admission",)
+        )
+        storage.execute_insert(
+            "INSERT OR IGNORE INTO book (id, series_id, book_number, version, position) "
+            "VALUES (?, ?, 1, 1, 1)",
+            (self.BOOK, "s-admission"),
+        )
+
+    def _interrupted_row(self, storage, run_id):
+        """A leftover 'interrupted' walk_run row (terminal, journal still held)."""
+        now = int(time.time() * 1000)
+        storage.execute_insert(
+            "INSERT INTO walk_run (run_id, book_id, walk_name, status, "
+            "cancel_requested, heartbeat_ms, created_ms) "
+            "VALUES (?, ?, ?, 'interrupted', 0, ?, ?)",
+            (run_id, self.BOOK, self.WALK, now, now),
+        )
+
+    def _capsule_character_insert(self, storage, run_id, char_id, name="Leak"):
+        """Insert a character AND journal its insert atomically (mirrors walks)."""
+        img = json.dumps({"id": char_id, "name": name})
+        with storage.savepoint("cap"):
+            storage.capture_undo(run_id, "character", "insert", char_id, after_json=img)
+            storage.execute_insert(
+                "INSERT INTO character (id, name) VALUES (?, ?)", (char_id, name)
+            )
+
+    def _runner(self, storage):
+        return WalkRunner(storage, log_service=_FakeLogService())
+
+    def test_admission_replays_leftover_interrupted_journal(self, storage):
+        """A leftover interrupted run's journal is replayed+cleared before a
+        replacement writer is admitted (drive the real run_walk_reserved seam)."""
+        self._seed_book(storage)
+        leftover = "run-leak"
+        self._interrupted_row(storage, leftover)
+        self._capsule_character_insert(storage, leftover, "c-leak")
+        # Sanity: the leftover journal exists before admission.
+        assert len(storage.list_undo_entries(leftover)) == 1
+
+        run_id = str(uuid.uuid4())
+        _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
+        runner = self._runner(storage)
+        mock_module = _make_mock_walk_module(
+            lambda book_id, hbs, config: {"status": "completed"}
+        )
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
+            result = runner.run_walk_reserved(run_id, self.WALK, self.BOOK, {})
+        assert result["status"] == "completed"
+
+        # Journal cleared at admission.
+        assert storage.list_undo_entries(leftover) == []
+        # Replay undid the leftover insert — the character is gone.
+        rows = storage.execute_query(
+            "SELECT name FROM character WHERE id = ?", ("c-leak",)
+        )
+        assert rows == []
+        # The new run executed and finalized 'completed'.
+        rows = storage.execute_query(
+            "SELECT status FROM walk_run WHERE run_id = ?", (run_id,)
+        )
+        assert rows[0]["status"] == "completed"
+
+    def test_admission_leaves_fresh_running_leftover_untouched(self, storage):
+        """On the same book-gate path, a FRESH 'running' leftover row (not
+        interrupted) is left untouched by the admission hook — it is neither
+        flipped nor journal-replayed, so its mutation survives."""
+        self._seed_book(storage)
+        live = "run-live"
+        now = int(time.time() * 1000)
+        storage.execute_insert(
+            "INSERT INTO walk_run (run_id, book_id, walk_name, status, "
+            "cancel_requested, heartbeat_ms, created_ms) "
+            "VALUES (?, ?, ?, 'running', 0, ?, ?)",
+            (live, self.BOOK, self.WALK, now, now),
+        )
+        self._capsule_character_insert(storage, live, "c-live", name="Live")
+
+        run_id = str(uuid.uuid4())
+        _insert_pending_row(storage, run_id, self.BOOK, self.WALK)
+        runner = self._runner(storage)
+        mock_module = _make_mock_walk_module(
+            lambda book_id, hbs, config: {"status": "completed"}
+        )
+        with (
+            patch.object(WalkRunner, "_load_walk_module", return_value=mock_module),
+            patch.object(WalkRunner, "_run_verification", return_value=True),
+        ):
+            result = runner.run_walk_reserved(run_id, self.WALK, self.BOOK, {})
+
+        # Grace-based admission (start_of_day=False) never flips a fresh running
+        # row and never replays it: status unchanged, journal intact, mutation kept.
+        rows = storage.execute_query(
+            "SELECT status FROM walk_run WHERE run_id = ?", (live,)
+        )
+        assert rows[0]["status"] == "running"
+        assert len(storage.list_undo_entries(live)) == 1
+        rows = storage.execute_query(
+            "SELECT name FROM character WHERE id = ?", ("c-live",)
+        )
+        assert rows[0]["name"] == "Live"
+        # The live writer is a single-active-walk gate collision, so the new run
+        # is deterministically refused (fresh running row is NOT the admission
+        # reconcile's job to clear).
+        assert result["status"] == "failed"
+        assert "Another walk is already running" in result["error"]

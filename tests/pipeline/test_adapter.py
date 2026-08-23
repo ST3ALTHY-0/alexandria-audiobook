@@ -2884,3 +2884,655 @@ class TestSQLiteAdapterSnapshotMethods:
             assert row["created_ms"] == 1000
         finally:
             adapter2.close()
+
+
+# ---------------------------------------------------------------------------
+# Plan S Phase 2 — walk_undo_entry journal primitives (both adapters)
+# ---------------------------------------------------------------------------
+
+
+class TestWalkUndoJournal:
+    """Journal capture + guarded replay primitives, verified on both adapters.
+
+    Comprehensive replay/walk coverage is Phase 7; these focused tests prove
+    the Phase 2 primitives: capture atomicity, reversed replay, after-image
+    CAS skips, key-free skips, rowid restoration, and decision undo-marking.
+    """
+
+    def _ensure_run(self, adapter, run_id):
+        adapter.execute_insert(
+            "INSERT INTO walk_run (run_id, status) VALUES (?, 'running')",
+            (run_id,),
+        )
+
+    def _insert(self, adapter, run_id, cid, name, op="insert"):
+        img = json.dumps(
+            {
+                "id": cid,
+                "name": name,
+                "aliases": "[]",
+                "voice_assignment_id": None,
+                "description": None,
+            }
+        )
+        with adapter.savepoint("sp"):
+            adapter.capture_undo(
+                run_id, "character", op, cid, after_json=img if op == "insert" else None
+            )
+            adapter.execute_insert(
+                "INSERT INTO character (id, name, aliases) VALUES (?, ?, '[]')",
+                (cid, name),
+            )
+
+    def test_insert_replay_deletes_row(self, sqlite_adapter, memory_adapter):
+        for adapter in (sqlite_adapter, memory_adapter):
+            self._ensure_run(adapter, "r")
+            self._insert(adapter, "r", "c1", "Alice")
+            assert adapter.execute_query("SELECT id FROM character WHERE id='c1'") == [
+                {"id": "c1"}
+            ]
+            res = adapter.replay_run("r")
+            assert res["replayed"] == 1 and res["skipped"] == 0
+            assert adapter.execute_query("SELECT id FROM character WHERE id='c1'") == []
+
+    def test_capture_is_atomic_with_mutation(self, sqlite_adapter, memory_adapter):
+        """A raise inside the savepoint rolls back BOTH data and journal."""
+        for adapter in (sqlite_adapter, memory_adapter):
+            self._ensure_run(adapter, "r")
+            with pytest.raises(RuntimeError), adapter.savepoint("sp"):
+                adapter.capture_undo(
+                    "r",
+                    "character",
+                    "insert",
+                    "cat",
+                    after_json=json.dumps(
+                        {
+                            "id": "cat",
+                            "name": "Cat",
+                            "aliases": "[]",
+                            "voice_assignment_id": None,
+                            "description": None,
+                        }
+                    ),
+                )
+                adapter.execute_insert(
+                    "INSERT INTO character (id,name,aliases) VALUES ('cat','Cat','[]')",
+                    (),
+                )
+                raise RuntimeError("rollback")
+            assert (
+                adapter.execute_query("SELECT id FROM character WHERE id='cat'") == []
+            )
+            assert adapter.list_undo_entries("r") == []
+
+    def test_allowlist_rejected(self, sqlite_adapter, memory_adapter):
+        for adapter in (sqlite_adapter, memory_adapter):
+            with pytest.raises(ValueError):
+                adapter.capture_undo("r", "book", "insert", "b1")
+
+    def test_idempotent_replay(self, sqlite_adapter, memory_adapter):
+        for adapter in (sqlite_adapter, memory_adapter):
+            self._ensure_run(adapter, "r")
+            self._insert(adapter, "r", "c1", "A")
+            first = adapter.replay_run("r")
+            second = adapter.replay_run("r")
+            assert first["replayed"] == 1 and second["replayed"] == 1
+
+    def test_rowid_restoration_on_delete_undo(self, sqlite_adapter, memory_adapter):
+        for adapter in (sqlite_adapter, memory_adapter):
+            self._ensure_run(adapter, "r")
+            adapter.execute_insert(
+                "INSERT INTO character (id,name,aliases) VALUES ('cx','CX','[]')", ()
+            )
+            adapter.execute_insert("INSERT INTO scene (id) VALUES ('sx')", ())
+            adapter.execute_insert(
+                "INSERT INTO character_scene (character_id, scene_id,"
+                " relation_type, source, confidence, human_override)"
+                " VALUES ('cx','sx','present','walk',0.9,0)",
+                (),
+            )
+            rid = adapter.execute_query(
+                "SELECT rowid FROM character_scene WHERE character_id='cx'"
+            )[0]["rowid"]
+            img = json.dumps(
+                {
+                    "character_id": "cx",
+                    "scene_id": "sx",
+                    "relation_type": "present",
+                    "source": "walk",
+                    "confidence": 0.9,
+                    "human_override": 0,
+                }
+            )
+            with adapter.savepoint("sp"):
+                adapter.capture_undo(
+                    "r", "character_scene", "delete", str(rid), before_json=img
+                )
+                adapter.execute_delete(
+                    "DELETE FROM character_scene WHERE rowid=?", (rid,)
+                )
+            res = adapter.replay_run("r")
+            assert res["replayed"] == 1
+            restored = adapter.execute_query(
+                "SELECT rowid FROM character_scene WHERE character_id='cx'"
+            )
+            assert restored and restored[0]["rowid"] == rid
+
+    def test_rowid_projection_delete_capture_replays(
+        self, sqlite_adapter, memory_adapter
+    ):
+        """A DELETE captured from a real ``SELECT rowid, ...`` projection replays
+        and restores the original rowid.
+
+        The walk journeys the before-image with the ``rowid`` key STRIPPED (the
+        image invariant: ``_read_row`` reads via ``SELECT *`` and ``_image_equiv``
+        requires every recorded key to match the live row).  This test captures
+        via a real rowid-laden projection, strips the ``rowid`` key exactly as the
+        walks' ``_junction_image``/``_span_image`` helpers do, then replays and
+        asserts the row is restored at its ORIGINAL rowid.
+        """
+        for adapter in (sqlite_adapter, memory_adapter):
+            self._ensure_run(adapter, "r")
+            adapter.execute_insert(
+                "INSERT INTO character (id, name, aliases) VALUES ('cx','CX','[]')", ()
+            )
+            adapter.execute_insert("INSERT INTO scene (id) VALUES ('sx')", ())
+            adapter.execute_insert(
+                "INSERT INTO character_scene (character_id, scene_id,"
+                " relation_type, source, confidence, human_override)"
+                " VALUES ('cx','sx','present','walk',0.9,0)",
+                (),
+            )
+            rid = adapter.execute_query(
+                "SELECT rowid FROM character_scene WHERE character_id='cx'"
+            )[0]["rowid"]
+            # Real rowid-laden projection, exactly as walk_2c/_2d select the row.
+            row = adapter.execute_query(
+                "SELECT rowid, character_id, scene_id, relation_type, source,"
+                " confidence, human_override FROM character_scene WHERE rowid=?",
+                (rid,),
+            )[0]
+            image = {k: v for k, v in dict(row).items() if k != "rowid"}
+            with adapter.savepoint("sp"):
+                adapter.capture_undo(
+                    "r",
+                    "character_scene",
+                    "delete",
+                    str(rid),
+                    before_json=json.dumps(image),
+                )
+                adapter.execute_delete(
+                    "DELETE FROM character_scene WHERE rowid=?", (rid,)
+                )
+            res = adapter.replay_run("r")
+            assert res["conflicts"] == 0
+            assert res["replayed"] == 1
+            restored = adapter.execute_query(
+                "SELECT rowid, character_id FROM character_scene WHERE character_id='cx'"
+            )
+            assert restored and restored[0]["rowid"] == rid
+            assert restored[0]["character_id"] == "cx"
+
+    def test_update_without_before_image_skips(self, sqlite_adapter, memory_adapter):
+        """An update entry with no before-image is a per-entry skip (never raises),
+        leaving the row untouched rather than aborting the whole run's replay."""
+        for adapter in (sqlite_adapter, memory_adapter):
+            self._ensure_run(adapter, "r")
+            adapter.execute_insert(
+                "INSERT INTO character (id, name, aliases) VALUES ('c1','A','[]')", ()
+            )
+            with adapter.savepoint("sp"):
+                adapter.capture_undo(
+                    "r",
+                    "character",
+                    "update",
+                    "c1",
+                    after_json=json.dumps(
+                        {
+                            "id": "c1",
+                            "name": "A",
+                            "aliases": "[]",
+                            "voice_assignment_id": None,
+                            "description": None,
+                        }
+                    ),
+                )
+            res = adapter.replay_run("r")
+            # No-before update cannot restore; must skip, never raise / abort.
+            assert res["skipped"] == 1
+            assert res["replayed"] == 0
+            # The row is untouched (still present, name unchanged).
+            rows = adapter.execute_query("SELECT id, name FROM character WHERE id='c1'")
+            assert rows == [{"id": "c1", "name": "A"}]
+
+    def test_decision_marked_undone_never_deleted(self, sqlite_adapter, memory_adapter):
+        for adapter in (sqlite_adapter, memory_adapter):
+            self._ensure_run(adapter, "r")
+            adapter.execute_insert("INSERT INTO series (id) VALUES ('se')", ())
+            adapter.execute_insert(
+                "INSERT INTO book (id, series_id) VALUES ('b1','se')", ()
+            )
+            img = json.dumps(
+                {
+                    "decision_id": "d1",
+                    "book_id": "b1",
+                    "target_kind": "presence",
+                    "target_key": "x",
+                    "decision_type": "t",
+                    "base_revision": 0,
+                    "payload_json": "{}",
+                    "status": "active",
+                    "source": "generated",
+                    "created_ms": 1,
+                    "undone_by": None,
+                    "supersedes_id": None,
+                }
+            )
+            with adapter.savepoint("sp"):
+                adapter.capture_undo(
+                    "r", "workbench_decision", "insert", "d1", after_json=img
+                )
+                adapter.execute_insert(
+                    "INSERT INTO workbench_decision (decision_id, book_id,"
+                    " target_kind, target_key, decision_type, base_revision,"
+                    " payload_json, status, source, created_ms)"
+                    " VALUES ('d1','b1','presence','x','t',0,'{}','active',"
+                    " 'generated',1)",
+                    (),
+                )
+            res = adapter.replay_run("r")
+            assert res["replayed"] == 1
+            row = adapter.execute_query(
+                "SELECT status FROM workbench_decision WHERE decision_id='d1'"
+            )
+            assert row and row[0]["status"] == "undone"
+
+    # -- P7-S2: extended replay / atomicity coverage --------------------------
+
+    def test_sequence_allocation_is_monotonic(self, sqlite_adapter, memory_adapter):
+        for adapter in (sqlite_adapter, memory_adapter):
+            self._ensure_run(adapter, "r")
+            assert adapter.next_undo_seq("r") == 0
+            seq1 = adapter.capture_undo(
+                "r",
+                "character",
+                "insert",
+                "s1",
+                after_json=json.dumps({"id": "s1", "name": "S1", "aliases": "[]"}),
+            )
+            seq2 = adapter.capture_undo(
+                "r",
+                "character",
+                "insert",
+                "s2",
+                after_json=json.dumps({"id": "s2", "name": "S2", "aliases": "[]"}),
+            )
+            assert seq1 == 0 and seq2 == 1
+            assert adapter.next_undo_seq("r") == 2
+
+    def test_nested_savepoint_capture_atomic(self, sqlite_adapter, memory_adapter):
+        for adapter in (sqlite_adapter, memory_adapter):
+            self._ensure_run(adapter, "r")
+            with pytest.raises(RuntimeError), adapter.transaction():
+                adapter.capture_undo(
+                    "r",
+                    "character",
+                    "insert",
+                    "nm",
+                    after_json=json.dumps({"id": "nm", "name": "NM", "aliases": "[]"}),
+                )
+                with adapter.savepoint("inner"):
+                    adapter.execute_insert(
+                        "INSERT INTO character (id,name,aliases)"
+                        " VALUES ('nm','NM','[]')",
+                        (),
+                    )
+                # A raise in the OUTER transaction rolls back inner + journal.
+                raise RuntimeError("outer rollback")
+            assert adapter.execute_query("SELECT id FROM character WHERE id='nm'") == []
+            assert adapter.list_undo_entries("r") == []
+
+    def test_base_exception_rolls_back_journal_and_mutation(
+        self, sqlite_adapter, memory_adapter
+    ):
+        for adapter in (sqlite_adapter, memory_adapter):
+            self._ensure_run(adapter, "r")
+            with pytest.raises(SystemExit), adapter.savepoint("sp"):
+                adapter.capture_undo(
+                    "r",
+                    "character",
+                    "insert",
+                    "bx",
+                    after_json=json.dumps({"id": "bx", "name": "BX", "aliases": "[]"}),
+                )
+                adapter.execute_insert(
+                    "INSERT INTO character (id,name,aliases) VALUES ('bx','BX','[]')",
+                    (),
+                )
+                raise SystemExit(3)
+            assert adapter.execute_query("SELECT id FROM character WHERE id='bx'") == []
+            assert adapter.list_undo_entries("r") == []
+
+    def test_set_based_multirow_capture(self, sqlite_adapter, memory_adapter):
+        """Pre-captured per-row images + one set-based DELETE replay fully."""
+        for adapter in (sqlite_adapter, memory_adapter):
+            self._ensure_run(adapter, "r")
+            adapter.execute_insert("INSERT INTO scene (id) VALUES ('s1')", ())
+            adapter.execute_insert("INSERT INTO scene (id) VALUES ('s2')", ())
+            for cid, sid in (("ca", "s1"), ("cb", "s1"), ("cc", "s2")):
+                adapter.execute_insert(
+                    "INSERT INTO character (id,name,aliases) VALUES (?, ?, '[]')",
+                    (cid, cid),
+                )
+                adapter.execute_insert(
+                    "INSERT INTO character_scene"
+                    " (character_id, scene_id, relation_type, source,"
+                    "  confidence, human_override)"
+                    " VALUES (?,?, 'present', 'human', 1.0, 1)",
+                    (cid, sid),
+                )
+            rowids = {
+                r["character_id"]: r["rowid"]
+                for r in adapter.execute_query(
+                    "SELECT rowid, character_id FROM character_scene"
+                )
+            }
+            # Capture each junction before the set-based DELETE.
+            for cid, rid in rowids.items():
+                with adapter.savepoint("cap"):
+                    adapter.capture_undo(
+                        "r",
+                        "character_scene",
+                        "delete",
+                        str(rid),
+                        before_json=json.dumps(
+                            {
+                                "character_id": cid,
+                                "scene_id": "s1" if cid != "cc" else "s2",
+                                "relation_type": "present",
+                                "source": "human",
+                                "confidence": 1.0,
+                                "human_override": 1,
+                            }
+                        ),
+                    )
+            adapter.execute_delete(
+                "DELETE FROM character_scene WHERE scene_id IN ('s1','s2')", ()
+            )
+            assert (
+                adapter.execute_query("SELECT COUNT(*) c FROM character_scene")[0]["c"]
+                == 0
+            )
+            res = adapter.replay_run("r")
+            assert res["replayed"] == 3 and res["skipped"] == 0
+            rows = adapter.execute_query(
+                "SELECT rowid, character_id FROM character_scene"
+            )
+            assert {r["rowid"] for r in rows} == set(rowids.values())
+            assert {r["character_id"] for r in rows} == set(rowids.keys())
+
+    def test_replay_idempotent_second_pass_is_noop(
+        self, sqlite_adapter, memory_adapter
+    ):
+        """After a full replay, a second replay performs no state-changing writes."""
+        for adapter in (sqlite_adapter, memory_adapter):
+            self._ensure_run(adapter, "r")
+            self._insert(adapter, "r", "idem", "Idem")
+            writes: list = []
+            second = adapter.replay_run("r")
+            assert second["replayed"] == 1
+            # Instrument writes to prove the 2nd pass performs no real writes.
+            real_insert = adapter.execute_insert
+            real_update = adapter.execute_update
+            real_delete = adapter.execute_delete
+
+            def _wrap_write(real, log, kind):
+                def inner(sql, params=()):
+                    log.append((kind, sql))
+                    return real(sql, params)
+
+                return inner
+
+            adapter.execute_insert = _wrap_write(real_insert, writes, "insert")
+            adapter.execute_update = _wrap_write(real_update, writes, "update")
+            adapter.execute_delete = _wrap_write(real_delete, writes, "delete")
+            third = adapter.replay_run("r")
+            adapter.execute_insert = real_insert
+            adapter.execute_update = real_update
+            adapter.execute_delete = real_delete
+            assert third["replayed"] == 1  # noop still counts as replayed
+            assert (
+                adapter.execute_query("SELECT id FROM character WHERE id='idem'") == []
+            )
+
+    def test_crash_mid_replay_is_resumable(self, sqlite_adapter, memory_adapter):
+        """A crash after the highest-seq entry is replayed restarts safely."""
+        for adapter in (sqlite_adapter, memory_adapter):
+            self._ensure_run(adapter, "r")
+            self._insert(adapter, "r", "cr1", "Cr1")
+            self._insert(adapter, "r", "cr2", "Cr2")
+            entries = adapter.list_undo_entries("r")
+            assert [e["seq"] for e in entries] == [0, 1]
+            # Simulate crash mid-replay: only the highest-seq entry replayed.
+            outcome, _ = adapter.replay_undo_entry("r", 1)
+            assert outcome == "applied"
+            assert (
+                adapter.execute_query("SELECT id FROM character WHERE id='cr2'") == []
+            )
+            assert (
+                adapter.execute_query("SELECT id FROM character WHERE id='cr1'") != []
+            )  # still present -> replay incomplete
+            # Restart: full replay completes the rest; cr2 stays a noop.
+            res = adapter.replay_run("r")
+            assert res["replayed"] == 2 and res["skipped"] == 0
+            assert (
+                adapter.execute_query("SELECT id FROM character WHERE id='cr1'") == []
+            )
+            assert (
+                adapter.execute_query("SELECT id FROM character WHERE id='cr2'") == []
+            )
+
+    def test_after_image_divergence_insert_skip(self, sqlite_adapter, memory_adapter):
+        """Insert-undo is skipped when the current row diverged (human edit)."""
+        for adapter in (sqlite_adapter, memory_adapter):
+            self._ensure_run(adapter, "r")
+            self._insert(adapter, "r", "div", "D1")
+            # Human edits the row after the run inserted it.
+            adapter.execute_update(
+                "UPDATE character SET name='HUMAN' WHERE id='div'", ()
+            )
+            res = adapter.replay_run("r")
+            assert res["conflicts"] == 1 and res["skipped"] == 1
+            row = adapter.execute_query("SELECT name FROM character WHERE id='div'")
+            assert row and row[0]["name"] == "HUMAN"  # preserved
+
+    def test_update_cas_divergence_skip(self, sqlite_adapter, memory_adapter):
+        """Update-undo is skipped when the after-image no longer matches."""
+        for adapter in (sqlite_adapter, memory_adapter):
+            self._ensure_run(adapter, "r")
+            self._ensure_character(adapter, "uc", "Before")
+            img = {"id": "uc", "name": "Before", "aliases": "[]"}
+            with adapter.savepoint("sp"):
+                adapter.capture_undo(
+                    "r",
+                    "character",
+                    "update",
+                    "uc",
+                    before_json=json.dumps(img),
+                    after_json=json.dumps(
+                        {**img, "name": "Run"},  # the run's after-image
+                    ),
+                )
+                adapter.execute_update(
+                    "UPDATE character SET name='Run' WHERE id='uc'", ()
+                )
+            # A later write (later run / human) moves the row past after-image.
+            adapter.execute_update(
+                "UPDATE character SET name='NEWER' WHERE id='uc'", ()
+            )
+            res = adapter.replay_run("r")
+            assert res["conflicts"] == 1 and res["skipped"] == 1
+            row = adapter.execute_query("SELECT name FROM character WHERE id='uc'")
+            assert row and row[0]["name"] == "NEWER"  # not clobbered back to Before
+
+    def test_key_free_insert_conflict_skip(self, sqlite_adapter, memory_adapter):
+        """Delete-undo re-insert is skipped when the unique key is occupied."""
+        for adapter in (sqlite_adapter, memory_adapter):
+            self._ensure_run(adapter, "r")
+            adapter.execute_insert("INSERT INTO series (id) VALUES ('se')", ())
+            adapter.execute_insert(
+                "INSERT INTO book (id, series_id) VALUES ('b1','se')", ()
+            )
+            adapter.execute_insert(
+                "INSERT INTO character (id,name) VALUES ('c1','A')", ()
+            )
+            adapter.execute_insert("INSERT INTO scene (id) VALUES ('s1')", ())
+            adapter.execute_insert(
+                "INSERT INTO character_scene_generated (id, book_id, character_id,"
+                " scene_id, relation_type, confidence, generation_revision,"
+                " source_run_id) VALUES ('gg1','b1','c1','s1','present',0.9,1,'r')",
+                (),
+            )
+            before = {
+                "id": "gg1",
+                "book_id": "b1",
+                "character_id": "c1",
+                "scene_id": "s1",
+                "relation_type": "present",
+                "confidence": 0.9,
+                "generation_revision": 1,
+                "source_run_id": "r",
+            }
+            with adapter.savepoint("sp"):
+                adapter.capture_undo(
+                    "r",
+                    "character_scene_generated",
+                    "delete",
+                    "gg1",
+                    before_json=json.dumps(before),
+                )
+                adapter.execute_delete(
+                    "DELETE FROM character_scene_generated WHERE id='gg1'", ()
+                )
+            # A different row now occupies the unique key.
+            adapter.execute_insert(
+                "INSERT INTO character_scene_generated (id, book_id, character_id,"
+                " scene_id, relation_type, confidence, generation_revision,"
+                " source_run_id) VALUES ('gg2','b1','c1','s1','present',0.5,2,NULL)",
+                (),
+            )
+            res = adapter.replay_run("r")
+            assert res["conflicts"] == 1 and res["skipped"] == 1
+            remaining = adapter.execute_query(
+                "SELECT id FROM character_scene_generated"
+            )
+            assert [r["id"] for r in remaining] == ["gg2"]  # occupant preserved
+
+    def test_reverse_fk_blocked_delete_skip(self, sqlite_adapter, memory_adapter):
+        """Character insert-undo is skipped when a later run's alias-merge refs it."""
+        for adapter in (sqlite_adapter, memory_adapter):
+            self._ensure_run(adapter, "r")
+            self._ensure_character(adapter, "rt-can", "Canonical")
+            self._ensure_character(adapter, "rt-mem", "Member")
+            self._ensure_series_and_book(adapter)
+            self._ensure_decision(adapter, "dec-rt")
+            # The run being undone created rt-mem (journaled insert).
+            with adapter.savepoint("sp"):
+                adapter.capture_undo(
+                    "r",
+                    "character",
+                    "insert",
+                    "rt-mem",
+                    after_json=json.dumps(
+                        {"id": "rt-mem", "name": "Member", "aliases": "[]"}
+                    ),
+                )
+            # A LATER run merged rt-mem under rt-can -> reverse FK now blocks delete.
+            adapter.execute_insert(
+                "INSERT INTO character_alias_merge (merge_id, book_id, canonical_id,"
+                " member_id, merge_revision, decision_id, status, prior_member_name,"
+                " prior_member_aliases_json, consequence_json, created_ms)"
+                " VALUES ('mg-rt','b1','rt-can','rt-mem',1,'dec-rt','active','M','[]','{}',1000)",
+                (),
+            )
+            res = adapter.replay_run("r")
+            assert res["skipped"] == 1  # reverse-FK guard: structural, not a conflict
+            assert (
+                adapter.execute_query("SELECT id FROM character WHERE id='rt-mem'")
+                != []
+            )  # preserved
+
+    def test_record_missing_after_json_update_skips(
+        self, sqlite_adapter, memory_adapter
+    ):
+        """Update-undo on a missing current row is skipped (cannot restore)."""
+        for adapter in (sqlite_adapter, memory_adapter):
+            self._ensure_run(adapter, "r")
+            self._ensure_character(adapter, "gone", "Gone")
+            img = {"id": "gone", "name": "Gone", "aliases": "[]"}
+            with adapter.savepoint("sp"):
+                adapter.capture_undo(
+                    "r",
+                    "character",
+                    "update",
+                    "gone",
+                    before_json=json.dumps(img),
+                    after_json=json.dumps({**img, "name": "Gone2"}),
+                )
+                adapter.execute_update(
+                    "UPDATE character SET name='Gone2' WHERE id='gone'", ()
+                )
+            adapter.execute_delete("DELETE FROM character WHERE id='gone'", ())
+            res = adapter.replay_run("r")
+            assert res["skipped"] == 1 and res["replayed"] == 0
+
+    def test_clear_undo_journal_idempotent(self, sqlite_adapter, memory_adapter):
+        """``clear_undo_journal`` is safe + idempotent: clears once, then a
+        repeated clear on an already-empty journal is a harmless no-op.
+
+        Regression for the L116 observation (a): the empty/double-clear path
+        (a trivial ``DELETE``) was unpinned.  A real run's journal holds several
+        rows; the first clear removes them all (rowcount == N), and a second
+        clear on the now-empty journal returns 0 without raising and without
+        touching other runs' rows.
+        """
+        for adapter in (sqlite_adapter, memory_adapter):
+            self._ensure_run(adapter, "r")
+            self._ensure_run(adapter, "other")
+            # A real run captures several entries (like a 2c redirect).
+            for cid in ("a", "b", "c"):
+                self._insert(adapter, "r", cid, f"Name{cid}")
+            self._insert(adapter, "other", "z", "Zed")  # another run's row
+            assert len(adapter.list_undo_entries("r")) == 3
+            # First clear removes only THIS run's rows, leaves the other intact.
+            assert adapter.clear_undo_journal("r") == 3
+            assert adapter.list_undo_entries("r") == []
+            assert len(adapter.list_undo_entries("other")) == 1
+            # Repeated clear on the empty journal is an idempotent no-op: 0, no raise.
+            assert adapter.clear_undo_journal("r") == 0
+            assert adapter.clear_undo_journal("r") == 0
+            assert adapter.list_undo_entries("r") == []
+            # Data rows replay would have undone are untouched by the clear.
+            assert adapter.execute_query("SELECT COUNT(*) c FROM character") != []
+
+    def _ensure_series_and_book(self, adapter):
+        adapter.execute_insert("INSERT OR IGNORE INTO series (id) VALUES ('se')", ())
+        adapter.execute_insert(
+            "INSERT OR IGNORE INTO book (id, series_id, position) VALUES ('b1','se',1)",
+            (),
+        )
+
+    def _ensure_character(self, adapter, cid, name="Char"):
+        adapter.execute_insert(
+            "INSERT OR IGNORE INTO character (id, name, aliases) VALUES (?, ?, '[]')",
+            (cid, name),
+        )
+
+    def _ensure_decision(self, adapter, decision_id):
+        adapter.execute_insert(
+            "INSERT INTO workbench_decision (decision_id, book_id, target_kind,"
+            " target_key, decision_type, base_revision, payload_json, status,"
+            " source, created_ms) VALUES (?, 'b1', 'presence', 'k', 'auto', 0,"
+            " '{}', 'active', 'human', 1000)",
+            (decision_id,),
+        )

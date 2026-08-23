@@ -178,6 +178,8 @@ EXPECTED_TABLES = {
     "walk_review_item",
     "walk_override",
     "project_snapshot",
+    # Plan S durable walk undo journal
+    "walk_undo_entry",
     # Combined 2b/2c/2d Workbench (Plan A workbench layer)
     "workbench_generation",
     "workbench_decision",
@@ -1349,6 +1351,96 @@ def _insert_prompt_config_revision(
            ) VALUES (?, ?, ?, NULL, '[]', 'prompt', '{}', NULL, '{}', 'local', 1000, NULL)""",
         (revision_id, book_id, task),
     )
+
+
+class TestWalkUndoEntrySchema:
+    """Plan S durable walk undo journal exists with the documented constraints.
+
+    The journal is additive and idempotent, keyed by ``(run_id, seq)``, FK-back
+    to ``walk_run``, CHECK-constrained operation tag, and nullable JSON/identity
+    columns that preserve legacy/unprovenanced rows.  Covered on a fresh schema
+    (``conn``), after an idempotent re-invoke, and via the migration tests in
+    ``test_schema_migration.py`` for a legacy DB.
+    """
+
+    def test_table_and_run_index_exist(self, conn):
+        assert "walk_undo_entry" in _table_names(conn)
+        names = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' "
+                "AND name='idx_walk_undo_entry_run'"
+            ).fetchall()
+        }
+        assert "idx_walk_undo_entry_run" in names
+
+    def test_primary_key_is_run_id_seq(self, conn):
+        table_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='walk_undo_entry'"
+        ).fetchone()[0]
+        assert "PRIMARY KEY (run_id, seq)" in table_sql
+
+    def test_op_column_check_enforced(self, conn):
+        conn.execute("INSERT INTO walk_run (run_id, status) VALUES ('r1', 'running')")
+        conn.execute(
+            "INSERT INTO walk_undo_entry (run_id, seq, op, created_ms) "
+            "VALUES ('r1', 1, 'insert', 1)"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO walk_undo_entry (run_id, seq, op, created_ms) "
+                "VALUES ('r1', 2, 'bogus', 1)"
+            )
+
+    def test_run_id_seq_uniqueness(self, conn):
+        conn.execute("INSERT INTO walk_run (run_id, status) VALUES ('r1', 'running')")
+        conn.execute(
+            "INSERT INTO walk_undo_entry (run_id, seq, op, created_ms) "
+            "VALUES ('r1', 1, 'insert', 1)"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO walk_undo_entry (run_id, seq, op, created_ms) "
+                "VALUES ('r1', 1, 'delete', 2)"
+            )
+
+    def test_json_and_identity_columns_nullable(self, conn):
+        # table_name, row_pk, before_json, after_json are nullable to preserve
+        # legacy/unprovenanced and non-key-capturable entries.
+        conn.execute("INSERT INTO walk_run (run_id, status) VALUES ('r1', 'running')")
+        conn.execute(
+            "INSERT INTO walk_undo_entry (run_id, seq, op, created_ms) "
+            "VALUES ('r1', 1, 'update', 5)"
+        )
+        cols = {r[1]: r for r in _column_info(conn, "walk_undo_entry")}
+        for name in ("table_name", "row_pk", "before_json", "after_json"):
+            assert name in cols
+            assert cols[name][3] == 0, f"{name} should be nullable"
+
+    def test_run_id_fk_references_walk_run(self, conn):
+        fks = conn.execute("PRAGMA foreign_key_list(walk_undo_entry)").fetchall()
+        assert any(r[2] == "walk_run" and r[3] == "run_id" for r in fks), fks
+
+    def test_fk_enforced_with_no_matching_run(self, conn):
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO walk_undo_entry (run_id, seq, op, created_ms) "
+                "VALUES ('no-such-run', 1, 'insert', 1)"
+            )
+
+    def test_idempotent_reinvoke(self, conn):
+        create_schema(conn)
+        assert "walk_undo_entry" in _table_names(conn)
+        count = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
+            "AND name='walk_undo_entry'"
+        ).fetchone()[0]
+        assert count == 1
+        idx_count = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' "
+            "AND name='idx_walk_undo_entry_run'"
+        ).fetchone()[0]
+        assert idx_count == 1
 
 
 class TestParityTablePresence:

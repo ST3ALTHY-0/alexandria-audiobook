@@ -7,6 +7,7 @@ import pytest
 
 from app.pipeline.adapter import InMemorySQLiteAdapter
 from app.pipeline.populate import populate_initial_spine
+from app.pipeline.walks.runner import HeartbeatStorage
 from app.pipeline.walks.walk_2b_character_discovery import (
     _build_character_discovery_prompt,
     _parse_llm_response,
@@ -141,6 +142,25 @@ def _patch_llm(monkeypatch, mock_llm_client, response_content):
 # ---------------------------------------------------------------------------
 # Tests: execute()
 # ---------------------------------------------------------------------------
+
+
+def _reserve_run(storage, run_id):
+    """Insert a reserved ``walk_run`` row (idempotent) for journal FK backing."""
+    existing = storage.execute_query(
+        "SELECT 1 FROM walk_run WHERE run_id = ?", (run_id,)
+    )
+    if not existing:
+        storage.execute_insert(
+            "INSERT INTO walk_run (run_id, book_id, walk_name, status, created_ms) "
+            "VALUES (?, ?, 'walk_test', 'running', ?)",
+            (run_id, "book-1", 1700000000000),
+        )
+    return storage
+
+
+def _heartbeat(storage, run_id):
+    """Reserve *run_id* and wrap *storage* in a HeartbeatStorage with that run."""
+    return HeartbeatStorage(_reserve_run(storage, run_id), run_id)
 
 
 class TestExecute:
@@ -658,3 +678,43 @@ class TestParseResponse:
         assert characters[0]["aliases"] == []
         assert characters[0]["role"] == "present"
         assert characters[0]["confidence"] == 0.8
+
+
+class TestJournalCoverage:
+    """P7-S4: walk 2b mutation inventory is journaled.
+
+    The character-discovery walk captures every discovered ``character``
+    INSERT plus its ``character_book``/``character_series``/``character_scene``/
+    ``character_span`` junctions and the generated-presence upsert
+    (``character_scene_generated``) with its ``workbench_provenance`` — so a
+    cancelled run rolls back discovery cleanly.
+    """
+
+    def _responses(self):
+        return [{"name": "John", "aliases": [], "role": "speaker", "confidence": 0.9}]
+
+    def _captured(self, storage, run_id):
+        return {(e["table_name"], e["op"]) for e in storage.list_undo_entries(run_id)}
+
+    def test_discovery_inventory_journaled(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
+        _patch_llm(monkeypatch, mock_llm_client, json.dumps(self._responses()))
+        execute("book-1", _heartbeat(populated_storage, "run-d"), {})
+        ops = self._captured(populated_storage, "run-d")
+        assert ("character", "insert") in ops
+        assert ("character_scene", "insert") in ops
+        assert ("character_scene_generated", "insert") in ops
+        assert ("character_span", "insert") in ops
+        assert ("workbench_provenance", "insert") in ops
+
+    def test_generated_upsert_update_on_rerun(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
+        _patch_llm(monkeypatch, mock_llm_client, json.dumps(self._responses()))
+        execute("book-1", _heartbeat(populated_storage, "run-d"), {})
+        _patch_llm(monkeypatch, mock_llm_client, json.dumps(self._responses()))
+        execute("book-1", _heartbeat(populated_storage, "run-e"), {})
+        ops2 = self._captured(populated_storage, "run-e")
+        # An already-generated presence is updated (upsert branch = update).
+        assert ("character_scene_generated", "update") in ops2

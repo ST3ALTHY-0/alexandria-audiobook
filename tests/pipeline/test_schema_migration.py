@@ -521,3 +521,110 @@ class TestParityMigrationOnOldSchema:
         tables = self._parity_table_names(conn)
         conn.close()
         assert self.PARITY_TABLES <= tables
+
+
+class TestWalkUndoEntryMigration:
+    """Plan S walk_undo_entry is additive/idempotent and compatible.
+
+    A legacy DB (pre-Plan-S) gains the journal table + run index via create_schema
+    without data loss; re-running create_schema adds nothing twice; the table is
+    FK-backed to walk_run and present on both adapter bindings.
+    """
+
+    def _build_legacy_db(self, path: Path) -> None:
+        """A DB from before walk_undo_entry existed: walk_run + one data table."""
+        conn = sqlite3.connect(str(path))
+        conn.execute(
+            "CREATE TABLE walk_run ("
+            " run_id TEXT PRIMARY KEY,"
+            " book_id TEXT,"
+            " status TEXT NOT NULL"
+            ")"
+        )
+        conn.execute(
+            "CREATE TABLE character ( id TEXT PRIMARY KEY, name TEXT, aliases TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO walk_run (run_id, book_id, status) VALUES ('r1','b1','completed')"
+        )
+        conn.execute(
+            "INSERT INTO character (id, name, aliases) VALUES ('c1','Alice','[]')"
+        )
+        conn.commit()
+        conn.close()
+
+    def test_legacy_db_gains_journal_table_and_index(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "legacy_undo.db"
+        self._build_legacy_db(db_path)
+        conn = sqlite3.connect(str(db_path))
+        create_schema(conn)
+        tables = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='walk_undo_entry'"
+            ).fetchall()
+        }
+        assert "walk_undo_entry" in tables
+        index_count = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index'"
+            " AND name='idx_walk_undo_entry_run'"
+        ).fetchone()[0]
+        assert index_count == 1
+        # Existing data preserved.
+        row = conn.execute("SELECT name FROM character WHERE id='c1'").fetchone()
+        assert row == ("Alice",)
+        conn.close()
+
+    def test_legacy_db_journal_idempotent(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "legacy_undo_idem.db"
+        self._build_legacy_db(db_path)
+        conn = sqlite3.connect(str(db_path))
+        create_schema(conn)
+        conn.close()
+        conn = sqlite3.connect(str(db_path))
+        create_schema(conn)
+        dup = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+            " AND name='walk_undo_entry' GROUP BY name HAVING COUNT(*) > 1"
+        ).fetchall()
+        dup_idx = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+            " AND name='idx_walk_undo_entry_run' GROUP BY name HAVING COUNT(*) > 1"
+        ).fetchall()
+        conn.close()
+        assert dup == []
+        assert dup_idx == []
+
+    def test_journal_fk_backed_to_walk_run(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "legacy_undo_fk.db"
+        self._build_legacy_db(db_path)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("PRAGMA foreign_keys = ON")
+        create_schema(conn)
+        # Valid reference to an existing run is accepted.
+        conn.execute(
+            "INSERT INTO walk_undo_entry (run_id, seq, op, created_ms)"
+            " VALUES ('r1', 1, 'insert', 1)"
+        )
+        # Missing run is rejected (FK NO ACTION).
+        try:
+            conn.execute(
+                "INSERT INTO walk_undo_entry (run_id, seq, op, created_ms)"
+                " VALUES ('nope', 1, 'insert', 1)"
+            )
+        except sqlite3.IntegrityError:
+            pass
+        else:
+            raise AssertionError("FK to walk_run not enforced")
+        conn.close()
+
+    def test_both_adapters_have_journal(self) -> None:
+        adapter = InMemorySQLiteAdapter()
+        adapter.init_db()
+        assert "walk_undo_entry" in {
+            r["name"]
+            for r in adapter.execute_query(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        adapter.close()

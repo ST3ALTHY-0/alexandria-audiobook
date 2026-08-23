@@ -321,6 +321,16 @@ def _process_character(
 
         # Update character.voice_assignment_id
         with storage.savepoint("walk_2h_voice_assignment"):
+            run_id = getattr(storage, "run_id", None)
+            _journal_capture(
+                storage,
+                run_id,
+                "character",
+                "update",
+                row_pk=character_id,
+                before={"voice_assignment_id": prior_assignment},
+                after={"voice_assignment_id": voice_config_id},
+            )
             storage.execute_update(
                 "UPDATE character SET voice_assignment_id = ? WHERE id = ?",
                 (voice_config_id, character_id),
@@ -360,6 +370,26 @@ def _get_prior_voice_assignment(
     return None
 
 
+def _journal_capture(storage, run_id, table, op, row_pk=None, before=None, after=None):
+    """Append one walk_undo_entry capture, guarded on an active run.
+
+    Joins the caller's open ``savepoint()`` (capture_undo never commits inside a
+    transaction), so the entry is atomic with the accompanying write. ``run_id``
+    is ``None`` outside a reserved run (direct unit calls / raw-adapter paths), in
+    which case no journal entry is written.
+    """
+    if run_id is None:
+        return
+    storage.capture_undo(
+        run_id,
+        table,
+        op,
+        row_pk=str(row_pk) if row_pk is not None else None,
+        before_json=json.dumps(before) if before is not None else None,
+        after_json=json.dumps(after) if after is not None else None,
+    )
+
+
 def _insert_review_item(
     storage: PipelineStorage,
     book_id: str,
@@ -372,7 +402,27 @@ def _insert_review_item(
     back) atomically with the voice_assignment_id update.  Auto-accept
     (>=0.7) and auto-reject (<0.5) paths never reach this helper.
     """
-    run_id = storage.run_id
+    run_id = getattr(storage, "run_id", None)
+    review_item_id = f"{run_id}:voice_assignment:{character_id}"
+    after = {
+        "id": review_item_id,
+        "book_id": book_id,
+        "run_id": run_id,
+        "kind": "voice_assignment",
+        "target_table": "character",
+        "target_id": character_id,
+        "prior_value": prior_value,
+        "status": "pending",
+        "created_ms": int(time.time() * 1000),
+    }
+    _journal_capture(
+        storage,
+        run_id,
+        "walk_review_item",
+        "insert",
+        row_pk=review_item_id,
+        after=after,
+    )
     storage.execute_insert(
         """
         INSERT INTO walk_review_item
@@ -381,12 +431,12 @@ def _insert_review_item(
         VALUES (?, ?, ?, 'voice_assignment', 'character', ?, ?, 'pending', ?)
         """,
         (
-            f"{run_id}:voice_assignment:{character_id}",
+            review_item_id,
             book_id,
             run_id,
             character_id,
             prior_value,
-            int(time.time() * 1000),
+            after["created_ms"],
         ),
     )
 

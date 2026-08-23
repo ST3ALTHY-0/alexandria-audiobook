@@ -338,6 +338,99 @@ class PipelineStorage(ABC):
         """Mark the ``prompt_config_revision`` row for *revision_id* as
         superseded by *superseded_by* (append-only chaining)."""
 
+    # -- walk_undo_entry journal (Plan S, Phase 2) ---------------------------
+    #
+    # The durable writer-side undo journal.  Every method is binding-neutral:
+    # the ABC lists the contract and BOTH ``SQLiteAdapter`` and
+    # ``InMemorySQLiteAdapter`` implement it by delegating to the module-level
+    # ``_*_undo*`` helpers so the two adapters stay behaviorally aligned (same
+    # pattern as ``_reconcile_stale_runs``).
+    #
+    # Capture atomicity: ``capture_undo`` never commits when a savepoint or
+    # transaction is open (``conn.in_transaction`` is True inside
+    # ``savepoint()`` / ``transaction()``), so composing
+    # ``with storage.savepoint("op"): storage.capture_undo(...);
+    # storage.execute_insert(...)`` makes the journal entry and its data
+    # mutation commit together on RELEASE and roll back together on any
+    # ``Exception``/``BaseException``.  Callers may also call ``capture_undo``
+    # in autocommit, in which case it commits its own row (mirroring
+    # ``execute_insert``).
+
+    @abstractmethod
+    def next_undo_seq(self, run_id: str) -> int:
+        """Return the next monotonic journal sequence for *run_id*.
+
+        ``(prior MAX(seq) for the run) + 1``, so replay order is total and
+        deterministic within a run.  Read-only; does not allocate or reserve
+        the sequence.
+        """
+
+    @abstractmethod
+    def capture_undo(
+        self,
+        run_id: str,
+        table: str,
+        op: str,
+        row_pk: str | None = None,
+        before_json: str | None = None,
+        after_json: str | None = None,
+    ) -> int:
+        """Append one ``walk_undo_entry`` row and return its allocated ``seq``.
+
+        ``op`` must be one of ``insert`` / ``update`` / ``delete`` and *table*
+        must be on the documented journal allowlist (``_UNDO_TABLE_ALLOWLIST``);
+        a table outside the allowlist raises ``ValueError`` rather than being
+        weakly journaled.  ``row_pk`` is the explicit primary-key value for
+        PK tables and the integer SQLite ``rowid`` for rowid tables.
+        ``before_json`` is the row image before the mutation (``None`` for an
+        insert) and ``after_json`` the image after it (``None`` for a delete).
+
+        The append joins an open ``savepoint()``/``transaction()``
+        (no commit) and auto-commits its own row in autocommit — so it is
+        atomic with the accompanying data mutation when both are wrapped in
+        one adapter-owned savepoint.
+        """
+
+    @abstractmethod
+    def get_undo_entry(self, run_id: str, seq: int) -> dict | None:
+        """Return the ``(run_id, seq)`` journal row as a dict, or ``None``."""
+
+    @abstractmethod
+    def list_undo_entries(self, run_id: str) -> list[dict]:
+        """Return every journal row for *run_id* in ascending ``seq`` order."""
+
+    @abstractmethod
+    def replay_undo_entry(self, run_id: str, seq: int) -> tuple[str, str]:
+        """Replay a single journal entry (idempotent).
+
+        Returns ``(outcome, reason)`` where *outcome* is one of ``applied``
+        (the undo was performed), ``noop`` (the row was already in the target
+        state — idempotent/resumable), or ``skipped`` (diverged / key occupied /
+        FK-guarded).  A skip never aborts the surrounding replay.
+        """
+
+    @abstractmethod
+    def replay_run(self, run_id: str) -> dict:
+        """Replay every ``walk_undo_entry`` for *run_id* in descending ``seq``.
+
+        Returns an auditable result dict:
+        ``{"run_id", "replayed", "skipped", "conflicts", "reasons"}`` where
+        ``replayed`` counts applied+idempotent-noop entries, ``skipped`` counts
+        guarded skips, and ``conflicts`` is the subset of skips caused by
+        after-image (CAS) divergence or occupied keys.  Entries are replayed in
+        ``seq DESC``; each applied entry auto-commits when not inside a caller
+        transaction, so replay is resumable after a crash and idempotent on a
+        second pass.
+        """
+
+    @abstractmethod
+    def clear_undo_journal(self, run_id: str) -> int:
+        """Delete every journal row for *run_id* (journal cleanup).
+
+        Returns the number of rows removed.  Used after a successfully
+        replayed run so a terminal run's journal does not accumulate.
+        """
+
 
 # ---------------------------------------------------------------------------
 # Startup reconciliation (contract rule #5)
@@ -391,6 +484,465 @@ def _reconcile_stale_runs(conn: sqlite3.Connection) -> dict[str, int]:
     if not was_in_transaction:
         conn.commit()
     return {"render_job": render_count, "walk_run": walk_count}
+
+
+# ---------------------------------------------------------------------------
+# Walk undo journal — module-level helpers shared by BOTH adapters (Plan S,
+# Phase 2).  The concrete adapters delegate their journal methods here so they
+# stay behaviorally aligned (same pattern as ``_reconcile_stale_runs``).
+# ---------------------------------------------------------------------------
+
+# Table allowlist enforced at the capture seam (P1-S2 / Phase 2).  Covers every
+# 2a-2i mutation table from the walk write inventory plus the review-supersede
+# surface.  A mutation targeting a table outside this set is REJECTED at
+# capture, never weakly journaled.  The allowlist is enforced by the adapter
+# API here, not by a ``table_name`` CHECK constraint in the DDL.
+_UNDO_TABLE_ALLOWLIST = frozenset(
+    {
+        "scene",
+        "chapter_scene",
+        "scene_paragraph",
+        "paragraph_span",
+        "character",
+        "character_book",
+        "character_series",
+        "character_scene",
+        "character_scene_generated",
+        "character_span",
+        "character_metadata",
+        "workbench_provenance",
+        "workbench_decision",
+        "character_alias_merge",
+        "character_scene_manual",
+        "persona_revision",
+        "span",
+        "walk_review_item",
+    }
+)
+
+# Tables whose delete-undo marks the row undone rather than deleting it.
+# ``workbench_decision.status`` is CHECK-constrained to
+# ('active','undone','superseded','conflict') and a hard delete would raise FK
+# NO ACTION hazards (character_scene_absence / boundary_override / alias-merge
+# decision_id) — so the inverse of a cancelled decision is ``status='undone'``,
+# never a DELETE.
+_UNDO_UNDONE_ON_DELETE = frozenset({"workbench_decision"})
+
+
+def _next_undo_seq(conn: sqlite3.Connection, run_id: str) -> int:
+    """Return the next monotonic journal sequence for *run_id* (MAX + 1)."""
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT COALESCE(MAX(seq), -1) AS max_seq"
+        " FROM walk_undo_entry WHERE run_id = ?",
+        (run_id,),
+    ).fetchone()
+    return int(row["max_seq"]) + 1
+
+
+def _append_undo(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    seq: int,
+    table: str,
+    op: str,
+    row_pk: str | None,
+    before_json: str | None,
+    after_json: str | None,
+    created_ms: int,
+) -> None:
+    """Insert one journal row.  Never commits — joins the caller's transaction/
+    savepoint so it is atomic with the described data mutation."""
+    conn.execute(
+        "INSERT INTO walk_undo_entry"
+        " (run_id, seq, table_name, op, row_pk, before_json, after_json,"
+        "  created_ms)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (run_id, seq, table, op, row_pk, before_json, after_json, created_ms),
+    )
+
+
+def _capture_undo(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    table: str,
+    op: str,
+    row_pk: str | None,
+    before_json: str | None,
+    after_json: str | None,
+) -> int:
+    """Allocate ``seq`` and append one ``walk_undo_entry`` row; return ``seq``.
+
+    ``table`` must be on ``_UNDO_TABLE_ALLOWLIST`` (raise ``ValueError``
+    otherwise).  Mirrors ``execute_insert`` commit semantics: joins an open
+    transaction/savepoint (no commit) and auto-commits its own row in
+    autocommit.
+    """
+    created_ms = int(time.time() * 1000)
+    seq = _next_undo_seq(conn, run_id)
+    was_in_transaction = conn.in_transaction
+    _append_undo(
+        conn,
+        run_id=run_id,
+        seq=seq,
+        table=table,
+        op=op,
+        row_pk=row_pk,
+        before_json=before_json,
+        after_json=after_json,
+        created_ms=created_ms,
+    )
+    if not was_in_transaction:
+        conn.commit()
+    return seq
+
+
+def _get_undo_entry(conn: sqlite3.Connection, run_id: str, seq: int) -> dict | None:
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM walk_undo_entry WHERE run_id = ? AND seq = ?",
+        (run_id, seq),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def _list_undo_entries(conn: sqlite3.Connection, run_id: str) -> list[dict]:
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT * FROM walk_undo_entry WHERE run_id = ? ORDER BY seq ASC",
+        (run_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _clear_undo_journal(conn: sqlite3.Connection, run_id: str) -> int:
+    """Delete every journal row for *run_id*; return rows removed."""
+    was_in_transaction = conn.in_transaction
+    cursor = conn.execute("DELETE FROM walk_undo_entry WHERE run_id = ?", (run_id,))
+    if not was_in_transaction:
+        conn.commit()
+    return cursor.rowcount
+
+
+def _pk_column(conn: sqlite3.Connection, table: str) -> str | None:
+    """Return the explicit primary-key column of *table*, or ``None``."""
+    conn.row_factory = sqlite3.Row
+    for row in conn.execute(f"PRAGMA table_info({table})").fetchall():
+        if row["pk"]:
+            return row["name"]
+    return None
+
+
+def _table_is_rowid(conn: sqlite3.Connection, table: str) -> bool:
+    """True when *table* has no explicit PRIMARY KEY (thus rowid-backed).
+
+    Junction/edge tables (``character_scene``, ``character_span``,
+    ``character_book``, ``character_series``, ``book_chapter``,
+    ``chapter_scene``, ``scene_paragraph``, ``paragraph_span``) and
+    ``character_metadata`` are rowid tables: ``row_pk`` is the SQLite
+    ``rowid``.  Explicit-PK tables (``character``, ``scene``, ``span``,
+    ``character_scene_generated``, ``workbench_*``, ``persona_revision``,
+    ``walk_review_item``) address rows by their PK text value.
+    """
+    return _pk_column(conn, table) is None
+
+
+def _read_row(conn: sqlite3.Connection, table: str, row_pk: str) -> dict | None:
+    """Return the current row at ``(table, row_pk)`` as a dict, or ``None``."""
+    conn.row_factory = sqlite3.Row
+    if _table_is_rowid(conn, table):
+        row = conn.execute(
+            f"SELECT * FROM {table} WHERE rowid = ?", (int(row_pk),)
+        ).fetchone()
+    else:
+        pk_col = _pk_column(conn, table)
+        row = conn.execute(
+            f"SELECT * FROM {table} WHERE {pk_col} = ?", (row_pk,)
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def _image_equiv(current: dict | None, recorded: dict | None) -> bool:
+    """Compare a live DB row against a recorded image (CAS).
+
+    Every column in the recorded image must equal the corresponding current
+    column (extra current columns from later migrations are ignored).  A
+    ``None`` recorded image imposes no expectation (conservative: allow).
+    """
+    if recorded is None:
+        return True
+    if current is None:
+        return False
+    for key, value in recorded.items():
+        if current.get(key) != value:
+            return False
+    return True
+
+
+def _delete_row(conn: sqlite3.Connection, table: str, row_pk: str) -> None:
+    if _table_is_rowid(conn, table):
+        conn.execute(f"DELETE FROM {table} WHERE rowid = ?", (int(row_pk),))
+    else:
+        pk_col = _pk_column(conn, table)
+        conn.execute(f"DELETE FROM {table} WHERE {pk_col} = ?", (row_pk,))
+
+
+def _apply_update_before(
+    conn: sqlite3.Connection, table: str, row_pk: str, before: dict
+) -> None:
+    """Restore a row to its recorded ``before`` image (update/insert-undo)."""
+    cols = list(before.keys())
+    set_clause = ", ".join(f"{col} = ?" for col in cols)
+    params = [before[col] for col in cols]
+    if _table_is_rowid(conn, table):
+        params.append(int(row_pk))
+        conn.execute(f"UPDATE {table} SET {set_clause} WHERE rowid = ?", params)
+    else:
+        pk_col = _pk_column(conn, table)
+        params.append(row_pk)
+        conn.execute(f"UPDATE {table} SET {set_clause} WHERE {pk_col} = ?", params)
+
+
+def _reinsert_row(
+    conn: sqlite3.Connection, table: str, row_pk: str, image: dict
+) -> None:
+    """Re-insert a delete-undo row, restoring the ORIGINAL rowid for rowid
+    tables (``INSERT INTO t(rowid, ...)``) so earlier-``seq`` entries for the
+    same row still resolve and repeated mutations remain addressable."""
+    cols = list(image.keys())
+    placeholders = ", ".join("?" for _ in cols)
+    params = [image[col] for col in cols]
+    if _table_is_rowid(conn, table):
+        conn.execute(
+            f"INSERT INTO {table} (rowid, {', '.join(cols)})"
+            f" VALUES (?, {placeholders})",
+            [int(row_pk)] + params,
+        )
+    else:
+        conn.execute(
+            f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({placeholders})",
+            params,
+        )
+
+
+def _mark_decision_undone(conn: sqlite3.Connection, decision_id: str) -> None:
+    """Mark a workbench_decision as undone (never deleted)."""
+    conn.execute(
+        "UPDATE workbench_decision SET status = 'undone'"
+        " WHERE decision_id = ? AND status != 'undone'",
+        (decision_id,),
+    )
+
+
+def _reverse_fk_blocked(conn: sqlite3.Connection, table: str, row_pk: str) -> bool:
+    """True when deleting ``(table, row_pk)`` would violate an FK NO ACTION /
+    RESTRICT — some row in another table still references this parent.
+
+    The documented case is ``character`` referenced by a later run's
+    ``character_alias_merge.member_id``/``canonical_id``.  A pre-check is safer
+    than relying on the DELETE raising, because this guards the delete-undo of
+    parent rows before they are reached in reverse-``seq`` replay and avoids
+    scattering integrity exceptions.  Child rows created by the SAME run have
+    already been removed by the time this parent is reached (descending seq),
+    so a hit here means the reference is a protected foreign/human row → skip.
+    """
+    conn.row_factory = sqlite3.Row
+    pk_col = _pk_column(conn, table)
+    if pk_col is None:
+        # Rowid leaf/junction tables are children, never referenced parents.
+        return False
+    for (child_table,) in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'"
+    ).fetchall():
+        if child_table == table:
+            continue
+        for fk in conn.execute(f"PRAGMA foreign_key_list({child_table})").fetchall():
+            if (
+                fk["table"] == table
+                and fk["to"] == pk_col
+                and conn.execute(
+                    f"SELECT 1 FROM {child_table} WHERE {fk['from']} = ? LIMIT 1",
+                    (row_pk,),
+                ).fetchone()
+                is not None
+            ):
+                return True
+    return False
+
+
+def _natural_key_conflict(conn: sqlite3.Connection, table: str, image: dict) -> bool:
+    """Best-effort key-free check against UNIQUE indexes before a delete-undo
+    re-insert (e.g. ``character_scene_generated`` UNIQUE
+    (book_id,character_id,scene_id,relation_type)).  NULL values dodge UNIQUE
+    in SQLite (per-row distinct), so rows with a NULL index column never check
+    positive here; the INSERT's own IntegrityError is the authoritative
+    backstop regardless."""
+    conn.row_factory = sqlite3.Row
+    for index in conn.execute(f"PRAGMA index_list({table})").fetchall():
+        if not index["unique"]:
+            continue
+        cols = [
+            row["name"]
+            for row in conn.execute(f"PRAGMA index_info({index['name']})").fetchall()
+        ]
+        params = [image.get(col) for col in cols]
+        if any(param is None for param in params):
+            continue
+        where = " AND ".join(f"{col} = ?" for col in cols)
+        if (
+            conn.execute(
+                f"SELECT 1 FROM {table} WHERE {where} LIMIT 1", params
+            ).fetchone()
+            is not None
+        ):
+            return True
+    return False
+
+
+def _insert_parents_missing(conn: sqlite3.Connection, table: str, image: dict) -> bool:
+    """True if re-inserting *image* would reference a now-missing FK parent.
+
+    A replay removes parent rows before their children in reverse-``seq``; by
+    the time a delete-undo re-inserts a child row, a parent it references may
+    already have been restored to a different value or be absent → skip rather
+    than raise FK NO ACTION."""
+    conn.row_factory = sqlite3.Row
+    for fk in conn.execute(f"PRAGMA foreign_key_list({table})").fetchall():
+        value = image.get(fk["from"])
+        if value is None:
+            continue
+        if (
+            conn.execute(
+                f"SELECT 1 FROM {fk['table']} WHERE {fk['to']} = ? LIMIT 1",
+                (value,),
+            ).fetchone()
+            is None
+        ):
+            return True
+    return False
+
+
+def _replay_one_entry(conn: sqlite3.Connection, entry: dict) -> tuple[str, str, bool]:
+    """Replay one journal entry against *conn*.
+
+    Returns ``(outcome, reason, is_conflict)``:
+      - ``applied`` — the undo was performed.
+      - ``noop`` — the row was already in the target state (idempotent /
+        resumable: a crash-restarted replay hits this on already-restored rows).
+      - ``skipped`` — could not be satisfied; never aborts the remaining
+        journal.  ``is_conflict`` marks genuine divergences/occupied keys
+        (after-image CAS mismatch, key occupied, unique conflict) versus
+        structural FK guards (reverse-FK / missing parent).
+    """
+    table = entry["table_name"]
+    op = entry["op"]
+    row_pk = entry["row_pk"]
+    if table not in _UNDO_TABLE_ALLOWLIST:
+        return ("skipped", "table not on allowlist", False)
+    if row_pk is None:
+        return ("skipped", "no row identity (row_pk NULL)", False)
+    after = json.loads(entry["after_json"]) if entry["after_json"] else None
+    before = json.loads(entry["before_json"]) if entry["before_json"] else None
+    current = _read_row(conn, table, row_pk)
+    was_in_transaction = conn.in_transaction
+
+    def applied(reason: str) -> tuple[str, str, bool]:
+        if not was_in_transaction:
+            conn.commit()
+        return ("applied", reason, False)
+
+    if op == "insert":
+        # Undo of an insert = delete the inserted row; guard by after-image CAS
+        # and workbench_decision/reverse-FK protections.
+        if current is None:
+            return ("noop", "row already absent", False)  # already deleted
+        if not _image_equiv(current, after):
+            return ("skipped", "after-image diverged (CAS)", True)
+        if table in _UNDO_UNDONE_ON_DELETE:
+            try:
+                _mark_decision_undone(conn, row_pk)
+            except sqlite3.IntegrityError as exc:
+                return ("skipped", f"integrity ({exc})", True)
+            return applied(f"{table} marked undone")
+        if _reverse_fk_blocked(conn, table, row_pk):
+            return ("skipped", "reverse FK reference unsafe", False)
+        try:
+            _delete_row(conn, table, row_pk)
+        except sqlite3.IntegrityError as exc:
+            return ("skipped", f"integrity ({exc})", True)
+        return applied("row deleted (insert-undo)")
+
+    if op == "update":
+        # Undo of an update = restore the before-image, gated by after-image
+        # CAS so human edits / later-run overwrites are never clobbered.
+        if current is None:
+            return ("skipped", "row missing (cannot restore)", False)
+        if not _image_equiv(current, after):
+            return ("skipped", "after-image diverged (CAS)", True)
+        if before is None:
+            return ("skipped", "no before-image to restore", False)
+        try:
+            _apply_update_before(conn, table, row_pk, before)
+        except sqlite3.IntegrityError as exc:
+            return ("skipped", f"integrity ({exc})", True)
+        return applied("restored before-image")
+
+    # delete: undo = re-insert the deleted row from before_json.
+    if before is None:
+        return ("skipped", "no before-image to restore", False)
+    if current is not None:
+        if _image_equiv(current, before):
+            return ("noop", "row already restored", False)
+        return ("skipped", "target key occupied", True)
+    if _natural_key_conflict(conn, table, before):
+        return ("skipped", "unique-key conflict", True)
+    if _insert_parents_missing(conn, table, before):
+        return ("skipped", "FK parent missing", False)
+    try:
+        _reinsert_row(conn, table, row_pk, before)
+    except sqlite3.IntegrityError as exc:
+        return ("skipped", f"integrity ({exc})", True)
+    return applied("row restored")
+
+
+def _replay_run(conn: sqlite3.Connection, run_id: str) -> dict:
+    """Replay every journal entry for *run_id* in descending ``seq``.
+
+    Wraps the loop so no savepoint is ever left dangling (replay issues plain
+    statements and never opens a ``SAVEPOINT``), and a ``BaseException``
+    propagates cleanly: entries already auto-committed stay committed
+    (resumable), and nothing remains half-applied at the current entry (each
+    entry is atomic in its own autocommit, or joins a caller transaction which
+    rolls back on propagate)."""
+    conn.row_factory = sqlite3.Row
+    entries = conn.execute(
+        "SELECT * FROM walk_undo_entry WHERE run_id = ? ORDER BY seq DESC",
+        (run_id,),
+    ).fetchall()
+    replayed = 0
+    skipped = 0
+    conflicts = 0
+    reasons: dict[int, str] = {}
+    for entry in entries:
+        outcome, reason, is_conflict = _replay_one_entry(conn, dict(entry))
+        if outcome == "skipped":
+            skipped += 1
+            if is_conflict:
+                conflicts += 1
+        else:
+            replayed += 1  # applied + idempotent noop
+        reasons[int(entry["seq"])] = (
+            f"{outcome}: {reason}" if outcome == "skipped" else reason
+        )
+    return {
+        "run_id": run_id,
+        "replayed": replayed,
+        "skipped": skipped,
+        "conflicts": conflicts,
+        "reasons": reasons,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1421,6 +1973,70 @@ class SQLiteAdapter(PipelineStorage):
             chunk_retention_days=chunk_retention_days,
         )
 
+    # -- walk_undo_entry journal (Plan S, Phase 2) ---------------------------
+
+    def next_undo_seq(self, run_id: str) -> int:
+        """Return the next monotonic journal sequence for *run_id* (MAX + 1)."""
+        self._ensure_owner_thread()
+        return _next_undo_seq(self._conn, run_id)
+
+    def capture_undo(
+        self,
+        run_id: str,
+        table: str,
+        op: str,
+        row_pk: str | None = None,
+        before_json: str | None = None,
+        after_json: str | None = None,
+    ) -> int:
+        """Append one ``walk_undo_entry`` row; returns its allocated ``seq``.
+
+        Rejects tables outside ``_UNDO_TABLE_ALLOWLIST`` with ``ValueError``.
+        Joins an open savepoint/transaction (atomic with the accompanying data
+        mutation) and auto-commits in autocommit.
+        """
+        self._ensure_owner_thread()
+        if table not in _UNDO_TABLE_ALLOWLIST:
+            raise ValueError(f"table {table!r} not on walk_undo_entry allowlist")
+        if op not in ("insert", "update", "delete"):
+            raise ValueError(f"invalid undo op {op!r}")
+        return _capture_undo(
+            self._conn,
+            run_id=run_id,
+            table=table,
+            op=op,
+            row_pk=row_pk,
+            before_json=before_json,
+            after_json=after_json,
+        )
+
+    def get_undo_entry(self, run_id: str, seq: int) -> dict | None:
+        """Return the ``(run_id, seq)`` journal row as a dict, or ``None``."""
+        return _get_undo_entry(self._conn, run_id, seq)
+
+    def list_undo_entries(self, run_id: str) -> list[dict]:
+        """Return every journal row for *run_id* in ascending ``seq`` order."""
+        return _list_undo_entries(self._conn, run_id)
+
+    def replay_undo_entry(self, run_id: str, seq: int) -> tuple[str, str]:
+        """Replay a single journal entry; returns ``(outcome, reason)``."""
+        self._ensure_owner_thread()
+        entry = _get_undo_entry(self._conn, run_id, seq)
+        if entry is None:
+            return ("skipped", "no such entry")
+        outcome, reason, _ = _replay_one_entry(self._conn, entry)
+        return (outcome, reason)
+
+    def replay_run(self, run_id: str) -> dict:
+        """Replay every journal entry for *run_id* in descending ``seq``."""
+        self._ensure_owner_thread()
+        return _replay_run(self._conn, run_id)
+
+    def clear_undo_journal(self, run_id: str) -> int:
+        """Delete every journal row for *run_id*; returns rows removed."""
+        self._ensure_owner_thread()
+        return _clear_undo_journal(self._conn, run_id)
+
 
 # ---------------------------------------------------------------------------
 # In-memory adapter (for testing)
@@ -1961,3 +2577,87 @@ class InMemorySQLiteAdapter(PipelineStorage):
             job_retention_days=job_retention_days,
             chunk_retention_days=chunk_retention_days,
         )
+
+    # -- walk_undo_entry journal (Plan S, Phase 2) ---------------------------
+    # Mirror of ``SQLiteAdapter`` — the concrete implementations delegate to
+    # the identical module-level helpers so both adapters stay behaviorally
+    # aligned.
+
+    def next_undo_seq(self, run_id: str) -> int:
+        """Return the next monotonic journal sequence for *run_id* (MAX + 1).
+
+        Mirror of ``SQLiteAdapter.next_undo_seq`` (same schema and interface).
+        """
+        self._ensure_owner_thread()
+        return _next_undo_seq(self._conn, run_id)
+
+    def capture_undo(
+        self,
+        run_id: str,
+        table: str,
+        op: str,
+        row_pk: str | None = None,
+        before_json: str | None = None,
+        after_json: str | None = None,
+    ) -> int:
+        """Append one ``walk_undo_entry`` row; returns its allocated ``seq``.
+
+        Mirror of ``SQLiteAdapter.capture_undo`` (same schema and interface).
+        Rejects tables outside ``_UNDO_TABLE_ALLOWLIST`` with ``ValueError``.
+        """
+        self._ensure_owner_thread()
+        if table not in _UNDO_TABLE_ALLOWLIST:
+            raise ValueError(f"table {table!r} not on walk_undo_entry allowlist")
+        if op not in ("insert", "update", "delete"):
+            raise ValueError(f"invalid undo op {op!r}")
+        return _capture_undo(
+            self._conn,
+            run_id=run_id,
+            table=table,
+            op=op,
+            row_pk=row_pk,
+            before_json=before_json,
+            after_json=after_json,
+        )
+
+    def get_undo_entry(self, run_id: str, seq: int) -> dict | None:
+        """Return the ``(run_id, seq)`` journal row as a dict, or ``None``.
+
+        Mirror of ``SQLiteAdapter.get_undo_entry``.
+        """
+        return _get_undo_entry(self._conn, run_id, seq)
+
+    def list_undo_entries(self, run_id: str) -> list[dict]:
+        """Return every journal row for *run_id* in ascending ``seq`` order.
+
+        Mirror of ``SQLiteAdapter.list_undo_entries``.
+        """
+        return _list_undo_entries(self._conn, run_id)
+
+    def replay_undo_entry(self, run_id: str, seq: int) -> tuple[str, str]:
+        """Replay a single journal entry; returns ``(outcome, reason)``.
+
+        Mirror of ``SQLiteAdapter.replay_undo_entry``.
+        """
+        self._ensure_owner_thread()
+        entry = _get_undo_entry(self._conn, run_id, seq)
+        if entry is None:
+            return ("skipped", "no such entry")
+        outcome, reason, _ = _replay_one_entry(self._conn, entry)
+        return (outcome, reason)
+
+    def replay_run(self, run_id: str) -> dict:
+        """Replay every journal entry for *run_id* in descending ``seq``.
+
+        Mirror of ``SQLiteAdapter.replay_run`` (same schema and interface).
+        """
+        self._ensure_owner_thread()
+        return _replay_run(self._conn, run_id)
+
+    def clear_undo_journal(self, run_id: str) -> int:
+        """Delete every journal row for *run_id*; returns rows removed.
+
+        Mirror of ``SQLiteAdapter.clear_undo_journal``.
+        """
+        self._ensure_owner_thread()
+        return _clear_undo_journal(self._conn, run_id)

@@ -192,9 +192,16 @@ run-owned generated output and pending run-owned review items. The
 cancelled/interrupted `walk_run` row and audit-safe history are PRESERVED —
 cleanup never deletes `walk_run` history, human/manual rows, shared identity
 or spine data, other-run writes, or unprovenanced rows.
-- **Run-output ownership matrix.** Cleanup may remove only rows it can prove
-are owned by the cancelled run, per the Run-Owned versus Protected Data
-matrix below. Everything else is protected.
+- **Run-output ownership matrix.** Cleanup may remove only rows it can prove are owned by the cancelled run, per the Run-Owned versus Protected Data matrix below. Everything else is protected.
+
+### Explicit Cancellation Rollback Override (Plan S)
+- Cancelled or process-interrupted walks 2a–2i must not leave progress behind. Plan S supersedes Plan R's delete-only cancellation cleanup for these statuses with a durable writer-side `walk_undo_entry` journal; Plan R remains the predecessor for gate, checkpoint, savepoint, and API behavior.
+- `walk_undo_entry` is additive and idempotent: `(run_id FK walk_run, seq, table_name allowlisted, op IN (insert|update|delete), row_pk, before_json, after_json, created_ms, UNIQUE(run_id, seq))`, with an index on `run_id`. Journal entries are appended in the same adapter-owned savepoint as their data mutation.
+- Writers capture one entry per affected row, including pre-read branch classification for UPSERTs and pre-captured rows for set-based statements. Rowid-backed tables restore the original rowid (see the rowid rules below) so reverse replay can address repeated mutations.
+- Rollback replays entries in descending `seq`. Update/delete replay requires an after-image/CAS match; insert restoration requires a key-free check. Divergent human or later-run writes, unique-key conflicts, and unsafe FK references are skipped and reported, never force blanket deletion, and never abort the remaining replay. Replay is idempotent and resumable per entry.
+- `workbench_decision` rows are never deleted — the inverse operation marks them `undone`. For append-only provenance/history (`workbench_provenance`, `persona_revision`, `character_metadata`, `walk_review_item`), only a journaled `insert` created by the replaying run itself is eligible for safe insert-undo (that exact run-created row may be deleted); human rows, other-run rows, and `NULL`-run rows are never treated as owned. Alias-merge history, absence tombstones, manual rows, and decision-audit rows remain protected (see the protected-data guarantees below).
+- Runtime replay occurs only after active execution stops, while the global gate is held, and before terminal run finalization. Startup reconciliation replays every newly interrupted run before any admission path (single, run-all, synchronous, background, or replacement) can write. The cancelled/interrupted `walk_run` row and audit/log history remain.
+- The failed-run policy is explicit: cancelled/interrupted statuses use journal replay; failed runs replay when a ``walk_undo_entry`` journal is safely available, otherwise they retain Plan R's existing ``_cleanup_run_owned`` delete-based cleanup (pre-journal runs keep working unchanged). In a run-all batch, only the active run is replayed; pending siblings retain their existing terminalization semantics.
 - **Onboarding / re-onboarding / book-switching coordination.** Onboarding,
 re-onboarding, and book switching wait for cancellation, active execution
 termination, AND cleanup before replacement state becomes current; replacement
@@ -206,6 +213,172 @@ status and complete cleanup before proceeding — it never optimistically
 resets `currentBookId`/persisted identity or clears data ahead of the active
 run.
 
+#### Journal row schema (`walk_undo_entry`)
+Exactly one row is appended per affected source row, inside the same
+adapter-owned savepoint as the data mutation (capture atomicity).
+
+| Column | Type | Semantics |
+|--------|------|-----------|
+| `run_id` | TEXT NOT NULL REFERENCES walk_run(run_id) | owner run; PK component |
+| `seq` | INTEGER NOT NULL | monotonically increasing per run; PK component |
+| `table_name` | TEXT | journaled table — must be on the table allowlist |
+| `op` | TEXT NOT NULL CHECK(op IN ('insert','update','delete')) | operation applied |
+| `row_pk` | TEXT | stable row identity — explicit PK value, or SQLite `rowid` for rowid tables |
+| `before_json` | TEXT | serialized row image before the mutation (NULL for insert) |
+| `after_json` | TEXT | serialized row image after the mutation (NULL for delete) |
+| `created_ms` | INTEGER NOT NULL | capture epoch millis |
+
+`PRIMARY KEY (run_id, seq)` plus `CREATE INDEX IF NOT EXISTS
+idx_walk_undo_entry_run ON walk_undo_entry (run_id)` make per-run reverse
+replay a simple `ORDER BY seq DESC`. DDL lives in `_UNIVERSAL_UPGRADE_DDL` in
+`app/pipeline/schema.py` and is issued idempotently by `create_schema`.
+
+**Capture atomicity.** The journal append and the data mutation it describes
+share ONE adapter-owned `savepoint(name)` (see Savepoint Ownership Override).
+On `Exception` or `BaseException` the rollback removes the data write AND its
+journal entry together — never a journal-only or data-only residue.
+
+**Sequence allocation.** `seq` is a monotonically increasing integer allocated
+per run (prior run max + 1), so replay order is total and deterministic within
+a run. Replay consumes entries in strictly descending `seq`.
+
+**Table allowlist.** Only tables on the documented allowlist may be journaled.
+The allowlist covers every 2a–2i write and the review-supersede surface
+(`scene`, `chapter_scene`, `scene_paragraph`, `paragraph_span`, `character`,
+`character_series`, `character_book`, `character_scene`, `character_span`,
+`character_scene_generated`, `workbench_provenance`, `workbench_decision`,
+`character_alias_merge`, `persona_revision`, `character_metadata`,
+`character_scene_manual`, `walk_review_item`, `span`, plus edges/writers instrumented in Phases 3–4). A
+mutation targeting a table outside the allowlist is rejected at the Phase 2
+capture seam rather than weakly journaled. The allowlist is enforced by
+the adapter API (Phase 2), not by a `table_name` CHECK constraint in the DDL.
+
+- **Ownership by table.** `character_scene_manual` encodes human/manual
+  projection and is NEVER run-owned: a journal may reference it for replay
+  safety, but its rows are never journal-reversible by a run. `character_metadata`
+  is a rowid table whose run-created metadata inserts (e.g. voice-profile rows
+  written by a walk) are eligible ONLY for guarded insert undo — after-image /
+  key-free / FK guards must pass — while human-, other-run-, and `NULL`-run
+  metadata rows are protected and never removed.
+
+**Per-table key / row-image rules.**
+- **Explicit-PK tables** (`scene`, `character`, `span`, `persona_revision`,
+  `voice_config`, `workbench_generation`, `workbench_decision`,
+  `character_scene_manual`, ...): `row_pk`
+  is the primary-key value; reverse replay addresses rows by that key.
+- **Rowid tables** (no explicit PK: `character_scene`, `character_span`,
+  `character_book`, `character_series`, `book_chapter`, `chapter_scene`,
+  `scene_paragraph`, `paragraph_span`, `character_metadata`): `row_pk` is the integer SQLite
+   `rowid`. Delete-undo re-inserts with the ORIGINAL rowid
+  (`INSERT INTO t(rowid,...)`) so earlier-`seq` entries for the same row still
+  resolve; when the original rowid is already occupied or a unique-key
+  conflict exists, the entry is skipped and reported — never force-applied
+  and never restored by natural key.
+
+  **Image invariant**: for a rowid-backed table, `row_pk` carries the rowid
+  AND captured `before_json`/`after_json` images contain ONLY real columns —
+  the `rowid` key must be stripped from any row projected for journaling. The
+  loader (`adapter._read_row`) reads via `SELECT *` (which has no `rowid`
+  key) and update/delete replay applies only when every recorded image key
+  equals the live row; a captured image that includes a `rowid` key would
+  therefore make every CAS replay fail. Writers must project images via a
+  rowid-stripping helper (as walk_2e `_span_image` / walk_2g `_metadata_image`
+  do) instead of `dict(row)` whenever the select listed the explicit `rowid`
+  column.
+- `table_name` and `row_pk` are NULLABLE so legacy/unprovenanced or
+  partially-captured rows are never rejected at journal insert time.
+
+**Reverse replay ordering and guards.** Replay walks entries in descending
+`seq`, scoped by `run_id`, and is idempotent:
+- **Update/delete replay** applies only when the current row matches the
+  recorded `after_json` (after-image / compare-and-swap). A divergent row
+  (human edit or later-run overwrite) is SKIPPED and reported, never
+  force-applied.
+- **Insert restoration** applies only when the target key is FREE (key-free
+  check). A unique-key conflict — e.g. `character_scene_generated`
+  `UNIQUE(book_id,character_id,scene_id,relation_type)` — skips the restore
+  and is reported.
+- **FK safety.** Before delete-undo of a parent row, reverse references are
+  pre-checked; an entry whose undo would raise an FK
+  `NO ACTION`/`RESTRICT` or cascade into protected rows (e.g. a later run's
+  `character_alias_merge.member_id`) is skipped. A skipped entry never aborts
+  the rest of the journal; skips are counted and auditable.
+- **Idempotency / resumability.** Replay is per-entry transactional. A crash
+  mid-replay restarts safely — already-restored entries replay as no-ops
+  (after-image mismatch → skip) and later entries still run.
+- **Startup-before-admission ordering.** Startup reconciliation replays every
+  newly interrupted run before ANY admission path (single, run-all,
+  synchronous workbench, background, or replacement writer) is admitted.
+
+#### Rollback policy by terminal status
+- **Cancelled / interrupted runs** replay their full journal in reverse `seq`
+  before terminal finalization; the global gate is held until replay completes
+  and the cancelled/interrupted `walk_run` row, logs, and history are retained.
+- **Failed runs** retain Plan R's existing `_cleanup_run_owned` delete-based
+  policy UNLESS a `walk_undo_entry` journal is safely available for the run —
+  in which case journal replay supersedes blanket deletes for the entries it
+  covers. This keeps Plan R working unchanged where no journal exists (e.g.
+  runs pre-dating the journal) while preferring the undo journal where it can
+  restore safely.
+- **`run_all` batch cancellation** replays ONLY the active run's journal;
+  pending sibling runs keep their existing terminalization semantics
+  (`pending` → terminal state) and are not replayed.
+- **Observability & `BaseException` paths.** Replay is auditable:
+  ``replay_run``/``_replay_and_clear`` return and log
+  ``{replayed, skipped, conflicts, reasons[seq]}``. A ``BaseException``
+  (``KeyboardInterrupt``/``SystemExit``) escaping active execution routes
+  through the SAME replay-then-finalize terminalizer as every other terminal
+  path: the row finalizes ``failed`` (gate held) and, when the run captured a
+  journal, that journal is replayed before finalization.
+
+#### Protected data guarantees during replay
+Replay never deletes or overwrites protected data. An `insert` journal entry
+created by the run is eligible for safe insert-undo (delete of that exact
+run-created row, subject to the after-image/CAS, reverse-FK, and protected-row
+guards); this does **not** authorize ownership-by-table or blanket deletion.
+Human-created rows, rows from another run, and rows with `run_id`/provenance
+`NULL` are never treated as owned by the replaying run. In particular:
+- **Human edits** — any row diverging from the recorded after-image
+  (`human_override=1`, manual review, manual voice assignment, edited
+  `span.instruct`) is skipped via the after-image guard.
+- **Later-run overwrites** — a row whose present state came from a later run is
+  skipped (after-image mismatch).
+- **Run-created append-only rows** — a journaled insert made by the replaying
+  run (including a run-created provenance/persona/metadata/review row) may be
+  deleted only by safe insert-undo. The same table's human rows, other-run
+  rows, and `NULL`-run rows remain untouched. Alias-merge history and decision
+  audit rows retain their special protections below.
+- **Append-only decisions / protected history** — `workbench_provenance`,
+  `character_alias_merge` history, persona revisions, and decision audit rows
+  are not blanket-deleted; only a safely identified run-created insert may be
+  removed, and alias-merge history itself remains irrevocable.
+- **Alias-merge history** — prior/human `character_alias_merge` rows are
+  irrevocable history and are never removed; replay restores only the merged
+  junction state. A run-created merge-row insert may be removed by safe
+  insert-undo, like any run-created append-only row (per the bullet above).
+- **Absence tombstones** — `character_scene_absence` rows are INSERTs created
+  by `set_presence` for `relation_type='absent'`, referencing a decision via a
+  `NO ACTION` FK (never CASCADE-deleted), and are never bulk-deleted.
+- **Unprovenanced rows** (`NULL run_id` / direct-call rows) have no owner run
+  to replay against and are never blanket-deleted.
+- **`workbench_decision` handling** — decisions are marked `undone`, never
+  deleted. Automatic replay does not populate `undone_by` or `supersedes_id`
+  unless a concrete implementation explicitly creates and records an inverse
+  decision; the journal replay contract alone does not imply either linkage.
+  Their `status` column is CHECK-constrained to
+  `('active','undone','superseded','conflict')`, so the inverse operation for a
+  cancelled decision is `UPDATE workbench_decision SET status='undone'` (with
+  existing linkage values preserved unless an explicit inverse decision is
+  implemented), which preserves audit history and avoids
+  the FK `NO ACTION` hazards a delete would raise.
+- **Human undo/override vs automatic replay** — a HUMAN review action
+  (accept/reject/override) or workbench undo/override (e.g. alias unmerge) is
+  DISTINCT from automatic cancelled-run replay. Human actions mark the item
+  `resolved` / the decision `undone` and remain preserved; automatic replay
+  restores a cancelled run's captured writes under the after-image/key-free/
+  FK guards. Both histories stay append-only and queryable and are never
+  collapsed into one another.
+
 ### Run-Owned versus Protected Data (Ownership Matrix)
 Cleanup of a cancelled/interrupted run keys on `run_id` (or generation /
 provenance linkage) AND latest-writer/status/manual guards. It is idempotent:
@@ -214,11 +387,12 @@ re-running cleanup for the same run is safe and changes nothing further.
 | Rows | Owned by the run → may be removed | Protected → must NOT be blanket-deleted |
 |------|-----------------------------------|------------------------------------------|
 | Generated presence (`character_scene_generated`) | projection/provenance originating from THIS run (`source_run_id`/`generation_revision` = this run) | later-run overwrites, any row with `human_override=1` or a manual projection, active human absence (`character_scene_absence`), resolved/superseded history |
-| Workbench provenance (`workbench_provenance`) | `run_id = this run` rows for targets the run generated | other-run rows, human/derived-source rows, provenance referenced by a live/manual decision |
+| Workbench provenance (`workbench_provenance`) | **Only a journaled insert created by this run, and only after safe insert-undo guards pass** | human/derived-source rows, other-run rows, `NULL`-run rows, or provenance whose target covers a live/manual decision |
 | Pending review items (`walk_review_item`) | `run_id = this run` AND `status = pending` | resolved/superseded/stale items, items backed by a human decision, other-run items |
 | Character identity & junctions (`character`, `character_scene`, `character_span`, aliases) | — (never blanket-owned) | human/manual-flagged rows, shared/merged identity, `character_alias_merge` (reversible history), merged-member records |
 | Spine (book/chapter/scene/paragraph/span/edges) | — (never blanket-owned) | all — spine is structural, not run-owned |
-| Persona / voice assignment / attribution / delivery | — (never blanket-owned) | manual persona revisions, `voice_assignment_id`, character_span attribution, `span.instruct` delivery |
+| Persona / voice assignment / attribution / delivery | journaled run-created `persona_revision`/`character_metadata` inserts may be removed only by safe insert-undo | manual/other-run/`NULL`-run persona or metadata rows, `voice_assignment_id`, character_span attribution, `span.instruct` delivery |
+| Manual projection (`character_scene_manual`) | — (never run-owned) | all human/manual presence rows and their decision references |
 | Unprovenanced rows (NULL `run_id` / direct-call rows) | — (never blanket-owned) | require a safe non-delete/convergence policy or explicit-undo — never deleted by cancellation cleanup |
 
 “Blanket-deleted” means cleanup never issues table-wide or ownership-unaware

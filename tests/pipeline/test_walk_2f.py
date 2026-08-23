@@ -7,6 +7,7 @@ import pytest
 
 from app.pipeline.adapter import InMemorySQLiteAdapter
 from app.pipeline.populate import populate_initial_spine
+from app.pipeline.walks.runner import HeartbeatStorage
 from app.pipeline.walks.walk_2f_character_description import (
     _build_description_prompt,
     _collect_character_spans,
@@ -161,6 +162,25 @@ def _insert_character_span(storage, character_id, span_id, relation_type):
         "VALUES (?, ?, ?, 'walk', 0.9, 0)",
         (character_id, span_id, relation_type),
     )
+
+
+def _reserve_run(storage, run_id):
+    """Insert a reserved ``walk_run`` row (idempotent) for journal FK backing."""
+    existing = storage.execute_query(
+        "SELECT 1 FROM walk_run WHERE run_id = ?", (run_id,)
+    )
+    if not existing:
+        storage.execute_insert(
+            "INSERT INTO walk_run (run_id, book_id, walk_name, status, created_ms) "
+            "VALUES (?, ?, 'walk_test', 'running', ?)",
+            (run_id, "book-1", 1700000000000),
+        )
+    return storage
+
+
+def _heartbeat(storage, run_id):
+    """Reserve *run_id* and wrap *storage* in a HeartbeatStorage with that run."""
+    return HeartbeatStorage(_reserve_run(storage, run_id), run_id)
 
 
 # ---------------------------------------------------------------------------
@@ -742,3 +762,156 @@ class TestSampleSpans:
         """Empty span list returns empty list."""
         result = _sample_spans([], max_samples=5)
         assert result == []
+
+
+class TestJournalCoverage:
+    """P7-S4: walk 2f mutation inventory is journaled.
+
+    The character-description walk captures each ``persona_revision`` INSERT and
+    the supersede of the prior revision (UPDATE ``superseded_by``) on re-run.
+    """
+
+    def _captured(self, storage, run_id):
+        return {(e["table_name"], e["op"]) for e in storage.list_undo_entries(run_id)}
+
+    def _seed_and_run(self, storage, run_id, monkeypatch, mock_llm_client):
+        if not storage.execute_query("SELECT 1 FROM character WHERE id = 'char-1'"):
+            _insert_character(storage, "char-1", "John")
+            _insert_character_span(storage, "char-1", "span-1b", "speaker")
+        _patch_llm(
+            monkeypatch,
+            mock_llm_client,
+            json.dumps({"description": "John is a stern mentor.", "confidence": 0.9}),
+        )
+        execute("book-1", _heartbeat(storage, run_id), {})
+
+    def test_persona_revision_insert_journaled(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
+        self._seed_and_run(populated_storage, "run-1", monkeypatch, mock_llm_client)
+        ops = self._captured(populated_storage, "run-1")
+        assert ("persona_revision", "insert") in ops
+
+    def test_persona_revision_supersede_update_journaled(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
+        self._seed_and_run(populated_storage, "run-1", monkeypatch, mock_llm_client)
+        self._seed_and_run(populated_storage, "run-2", monkeypatch, mock_llm_client)
+        ops2 = self._captured(populated_storage, "run-2")
+        assert ("persona_revision", "update") in ops2  # prior revision superseded_by
+
+
+class TestPersonaInsertUndo:
+    """P8-S5: a run-created ``persona_revision`` INSERT is undone by safe
+    insert-undo ONLY when its after-image/key/FK guards pass, leaving human,
+    other-run, and ``NULL``-run revision rows intact."""
+
+    def _insert_revision(
+        self,
+        storage,
+        persona_id,
+        character_id,
+        *,
+        author_id="human",
+        review_state="accepted",
+        protected=0,
+    ):
+        storage.execute_insert(
+            "INSERT INTO persona_revision (persona_id, character_id, book_id, "
+            "revision, fields_json, evidence_json, aliases_json, scene_scope, "
+            "review_state, protected, voice_consequences_json, author_id, "
+            "created_ms) VALUES (?, ?, 'book-1', 1, '{}', '[]', '[]', 'book', "
+            "?, ?, '{}', ?, 1000)",
+            (persona_id, character_id, review_state, protected, author_id),
+        )
+
+    def _run_persona(self, storage, run_id, monkeypatch, mock_llm_client):
+        _insert_character(storage, "char-1", "John")
+        _insert_character_span(storage, "char-1", "span-1b", "speaker")
+        _patch_llm(
+            monkeypatch,
+            mock_llm_client,
+            json.dumps({"description": "John is a stern mentor.", "confidence": 0.9}),
+        )
+        execute("book-1", _heartbeat(storage, run_id), {})
+
+    def _run_revision_id(self, storage):
+        return storage.execute_query(
+            "SELECT persona_id FROM persona_revision "
+            "WHERE character_id='char-1' AND book_id='book-1'"
+        )[0]["persona_id"]
+
+    def test_replay_removes_run_persona_insert_and_keeps_protected(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
+        """The run's ``persona_revision`` insert is journaled and removed by
+        safe insert-undo on replay, while human/other-run/NULL-run revisions
+        remain intact."""
+        self._run_persona(populated_storage, "run-p1", monkeypatch, mock_llm_client)
+        ops = {
+            (e["table_name"], e["op"])
+            for e in populated_storage.list_undo_entries("run-p1")
+        }
+        assert ("persona_revision", "insert") in ops
+        run_rev = self._run_revision_id(populated_storage)
+        # Protected revisions: human / other-run / NULL-run rows.
+        self._insert_revision(
+            populated_storage, "pers-human", "char-1", author_id="human"
+        )
+        self._insert_revision(
+            populated_storage, "pers-run9", "char-1", author_id="other-run"
+        )
+        self._insert_revision(
+            populated_storage, "pers-null", "char-1", author_id="direct"
+        )
+
+        res = populated_storage.replay_run("run-p1")
+        populated_storage.clear_undo_journal("run-p1")
+
+        # Run-created insert removed on safe insert-undo.
+        assert (
+            populated_storage.execute_query(
+                "SELECT persona_id FROM persona_revision WHERE persona_id = ?",
+                (run_rev,),
+            )
+            == []
+        )
+        # Protected revisions (human / other-run / NULL-run) survive replay.
+        for pid in ("pers-human", "pers-run9", "pers-null"):
+            assert (
+                populated_storage.execute_query(
+                    "SELECT persona_id FROM persona_revision WHERE persona_id = ?",
+                    (pid,),
+                )
+                != []
+            )
+        # Auditable: applied (no forced skip / no blank) with zero conflicts.
+        assert res["replayed"] >= 1
+        assert res["conflicts"] == 0
+
+    def test_replay_skips_diverged_run_persona_insert(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
+        """A human edit that diverges from the recorded after-image prevents the
+        insert-undo (CAS skip, audited conflict) — the row is NOT deleted."""
+        self._run_persona(populated_storage, "run-p2", monkeypatch, mock_llm_client)
+        run_rev = self._run_revision_id(populated_storage)
+        # Human edit AFTER the run -> recorded after-image no longer matches.
+        populated_storage.execute_update(
+            "UPDATE persona_revision SET review_state='accepted', protected=1 "
+            "WHERE persona_id = ?",
+            (run_rev,),
+        )
+
+        res = populated_storage.replay_run("run-p2")
+        populated_storage.clear_undo_journal("run-p2")
+
+        # NOT undone because the after-image diverged (audited as a conflict).
+        assert (
+            populated_storage.execute_query(
+                "SELECT persona_id FROM persona_revision WHERE persona_id = ?",
+                (run_rev,),
+            )
+            != []
+        )
+        assert res["conflicts"] >= 1

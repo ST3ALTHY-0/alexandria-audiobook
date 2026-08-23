@@ -26,6 +26,7 @@ with temperature=0.1 for format stability.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -166,6 +167,40 @@ def _load_existing_characters(
     return [{"id": row["id"], "name": row["name"]} for row in rows]
 
 
+def _journal_capture(storage, run_id, table, op, row_pk=None, before=None, after=None):
+    """Append one walk_undo_entry capture, guarded on an active run.
+
+    Joins the caller's open ``savepoint()`` (capture_undo never commits inside a
+    transaction), so the entry is atomic with the accompanying write. ``run_id``
+    is ``None`` outside a reserved run (direct unit calls / raw-adapter paths), in
+    which case no journal entry is written.
+    """
+    if run_id is None:
+        return
+    storage.capture_undo(
+        run_id,
+        table,
+        op,
+        row_pk=str(row_pk) if row_pk is not None else None,
+        before_json=json.dumps(before) if before is not None else None,
+        after_json=json.dumps(after) if after is not None else None,
+    )
+
+
+def _span_image(row) -> dict:
+    """Project a character_span row (selected as ``rowid, cols``) to a journal
+    image without the ``rowid`` key, so before/after images carry only the real
+    columns (``_reinsert_row`` would otherwise try to set ``rowid`` twice)."""
+    return {
+        "character_id": row["character_id"],
+        "span_id": row["span_id"],
+        "relation_type": row["relation_type"],
+        "source": row["source"],
+        "confidence": row["confidence"],
+        "human_override": row["human_override"],
+    }
+
+
 def _get_surrounding_context(
     paragraph_id: str, span_id: str, storage: PipelineStorage
 ) -> dict[str, list[str]]:
@@ -281,24 +316,36 @@ def _process_attribution(
 
     character_id = character_id.strip()
 
+    run_id = getattr(storage, "run_id", None)
+
     if character_id not in existing_character_ids:
         # Reject IDs that are not associated with the current book. Also remove
         # any stale generated foreign attribution left by an earlier run while
-        # preserving human decisions.
+        # preserving human decisions.  Each row-level delete is pre-captured
+        # (before image + rowid identity) so a cancelled run can restore it.
         stale_rows = storage.execute_query(
-            "SELECT character_id FROM character_span "
+            "SELECT rowid, character_id, span_id, relation_type, "
+            "       source, confidence, human_override "
+            "FROM character_span "
             "WHERE span_id = ? AND relation_type = 'speaker' "
             "AND human_override = 0",
             (span_id,),
         )
         for stale_row in stale_rows:
-            if stale_row["character_id"] not in existing_character_ids:
-                storage.execute_update(
-                    "DELETE FROM character_span WHERE span_id = ? "
-                    "AND relation_type = 'speaker' AND character_id = ? "
-                    "AND human_override = 0",
-                    (span_id, stale_row["character_id"]),
-                )
+            if stale_row["character_id"] in existing_character_ids:
+                continue
+            _journal_capture(
+                storage,
+                run_id,
+                "character_span",
+                "delete",
+                row_pk=stale_row["rowid"],
+                before=_span_image(stale_row),
+            )
+            storage.execute_update(
+                "DELETE FROM character_span WHERE rowid = ?",
+                (stale_row["rowid"],),
+            )
         result["speakers_unknown"] += 1
         return
 
@@ -314,6 +361,36 @@ def _process_attribution(
         return
 
     is_review = 0.5 <= confidence < 0.7
+
+    # Pre-capture every walk-owned (human_override=0) pred span row that the
+    # replace-speaker UPDATE will touch, so the multi-row overwrite is journaled
+    # per-row with before/after images (conflict-safe replay against the
+    # authoritative after image).  Human-override rows are never touched.
+    pred_rows = storage.execute_query(
+        "SELECT rowid, character_id, span_id, relation_type, "
+        "       source, confidence, human_override "
+        "FROM character_span "
+        "WHERE span_id = ? AND relation_type = 'speaker' "
+        "AND human_override = 0",
+        (span_id,),
+    )
+    for pred_row in pred_rows:
+        _journal_capture(
+            storage,
+            run_id,
+            "character_span",
+            "update",
+            row_pk=pred_row["rowid"],
+            before=_span_image(pred_row),
+            after={
+                "character_id": character_id,
+                "span_id": pred_row["span_id"],
+                "relation_type": "speaker",
+                "source": "walk",
+                "confidence": confidence,
+                "human_override": 0,
+            },
+        )
 
     # Replace generated scene-level guesses (including legacy Walk 2b rows),
     # but never overwrite a human decision.  This keeps reruns idempotent
@@ -337,11 +414,26 @@ def _process_attribution(
         existing_speaker = []
 
     if not attribution_written and not existing_speaker:
-        storage.execute_insert(
+        new_rowid = storage.execute_insert(
             "INSERT INTO character_span "
             "(character_id, span_id, relation_type, source, confidence, human_override) "
             "VALUES (?, ?, 'speaker', 'walk', ?, 0)",
             (character_id, span_id, confidence),
+        )
+        _journal_capture(
+            storage,
+            run_id,
+            "character_span",
+            "insert",
+            row_pk=new_rowid,
+            after={
+                "character_id": character_id,
+                "span_id": span_id,
+                "relation_type": "speaker",
+                "source": "walk",
+                "confidence": confidence,
+                "human_override": 0,
+            },
         )
         attribution_written = True
 

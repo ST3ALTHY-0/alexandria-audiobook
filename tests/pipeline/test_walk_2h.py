@@ -37,20 +37,36 @@ def sample_chapters():
                 {
                     "id": "para-1",
                     "spans": [
-                        {"id": "span-1a", "span_type": "sentence", "text": "The sun rose over the mountains."},
-                        {"id": "span-1b", "span_type": "quotation", "text": '"Good morning," said John.'},
+                        {
+                            "id": "span-1a",
+                            "span_type": "sentence",
+                            "text": "The sun rose over the mountains.",
+                        },
+                        {
+                            "id": "span-1b",
+                            "span_type": "quotation",
+                            "text": '"Good morning," said John.',
+                        },
                     ],
                 },
                 {
                     "id": "para-2",
                     "spans": [
-                        {"id": "span-2a", "span_type": "sentence", "text": "Mary waved from across the room."},
+                        {
+                            "id": "span-2a",
+                            "span_type": "sentence",
+                            "text": "Mary waved from across the room.",
+                        },
                     ],
                 },
                 {
                     "id": "para-3",
                     "spans": [
-                        {"id": "span-3a", "span_type": "quotation", "text": '"Hello everyone," she said.'},
+                        {
+                            "id": "span-3a",
+                            "span_type": "quotation",
+                            "text": '"Hello everyone," she said.',
+                        },
                     ],
                 },
             ],
@@ -61,13 +77,21 @@ def sample_chapters():
                 {
                     "id": "para-4",
                     "spans": [
-                        {"id": "span-4a", "span_type": "sentence", "text": "Later that day, the scene shifted to the city."},
+                        {
+                            "id": "span-4a",
+                            "span_type": "sentence",
+                            "text": "Later that day, the scene shifted to the city.",
+                        },
                     ],
                 },
                 {
                     "id": "para-5",
                     "spans": [
-                        {"id": "span-5a", "span_type": "quotation", "text": '"Welcome," said Bob.'},
+                        {
+                            "id": "span-5a",
+                            "span_type": "quotation",
+                            "text": '"Welcome," said Bob.',
+                        },
                     ],
                 },
             ],
@@ -115,6 +139,35 @@ def _patch_llm(monkeypatch, mock_llm_client, response_content):
     )
 
 
+def _reserve_run(storage, run_id):
+    """Insert a reserved ``walk_run`` row for *run_id* (idempotent).
+
+    The walk journal (``walk_undo_entry.run_id``) FK-references ``walk_run``,
+    so any run context a walk test fabricates must correspond to a reserved
+    run — mirroring ``run_walk_reserved``, which the real runner performs
+    before ``execute``.  Returns *storage* unchanged.
+    """
+    existing = storage.execute_query(
+        "SELECT 1 FROM walk_run WHERE run_id = ?", (run_id,)
+    )
+    if not existing:
+        storage.execute_insert(
+            "INSERT INTO walk_run (run_id, book_id, walk_name, status, created_ms) "
+            "VALUES (?, ?, 'walk_test', 'running', ?)",
+            (run_id, "book-1", 1700000000000),
+        )
+    return storage
+
+
+def _heartbeat(storage, run_id):
+    """Reserve *run_id* in ``walk_run`` then wrap *storage* in a HeartbeatStorage.
+
+    Mirrors the runner: a walk's HeartbeatStorage carries a run_id that
+    corresponds to a reserved ``walk_run`` row.
+    """
+    return HeartbeatStorage(_reserve_run(storage, run_id), run_id)
+
+
 def _insert_character(storage, character_id, name, aliases="[]"):
     """Insert a character and character_book junction."""
     storage.execute_insert(
@@ -144,13 +197,17 @@ def _insert_voice_profile(storage, character_id, voice_profile):
     )
 
 
-def _make_voice_match_response(voice_config_id=None, confidence=0.9, reasoning="Good match."):
+def _make_voice_match_response(
+    voice_config_id=None, confidence=0.9, reasoning="Good match."
+):
     """Create a mock LLM response JSON for voice assignment."""
-    return json.dumps({
-        "voice_config_id": voice_config_id,
-        "reasoning": reasoning,
-        "confidence": confidence,
-    })
+    return json.dumps(
+        {
+            "voice_config_id": voice_config_id,
+            "reasoning": reasoning,
+            "confidence": confidence,
+        }
+    )
 
 
 def _get_review_items(storage):
@@ -181,12 +238,15 @@ class _FailingItemInsert(HeartbeatStorage):
 class TestExecute:
     """Test the main execute() function."""
 
-    def test_execute_returns_summary_dict(self, populated_storage, mock_llm_client, monkeypatch):
+    def test_execute_returns_summary_dict(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
         """execute() returns a summary dict with expected keys."""
         _insert_character(populated_storage, "char-1", "John")
         _insert_voice_config(populated_storage, "voice-1", "Warm Male")
         _insert_voice_profile(
-            populated_storage, "char-1",
+            populated_storage,
+            "char-1",
             {"age": "middle-aged", "gender": "male", "tone": "warm"},
         )
 
@@ -203,12 +263,20 @@ class TestExecute:
         assert "errors" in result
         assert result["book_id"] == "book-1"
 
-    def test_voice_matched_with_high_confidence(self, populated_storage, mock_llm_client, monkeypatch):
+    def test_voice_matched_with_high_confidence(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
         """Voice matched with confidence >= 0.7 → voice_assignment_id set on character."""
         _insert_character(populated_storage, "char-1", "John")
-        _insert_voice_config(populated_storage, "voice-1", "Warm Male", "A warm, authoritative male voice.")
+        _insert_voice_config(
+            populated_storage,
+            "voice-1",
+            "Warm Male",
+            "A warm, authoritative male voice.",
+        )
         _insert_voice_profile(
-            populated_storage, "char-1",
+            populated_storage,
+            "char-1",
             {"age": "middle-aged", "gender": "male", "tone": "warm"},
         )
 
@@ -229,19 +297,24 @@ class TestExecute:
         assert len(rows) == 1
         assert rows[0]["voice_assignment_id"] == "voice-1"
 
-    def test_voice_matched_medium_confidence_review(self, populated_storage, mock_llm_client, monkeypatch):
+    def test_voice_matched_medium_confidence_review(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
         """Voice matched with 0.5 <= confidence < 0.7 → assigned but flagged for review."""
         _insert_character(populated_storage, "char-1", "John")
-        _insert_voice_config(populated_storage, "voice-1", "Warm Male", "A warm male voice.")
+        _insert_voice_config(
+            populated_storage, "voice-1", "Warm Male", "A warm male voice."
+        )
         _insert_voice_profile(
-            populated_storage, "char-1",
+            populated_storage,
+            "char-1",
             {"age": "middle-aged", "gender": "male", "tone": "warm"},
         )
 
         response = _make_voice_match_response("voice-1", confidence=0.6)
         _patch_llm(monkeypatch, mock_llm_client, response)
 
-        result = execute("book-1", HeartbeatStorage(populated_storage, "run-1"), {})
+        result = execute("book-1", _heartbeat(populated_storage, "run-1"), {})
 
         # Voice IS assigned but flagged for review
         assert result["voices_matched"] == 1
@@ -254,12 +327,17 @@ class TestExecute:
         )
         assert rows[0]["voice_assignment_id"] == "voice-1"
 
-    def test_voice_unmatched_low_confidence(self, populated_storage, mock_llm_client, monkeypatch):
+    def test_voice_unmatched_low_confidence(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
         """Voice matched with confidence < 0.5 → voice_assignment_id stays NULL."""
         _insert_character(populated_storage, "char-1", "John")
-        _insert_voice_config(populated_storage, "voice-1", "Warm Male", "A warm male voice.")
+        _insert_voice_config(
+            populated_storage, "voice-1", "Warm Male", "A warm male voice."
+        )
         _insert_voice_profile(
-            populated_storage, "char-1",
+            populated_storage,
+            "char-1",
             {"age": "middle-aged", "gender": "male", "tone": "warm"},
         )
 
@@ -278,12 +356,17 @@ class TestExecute:
         )
         assert rows[0]["voice_assignment_id"] is None
 
-    def test_voice_no_match_in_config(self, populated_storage, mock_llm_client, monkeypatch):
+    def test_voice_no_match_in_config(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
         """LLM returns null voice_config_id → voice_assignment_id stays NULL."""
         _insert_character(populated_storage, "char-1", "John")
-        _insert_voice_config(populated_storage, "voice-1", "Warm Male", "A warm male voice.")
+        _insert_voice_config(
+            populated_storage, "voice-1", "Warm Male", "A warm male voice."
+        )
         _insert_voice_profile(
-            populated_storage, "char-1",
+            populated_storage,
+            "char-1",
             {"age": "elderly", "gender": "female", "tone": "ethereal"},
         )
 
@@ -304,10 +387,14 @@ class TestExecute:
         )
         assert rows[0]["voice_assignment_id"] is None
 
-    def test_character_without_voice_profile_skipped(self, populated_storage, mock_llm_client, monkeypatch):
+    def test_character_without_voice_profile_skipped(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
         """Character without voice_profile in metadata is skipped."""
         _insert_character(populated_storage, "char-1", "John")
-        _insert_voice_config(populated_storage, "voice-1", "Warm Male", "A warm male voice.")
+        _insert_voice_config(
+            populated_storage, "voice-1", "Warm Male", "A warm male voice."
+        )
         # No voice_profile inserted into character_metadata
 
         response = _make_voice_match_response("voice-1", confidence=0.9)
@@ -330,13 +417,20 @@ class TestExecute:
         )
         assert rows[0]["voice_assignment_id"] is None
 
-    def test_assignment_is_not_locked(self, populated_storage, mock_llm_client, monkeypatch):
+    def test_assignment_is_not_locked(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
         """After assignment, voice_assignment_id can be changed (no locked column)."""
         _insert_character(populated_storage, "char-1", "John")
-        _insert_voice_config(populated_storage, "voice-1", "Warm Male", "A warm male voice.")
-        _insert_voice_config(populated_storage, "voice-2", "Deep Male", "A deep male voice.")
+        _insert_voice_config(
+            populated_storage, "voice-1", "Warm Male", "A warm male voice."
+        )
+        _insert_voice_config(
+            populated_storage, "voice-2", "Deep Male", "A deep male voice."
+        )
         _insert_voice_profile(
-            populated_storage, "char-1",
+            populated_storage,
+            "char-1",
             {"age": "middle-aged", "gender": "male", "tone": "warm"},
         )
 
@@ -371,11 +465,14 @@ class TestExecute:
         columns = [row[1] for row in cursor.fetchall()]
         assert "locked" not in columns
 
-    def test_voice_config_table_empty(self, populated_storage, mock_llm_client, monkeypatch):
+    def test_voice_config_table_empty(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
         """Gracefully handle empty voice_config table — all characters unmatched."""
         _insert_character(populated_storage, "char-1", "John")
         _insert_voice_profile(
-            populated_storage, "char-1",
+            populated_storage,
+            "char-1",
             {"age": "middle-aged", "gender": "male", "tone": "warm"},
         )
         # No voices inserted into voice_config
@@ -399,7 +496,9 @@ class TestExecute:
         )
         assert rows[0]["voice_assignment_id"] is None
 
-    def test_nonexistent_book_returns_error(self, storage, mock_llm_client, monkeypatch):
+    def test_nonexistent_book_returns_error(
+        self, storage, mock_llm_client, monkeypatch
+    ):
         """execute() returns error for nonexistent book."""
         _patch_llm(monkeypatch, mock_llm_client, "{}")
 
@@ -408,12 +507,17 @@ class TestExecute:
         assert len(result["errors"]) > 0
         assert result["voices_matched"] == 0
 
-    def test_invalid_voice_config_id_rejected(self, populated_storage, mock_llm_client, monkeypatch):
+    def test_invalid_voice_config_id_rejected(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
         """LLM returns a voice_config_id not in voice_config → rejected."""
         _insert_character(populated_storage, "char-1", "John")
-        _insert_voice_config(populated_storage, "voice-1", "Warm Male", "A warm male voice.")
+        _insert_voice_config(
+            populated_storage, "voice-1", "Warm Male", "A warm male voice."
+        )
         _insert_voice_profile(
-            populated_storage, "char-1",
+            populated_storage,
+            "char-1",
             {"age": "middle-aged", "gender": "male", "tone": "warm"},
         )
 
@@ -433,18 +537,26 @@ class TestExecute:
         )
         assert rows[0]["voice_assignment_id"] is None
 
-    def test_multiple_characters_with_different_voices(self, populated_storage, mock_llm_client, monkeypatch):
+    def test_multiple_characters_with_different_voices(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
         """Multiple characters can be assigned different voices."""
         _insert_character(populated_storage, "char-1", "John")
         _insert_character(populated_storage, "char-2", "Mary")
-        _insert_voice_config(populated_storage, "voice-1", "Warm Male", "A warm male voice.")
-        _insert_voice_config(populated_storage, "voice-2", "Soft Female", "A soft female voice.")
+        _insert_voice_config(
+            populated_storage, "voice-1", "Warm Male", "A warm male voice."
+        )
+        _insert_voice_config(
+            populated_storage, "voice-2", "Soft Female", "A soft female voice."
+        )
         _insert_voice_profile(
-            populated_storage, "char-1",
+            populated_storage,
+            "char-1",
             {"age": "middle-aged", "gender": "male", "tone": "warm"},
         )
         _insert_voice_profile(
-            populated_storage, "char-2",
+            populated_storage,
+            "char-2",
             {"age": "young", "gender": "female", "tone": "soft"},
         )
 
@@ -487,8 +599,9 @@ class TestExecute:
         assert rows[0]["voice_assignment_id"] == "voice-1"  # John
         assert rows[1]["voice_assignment_id"] == "voice-2"  # Mary
 
-
-    def test_walk_override_drives_llm_config(self, populated_storage, monkeypatch, tmp_path):
+    def test_walk_override_drives_llm_config(
+        self, populated_storage, monkeypatch, tmp_path
+    ):
         """A walk_override row for (book, task) overrides the walk's LLM config.
 
         Phase 3 (Plan G): the walk resolves its LLM config via
@@ -499,7 +612,8 @@ class TestExecute:
         _insert_character(populated_storage, "char-1", "John")
         _insert_voice_config(populated_storage, "voice-1", "Warm Male")
         _insert_voice_profile(
-            populated_storage, "char-1",
+            populated_storage,
+            "char-1",
             {"age": "middle-aged", "gender": "male", "tone": "warm"},
         )
 
@@ -525,7 +639,12 @@ class TestExecute:
         captured = {}
 
         def mock_call_llm(
-            client, model_name, temperature, reasoning_effort, system_prompt, user_prompt
+            client,
+            model_name,
+            temperature,
+            reasoning_effort,
+            system_prompt,
+            user_prompt,
         ):
             captured["temperature"] = temperature
             captured["model_name"] = model_name
@@ -572,7 +691,12 @@ class TestExecute:
         captured = {}
 
         def mock_call_llm(
-            client, model_name, temperature, reasoning_effort, system_prompt, user_prompt
+            client,
+            model_name,
+            temperature,
+            reasoning_effort,
+            system_prompt,
+            user_prompt,
         ):
             captured["system_prompt"] = system_prompt
             return "[]"
@@ -615,10 +739,15 @@ class TestWalkReviewItem:
     ):
         """Review-band assignment writes an item row capturing the prior assignment."""
         _insert_character(populated_storage, "char-1", "John")
-        _insert_voice_config(populated_storage, "voice-0", "Old Voice", "A previously assigned voice.")
-        _insert_voice_config(populated_storage, "voice-1", "Warm Male", "A warm male voice.")
+        _insert_voice_config(
+            populated_storage, "voice-0", "Old Voice", "A previously assigned voice."
+        )
+        _insert_voice_config(
+            populated_storage, "voice-1", "Warm Male", "A warm male voice."
+        )
         _insert_voice_profile(
-            populated_storage, "char-1",
+            populated_storage,
+            "char-1",
             {"age": "middle-aged", "gender": "male", "tone": "warm"},
         )
         # Seed a prior assignment so prior_value can be verified
@@ -630,7 +759,7 @@ class TestWalkReviewItem:
         response = _make_voice_match_response("voice-1", confidence=0.6)
         _patch_llm(monkeypatch, mock_llm_client, response)
 
-        execute("book-1", HeartbeatStorage(populated_storage, "run-1"), {})
+        execute("book-1", _heartbeat(populated_storage, "run-1"), {})
 
         rows = _get_review_items(populated_storage)
         assert len(rows) == 1
@@ -658,16 +787,19 @@ class TestWalkReviewItem:
     ):
         """Review-band assignment with no prior assignment records prior_value=None."""
         _insert_character(populated_storage, "char-1", "John")
-        _insert_voice_config(populated_storage, "voice-1", "Warm Male", "A warm male voice.")
+        _insert_voice_config(
+            populated_storage, "voice-1", "Warm Male", "A warm male voice."
+        )
         _insert_voice_profile(
-            populated_storage, "char-1",
+            populated_storage,
+            "char-1",
             {"age": "middle-aged", "gender": "male", "tone": "warm"},
         )
 
         response = _make_voice_match_response("voice-1", confidence=0.6)
         _patch_llm(monkeypatch, mock_llm_client, response)
 
-        execute("book-1", HeartbeatStorage(populated_storage, "run-1"), {})
+        execute("book-1", _heartbeat(populated_storage, "run-1"), {})
 
         rows = _get_review_items(populated_storage)
         assert len(rows) == 1
@@ -678,16 +810,19 @@ class TestWalkReviewItem:
     ):
         """Auto-accepted assignment (>= 0.7) does not write a walk_review_item row."""
         _insert_character(populated_storage, "char-1", "John")
-        _insert_voice_config(populated_storage, "voice-1", "Warm Male", "A warm male voice.")
+        _insert_voice_config(
+            populated_storage, "voice-1", "Warm Male", "A warm male voice."
+        )
         _insert_voice_profile(
-            populated_storage, "char-1",
+            populated_storage,
+            "char-1",
             {"age": "middle-aged", "gender": "male", "tone": "warm"},
         )
 
         response = _make_voice_match_response("voice-1", confidence=0.9)
         _patch_llm(monkeypatch, mock_llm_client, response)
 
-        execute("book-1", HeartbeatStorage(populated_storage, "run-1"), {})
+        execute("book-1", _heartbeat(populated_storage, "run-1"), {})
 
         assert _get_review_items(populated_storage) == []
 
@@ -696,16 +831,19 @@ class TestWalkReviewItem:
     ):
         """Auto-rejected match (< 0.5) does not write a walk_review_item row."""
         _insert_character(populated_storage, "char-1", "John")
-        _insert_voice_config(populated_storage, "voice-1", "Warm Male", "A warm male voice.")
+        _insert_voice_config(
+            populated_storage, "voice-1", "Warm Male", "A warm male voice."
+        )
         _insert_voice_profile(
-            populated_storage, "char-1",
+            populated_storage,
+            "char-1",
             {"age": "middle-aged", "gender": "male", "tone": "warm"},
         )
 
         response = _make_voice_match_response("voice-1", confidence=0.3)
         _patch_llm(monkeypatch, mock_llm_client, response)
 
-        execute("book-1", HeartbeatStorage(populated_storage, "run-1"), {})
+        execute("book-1", _heartbeat(populated_storage, "run-1"), {})
 
         assert _get_review_items(populated_storage) == []
 
@@ -714,10 +852,15 @@ class TestWalkReviewItem:
     ):
         """A mid-savepoint failure rolls back BOTH the item row and the assignment write."""
         _insert_character(populated_storage, "char-1", "John")
-        _insert_voice_config(populated_storage, "voice-0", "Old Voice", "A previously assigned voice.")
-        _insert_voice_config(populated_storage, "voice-1", "Warm Male", "A warm male voice.")
+        _insert_voice_config(
+            populated_storage, "voice-0", "Old Voice", "A previously assigned voice."
+        )
+        _insert_voice_config(
+            populated_storage, "voice-1", "Warm Male", "A warm male voice."
+        )
         _insert_voice_profile(
-            populated_storage, "char-1",
+            populated_storage,
+            "char-1",
             {"age": "middle-aged", "gender": "male", "tone": "warm"},
         )
         # Seed a prior assignment; it must survive the rollback unchanged
@@ -729,7 +872,7 @@ class TestWalkReviewItem:
         response = _make_voice_match_response("voice-1", confidence=0.6)
         _patch_llm(monkeypatch, mock_llm_client, response)
 
-        failing = _FailingItemInsert(populated_storage, "run-1")
+        failing = _FailingItemInsert(_reserve_run(populated_storage, "run-1"), "run-1")
         result = execute("book-1", failing, {})
 
         # Unit failure recorded; nothing committed
@@ -753,15 +896,18 @@ class TestSupersede:
         """Re-running with a NEW run_id supersedes the old pending item and
         writes a fresh pending item for the regenerated target."""
         _insert_character(populated_storage, "char-1", "John")
-        _insert_voice_config(populated_storage, "voice-1", "Warm Male", "A warm male voice.")
+        _insert_voice_config(
+            populated_storage, "voice-1", "Warm Male", "A warm male voice."
+        )
         _insert_voice_profile(
-            populated_storage, "char-1",
+            populated_storage,
+            "char-1",
             {"age": "middle-aged", "gender": "male", "tone": "warm"},
         )
 
         response = _make_voice_match_response("voice-1", confidence=0.6)
         _patch_llm(monkeypatch, mock_llm_client, response)
-        execute("book-1", HeartbeatStorage(populated_storage, "run-1"), {})
+        execute("book-1", _heartbeat(populated_storage, "run-1"), {})
 
         rows = _get_review_items(populated_storage)
         assert len(rows) == 1
@@ -769,7 +915,7 @@ class TestSupersede:
         assert rows[0]["status"] == "pending"
 
         # Second run with a new run_id regenerates char-1's assignment
-        execute("book-1", HeartbeatStorage(populated_storage, "run-2"), {})
+        execute("book-1", _heartbeat(populated_storage, "run-2"), {})
 
         rows = _get_review_items(populated_storage)
         assert len(rows) == 2
@@ -784,19 +930,23 @@ class TestSupersede:
         """A target NOT regenerated this run keeps its prior pending item."""
         _insert_character(populated_storage, "char-1", "John")
         _insert_character(populated_storage, "char-2", "Mary")
-        _insert_voice_config(populated_storage, "voice-1", "Warm Male", "A warm male voice.")
+        _insert_voice_config(
+            populated_storage, "voice-1", "Warm Male", "A warm male voice."
+        )
         _insert_voice_profile(
-            populated_storage, "char-1",
+            populated_storage,
+            "char-1",
             {"age": "middle-aged", "gender": "male", "tone": "warm"},
         )
         _insert_voice_profile(
-            populated_storage, "char-2",
+            populated_storage,
+            "char-2",
             {"age": "young", "gender": "female", "tone": "soft"},
         )
 
         response = _make_voice_match_response("voice-1", confidence=0.6)
         _patch_llm(monkeypatch, mock_llm_client, response)
-        execute("book-1", HeartbeatStorage(populated_storage, "run-1"), {})
+        execute("book-1", _heartbeat(populated_storage, "run-1"), {})
         assert len(_get_review_items(populated_storage)) == 2
 
         # char-2 loses its voice profile → skipped in run-2 → not committed
@@ -805,7 +955,7 @@ class TestSupersede:
             "WHERE character_id = 'char-2' AND key = 'voice_profile'",
             (),
         )
-        execute("book-1", HeartbeatStorage(populated_storage, "run-2"), {})
+        execute("book-1", _heartbeat(populated_storage, "run-2"), {})
 
         rows = _get_review_items(populated_storage)
         assert len(rows) == 3
@@ -821,15 +971,18 @@ class TestSupersede:
     ):
         """If execute() raises, no supersede runs — prior items stay pending."""
         _insert_character(populated_storage, "char-1", "John")
-        _insert_voice_config(populated_storage, "voice-1", "Warm Male", "A warm male voice.")
+        _insert_voice_config(
+            populated_storage, "voice-1", "Warm Male", "A warm male voice."
+        )
         _insert_voice_profile(
-            populated_storage, "char-1",
+            populated_storage,
+            "char-1",
             {"age": "middle-aged", "gender": "male", "tone": "warm"},
         )
 
         response = _make_voice_match_response("voice-1", confidence=0.6)
         _patch_llm(monkeypatch, mock_llm_client, response)
-        execute("book-1", HeartbeatStorage(populated_storage, "run-1"), {})
+        execute("book-1", _heartbeat(populated_storage, "run-1"), {})
         assert _get_review_items(populated_storage)[0]["status"] == "pending"
 
         # run-2 fails before the loop: client creation raises
@@ -839,7 +992,7 @@ class TestSupersede:
         monkeypatch.setattr("app.utils.create_llm_client", boom)
 
         with pytest.raises(RuntimeError):
-            execute("book-1", HeartbeatStorage(populated_storage, "run-2"), {})
+            execute("book-1", _heartbeat(populated_storage, "run-2"), {})
 
         rows = _get_review_items(populated_storage)
         assert len(rows) == 1
@@ -910,11 +1063,13 @@ class TestParseResponse:
 
     def test_parse_valid_json_with_match(self):
         """Parse valid JSON response with a voice match."""
-        response = json.dumps({
-            "voice_config_id": "voice-1",
-            "reasoning": "Good match.",
-            "confidence": 0.9,
-        })
+        response = json.dumps(
+            {
+                "voice_config_id": "voice-1",
+                "reasoning": "Good match.",
+                "confidence": 0.9,
+            }
+        )
 
         result = _parse_llm_response(response)
 
@@ -924,11 +1079,13 @@ class TestParseResponse:
 
     def test_parse_valid_json_with_null_match(self):
         """Parse valid JSON response with null voice_config_id."""
-        response = json.dumps({
-            "voice_config_id": None,
-            "reasoning": "No suitable voice.",
-            "confidence": 0.3,
-        })
+        response = json.dumps(
+            {
+                "voice_config_id": None,
+                "reasoning": "No suitable voice.",
+                "confidence": 0.3,
+            }
+        )
 
         result = _parse_llm_response(response)
 
@@ -939,9 +1096,9 @@ class TestParseResponse:
     def test_parse_json_with_extra_text(self):
         """Parse JSON response with extra text around it."""
         response = (
-            'Here is the result:\n'
+            "Here is the result:\n"
             '{"voice_config_id": "voice-1", "reasoning": "Match.", "confidence": 0.8}\n'
-            'Done.'
+            "Done."
         )
 
         result = _parse_llm_response(response)
@@ -969,10 +1126,12 @@ class TestParseResponse:
 
     def test_parse_defaults_confidence(self):
         """Parse defaults missing confidence to 0.8."""
-        response = json.dumps({
-            "voice_config_id": "voice-1",
-            "reasoning": "Match.",
-        })
+        response = json.dumps(
+            {
+                "voice_config_id": "voice-1",
+                "reasoning": "Match.",
+            }
+        )
 
         result = _parse_llm_response(response)
 
@@ -997,12 +1156,211 @@ class TestParseResponse:
 
     def test_parse_invalid_voice_config_id_type_returns_empty(self):
         """Parse response where voice_config_id is not a string or null returns empty dict."""
-        response = json.dumps({
-            "voice_config_id": 123,
-            "reasoning": "Bad type.",
-            "confidence": 0.9,
-        })
+        response = json.dumps(
+            {
+                "voice_config_id": 123,
+                "reasoning": "Bad type.",
+                "confidence": 0.9,
+            }
+        )
 
         result = _parse_llm_response(response)
 
         assert result == {}
+
+
+class TestJournalCoverage:
+    """P7-S4: walk 2h mutation inventory is journaled.
+
+    The voice-assignment walk captures the ``character.voice_assignment_id``
+    overwrite (UPDATE), the review-band ``walk_review_item`` INSERT, and the
+    completion-time supersede of prior pending assignment items (UPDATE).
+    """
+
+    def _captured(self, storage, run_id):
+        return {(e["table_name"], e["op"]) for e in storage.list_undo_entries(run_id)}
+
+    def _seed(self, storage):
+        _insert_character(storage, "char-1", "John")
+        _insert_voice_config(storage, "voice-1", "Warm Male", "A warm male voice.")
+        _insert_voice_profile(
+            storage, "char-1", {"age": "middle-aged", "gender": "male", "tone": "warm"}
+        )
+
+    def test_assignment_update_and_review_insert_journaled(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
+        self._seed(populated_storage)
+        _patch_llm(
+            monkeypatch,
+            mock_llm_client,
+            _make_voice_match_response("voice-1", confidence=0.6),
+        )
+        execute("book-1", _heartbeat(populated_storage, "run-1"), {})
+        ops = self._captured(populated_storage, "run-1")
+        assert ("character", "update") in ops  # voice_assignment_id overwrite
+        assert ("walk_review_item", "insert") in ops  # review-band insert
+
+    def test_supersede_update_journaled(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
+        self._seed(populated_storage)
+        _patch_llm(
+            monkeypatch,
+            mock_llm_client,
+            _make_voice_match_response("voice-1", confidence=0.6),
+        )
+        execute("book-1", _heartbeat(populated_storage, "run-1"), {})
+        _patch_llm(
+            monkeypatch,
+            mock_llm_client,
+            _make_voice_match_response("voice-1", confidence=0.6),
+        )
+        execute("book-1", _heartbeat(populated_storage, "run-2"), {})
+        ops2 = self._captured(populated_storage, "run-2")
+        assert ("walk_review_item", "update") in ops2  # supersede flip
+
+
+class TestFullReplayCoverage:
+    """P8-S3: full reverse-order replay of a walk_2h run restores every
+    journaled 2h mutation safely and preserves human/later-run overwrites.
+
+    Drives the real walk_2h ``execute()`` seam (the medium-confidence band
+    overwrites ``character.voice_assignment_id``, inserts a pending review item,
+    and supersedes prior pending items), then replays via
+    ``storage.replay_run`` + ``clear_undo_journal`` (mirroring
+    ``WalkRunner._replay_and_clear``). Non-vacuous — replay actually runs, and
+    would fail before insert-undo / update-undo existed.
+    """
+
+    def _captured(self, storage, run_id):
+        return {(e["table_name"], e["op"]) for e in storage.list_undo_entries(run_id)}
+
+    def _insert_prior_item(self, storage):
+        """A prior-run pending review item that this run supersedes at completion."""
+        storage.execute_insert(
+            "INSERT INTO walk_review_item (id, book_id, run_id, kind, "
+            "target_table, target_id, prior_value, status, created_ms) "
+            "VALUES ('ri-prior', 'book-1', 'run-0', 'voice_assignment', "
+            "'character', 'char-1', 'voice-0', 'pending', 1000)",
+            (),
+        )
+
+    def _seed(self, storage, *, with_prior_item=True):
+        _insert_character(storage, "char-1", "John")  # voice_assignment_id NULL
+        _insert_voice_config(storage, "voice-0", "Previous Voice", "prior")
+        _insert_voice_config(storage, "voice-1", "Warm Male", "a warm male voice")
+        _insert_voice_config(storage, "voice-2", "Cool Female", "another voice")
+        _insert_voice_profile(
+            storage,
+            "char-1",
+            {"age": "middle-aged", "gender": "male", "tone": "warm"},
+        )
+        # Pre-run voice assignment — replay must restore to this value.
+        storage.execute_update(
+            "UPDATE character SET voice_assignment_id = 'voice-0' WHERE id = 'char-1'",
+            (),
+        )
+        if with_prior_item:
+            self._insert_prior_item(storage)
+
+    def test_full_2h_replay_restores_voice_and_removes_pending_review(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
+        """Replay of a journal-backed run restores the voice assignment to its
+        pre-run value, discards the run's pending review item, and undoes the
+        supersede of a prior pending item — with auditable zero-conflict counts."""
+        self._seed(populated_storage)
+        _patch_llm(
+            monkeypatch,
+            mock_llm_client,
+            _make_voice_match_response("voice-1", confidence=0.6),
+        )
+        # Real walk seam: rewrite the assignment, insert a review item, supersede.
+        execute("book-1", _heartbeat(populated_storage, "run-1"), {})
+        ops = self._captured(populated_storage, "run-1")
+        # Every journaled 2h mutation is present.
+        assert ("character", "update") in ops  # voice_assignment_id overwrite
+        assert ("walk_review_item", "insert") in ops  # run's own pending review
+        assert ("walk_review_item", "update") in ops  # supersede of ri-prior
+        assert (
+            populated_storage.execute_query(
+                "SELECT status FROM walk_review_item WHERE id='ri-prior'"
+            )[0]["status"]
+            == "superseded"  # pre-replay state
+        )
+
+        res = populated_storage.replay_run("run-1")
+        populated_storage.clear_undo_journal("run-1")
+
+        # (a) voice_assignment_id restored to the pre-run value 'voice-0'.
+        rows = populated_storage.execute_query(
+            "SELECT voice_assignment_id FROM character WHERE id='char-1'"
+        )
+        assert rows[0]["voice_assignment_id"] == "voice-0"
+        # (b) the run's pending review item is removed/discarded.
+        assert (
+            populated_storage.execute_query(
+                "SELECT id FROM walk_review_item WHERE run_id='run-1'"
+            )
+            == []
+        )
+        # Supersede undone: the prior pending item is restored to 'pending'.
+        restored = populated_storage.execute_query(
+            "SELECT status FROM walk_review_item WHERE id='ri-prior'"
+        )
+        assert restored[0]["status"] == "pending"
+        # (d) auditable counts: no divergence, so conflicts == 0 and replayed > 0.
+        assert res["conflicts"] == 0
+        assert res["replayed"] >= 2
+        # walk_run history retained and the journal cleared (mirrors _replay_and_clear).
+        assert (
+            populated_storage.execute_query(
+                "SELECT run_id FROM walk_run WHERE run_id='run-1'"
+            )
+            != []
+        )
+        assert populated_storage.list_undo_entries("run-1") == []
+
+    def test_replay_preserves_later_human_voice_overwrite_as_conflict_skip(
+        self, populated_storage, mock_llm_client, monkeypatch
+    ):
+        """A human/later-run overwrite of the voice assignment diverges from the
+        recorded after-image, so replay skips it (audited conflict) and the run's
+        own pending review item is still undone."""
+        self._seed(populated_storage, with_prior_item=False)
+        _patch_llm(
+            monkeypatch,
+            mock_llm_client,
+            _make_voice_match_response("voice-1", confidence=0.6),
+        )
+        execute("book-1", _heartbeat(populated_storage, "run-1"), {})
+        assert (
+            populated_storage.execute_query(
+                "SELECT voice_assignment_id FROM character WHERE id='char-1'"
+            )[0]["voice_assignment_id"]
+            == "voice-1"
+        )
+        # Human/later-run overwrite AFTER the run — CAS divergence for the update.
+        populated_storage.execute_update(
+            "UPDATE character SET voice_assignment_id='voice-2' WHERE id='char-1'",
+            (),
+        )
+
+        res = populated_storage.replay_run("run-1")
+        populated_storage.clear_undo_journal("run-1")
+
+        # (c) human/later-run overwrite preserved (not restored to 'voice-0').
+        rows = populated_storage.execute_query(
+            "SELECT voice_assignment_id FROM character WHERE id='char-1'"
+        )
+        assert rows[0]["voice_assignment_id"] == "voice-2"
+        # (d) the divergent character update is an audited conflict skip.
+        assert res["conflicts"] >= 1
+        # The run's own review item (still matching its after-image) is undone.
+        assert (
+            populated_storage.execute_query(
+                "SELECT id FROM walk_review_item WHERE run_id='run-1'"
+            )
+            == []
+        )

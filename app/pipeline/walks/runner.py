@@ -11,6 +11,11 @@ row (running → completed | failed | cancelled) with created_ms,
 finished_ms, result_json, error and heartbeat_ms (rows = truth).
 ``is_cancel_requested`` is the single cancellation dispatcher over the DB
 row flag, a persisted stop-file, and the in-process per-book event.
+
+A cancelled or process-interrupted run's durable ``walk_undo_entry`` journal is
+replayed (reverse-seq, gate held) before finalization, and startup
+reconciliation replays every newly interrupted run before any new run is
+admitted (see ``reconcile_and_replay``).
 """
 
 from __future__ import annotations
@@ -155,6 +160,106 @@ def mark_reserved_runs_failed(
             "WHERE run_id = ? AND status = 'pending'",
             (error, _now_ms(), run_id),
         )
+
+
+# ---------------------------------------------------------------------------
+# Centralized startup reconciliation + interrupted-run journal replay (Plan S,
+# P5-S3/S5).  ONE entry point the API/synchronous/background/run-all/alternate
+# admission paths invoke before admitting a replacement writer, so a cancelled
+# or process-interrupted run's durable undo journal is replayed (reverse seq,
+# per-entry auto-commit, with the Phase 2 after-image/key-free guards) and
+# cleared BEFORE any new run starts.
+# ---------------------------------------------------------------------------
+
+# Terminal cause stamped on rows flipped to ``interrupted`` at startup (mirrors
+# the adapter's ``_INTERRUPTED_ERROR`` message used by reconcile_stale_runs).
+_INTERRUPTED_ERROR = "interrupted by process restart"
+
+
+def _flip_all_running_to_interrupted(storage: PipelineStorage) -> list[str]:
+    """Start-of-day: treat EVERY leftover ``running`` row as interrupted.
+
+    Fresh-heartbeat crash gap: a single-process deployment can hold at most one
+    live walk, and at process start (storage first acquisition) no walk is
+    genuinely executing yet — so any ``running`` row present here is the
+    leftover of a dead process whose heartbeat may still look fresh (the process
+    crashed within the ``_STALE_RUN_GRACE_MS`` window, so the grace-based flip in
+    ``reconcile_stale_runs`` alone would miss it). These rows must be replayed
+    to ``interrupted`` before any admission overwrites their journal.
+
+    Safe ONLY at start-of-day (no admission is in flight yet). Grace-based
+    reconciliation is the sole stamp elsewhere; at run admission a live walk's
+    fresh row is never touched (the global gate rejects it instead).
+    """
+    rows = storage.execute_query(
+        "SELECT run_id FROM walk_run WHERE status = 'running'", ()
+    )
+    run_ids = [row["run_id"] for row in rows]
+    now = _now_ms()
+    for run_id in run_ids:
+        storage.execute_update(
+            "UPDATE walk_run SET status = 'interrupted', error = ?, "
+            "finished_ms = ?, heartbeat_ms = ? "
+            "WHERE run_id = ? AND status = 'running'",
+            (_INTERRUPTED_ERROR, now, now, run_id),
+        )
+    return run_ids
+
+
+def reconcile_and_replay(
+    storage: PipelineStorage,
+    *,
+    start_of_day: bool = False,
+) -> dict:
+    """Reconcile stale runs and replay interrupted-run journals (one entry point).
+
+    Used by EVERY walk admission path and defensively at storage acquisition,
+    so a cancelled/process-interrupted run's ``walk_undo_entry`` journal is
+    replayed and cleared before any replacement writer is admitted. Idempotent
+    — safe to call repeatedly.
+
+    Steps:
+      1. ``storage.reconcile_stale_runs()`` — flip stale ``running`` rows (grace
+         window elapsed) to ``interrupted``. Never touches fresh-heartbeat rows.
+      2. When ``start_of_day`` is true (storage acquisition before any request/
+         admission), also flip every remaining ``running`` row to ``interrupted``
+         — the fresh-heartbeat crash gap (nothing is live at process start).
+      3. For every ``interrupted`` run that still holds journal rows, replay it
+         (reverse ``seq``, per-entry auto-commit — no blanket transaction, so a
+         crash mid-replay restarts safely) and clear the journal. The adapter's
+         ``replay_run`` guards never blanket-delete or clobber human/other-run/
+         ``NULL``-run rows; a safely identified run-created ``insert`` may be
+         undone via safe insert-undo, decisions are marked ``undone`` (never
+         deleted), and alias-merge history stays irrevocable.
+
+    Returns ``{"reconcile": {...counts}, "flipped_fresh_heartbeat": [run_id],
+    "replays": {run_id: {replayed, skipped, conflicts, reasons}}}``.
+    """
+    counts = storage.reconcile_stale_runs()
+    flipped = _flip_all_running_to_interrupted(storage) if start_of_day else []
+    journaled = storage.execute_query(
+        "SELECT run_id FROM walk_run WHERE status = 'interrupted' "
+        "AND run_id IN (SELECT DISTINCT run_id FROM walk_undo_entry)",
+        (),
+    )
+    replays: dict[str, dict] = {}
+    for row in journaled:
+        run_id = row["run_id"]
+        result = storage.replay_run(run_id)
+        storage.clear_undo_journal(run_id)
+        replays[run_id] = result
+        logger.info(
+            "Startup replay of interrupted run %s: replayed=%d skipped=%d conflicts=%d",
+            run_id,
+            result.get("replayed"),
+            result.get("skipped"),
+            result.get("conflicts"),
+        )
+    return {
+        "reconcile": counts,
+        "flipped_fresh_heartbeat": flipped,
+        "replays": replays,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -613,7 +718,9 @@ class WalkRunner:
             The walk's raw ``execute()`` result on success, or an error dict with
             ``status='failed'`` on failure, or
             ``{'status': 'cancelled', ...}`` when cancellation was requested
-            before execution.
+            before execution. A cancelled/interrupted run (or a journal-backed
+            failed run) replays its durable ``walk_undo_entry`` journal via the
+            shared terminalizer before its row is finalized.
         """
         self._ensure_book(book_id)
         # Refuse a second concurrent walk for the same book (preserved).
@@ -642,7 +749,9 @@ class WalkRunner:
 
         Each walk goes through ``run_walk`` — its own ``walk_run`` row and
         its own ``is_cancel_requested`` check before execution. Abort-on-
-        first-failure preserved.
+        first-failure preserved: a child that cancels/interrupts replays its
+        durable undo journal (gate held) before finalization and still aborts
+        the remaining walks.
 
         Parameters
         ----------
@@ -716,12 +825,28 @@ class WalkRunner:
         Every terminal exit path — success, walk exception, reportable errors,
         verification failure, import failure, cancellation, and unexpected
         ``BaseException`` — routes through ``_finish_run``, which (for non-
-        completed runs) runs run-owned cleanup (``_cleanup_run_owned``) WHILE
-        holding the global gate, then finalizes the row and releases the gate.
+        completed runs) either replays the run's durable undo journal (cancelled/
+        interrupted, or a journal-backed failed run) or, for a failed pre-journal
+        run / cancelled-before-start run that captured nothing, runs run-owned
+        cleanup (``_cleanup_run_owned``) WHILE holding the global gate, then
+        finalizes the row and releases the gate.
         No ``running`` row is ever left behind and no replacement run can start
-        before this run's cleanup completes.
+        before this run's cleanup or journal replay completes. The replay is
+        observable: ``_replay_and_clear`` logs the auditable ``{replayed,
+        skipped, conflicts}`` counts for the run. A ``BaseException``
+        (``KeyboardInterrupt``/``SystemExit``) escaping active execution still
+        routes through this same terminalizer — the row is finalized ``failed``
+        and, when the run captured a journal, that journal is replayed before
+        finalization with the gate held.
         """
         self._ensure_book(book_id)
+        # Startup/leftover replay before admission (defense for direct/alternate
+        # admission paths that bypass the API storage-acquisition hook): replay
+        # and clear any interrupted run's journal before admitting a replacement
+        # writer. Grace-based only at admission (start_of_day=False) — a live
+        # walk's fresh ``running`` row is never flipped here; the gate below
+        # rejects it instead. Idempotent no-op on the common no-leftover path.
+        reconcile_and_replay(self._storage)
         admitted = False
         terminalized = False
         try:
@@ -948,8 +1073,9 @@ class WalkRunner:
             # A BaseException (e.g. KeyboardInterrupt/SystemExit) escaped active
             # execution without reaching a terminal path. If we were admitted and
             # the row is still 'running', terminalize it now via _finish_run
-            # (run-owned cleanup runs first, while the gate is held) so no
-            # 'running' row is stranded and the global gate is released.
+            # (journal replay — or, for a no-journal failed run, run-owned
+            # cleanup — runs first, while the gate is held) so no 'running' row
+            # is stranded and the global gate is released.
             if admitted and not terminalized:
                 error = "Run terminated by unexpected exception"
                 self._finish_run(
@@ -1070,14 +1196,16 @@ class WalkRunner:
         return _probe
 
     def _cleanup_run_owned(self, run_id: str) -> None:
-        """Idempotently delete run-owned generated output for a non-completed run.
+        """Idempotently delete run-owned generated output for a failed run.
 
-        Aligned with the CONTRACTS.md ownership matrix: for a walk that stopped
-        WITHOUT completing, delete only generated records attributable to THIS
-        run — ``walk_review_item`` rows whose ``run_id`` is this run and whose
-        ``status`` is ``'pending'``, ``character_scene_generated`` rows whose
-        ``source_run_id`` is this run, and ``workbench_provenance`` rows whose
-        ``run_id`` is this run.
+        Plan S rollback policy (CONTRACTS.md): blanket-delete cleanup applies
+        ONLY to the failed-run policy — a ``failed`` run with no safely-available
+        ``walk_undo_entry`` journal (e.g. a pre-journal run), and a
+        cancelled-before-start run that captured nothing. A cancelled/interrupted
+        run (or a failed run) that holds journal entries is instead undone via
+        journal replay in ``_replay_and_clear`` and never reaches this path; a
+        cancelled/interrupted run with an empty journal (captured nothing)
+        behaves like cancelled-before-start and runs this idempotent cleanup.
 
         NEVER touched (protected): later-run overwrites (different
         ``source_run_id``/``generation_revision``), manual/human rows
@@ -1139,9 +1267,15 @@ class WalkRunner:
            ``_terminal_and_close`` (close_run fires BEFORE the DB row is
            finalized). Suppressed for a cancelled-before-start run, which opens
            no sink and must emit no terminal record.
-        2. For any non-``completed`` status, run run-owned cleanup
-           (``_cleanup_run_owned``) while the global gate is still held, so no
-           replacement run can start before cleanup completes.
+        2. For any non-``completed`` status, undo the run while the global gate
+           is still held: a cancelled/interrupted run (or a journal-backed
+           failed run) replays its durable undo journal via ``_replay_and_clear``
+           (reverse-seq, after-image/key-free guards, auditable replayed/skipped/
+           conflicts counts); a failed run with no safely-available journal, a
+           cancelled/interrupted run with no journal (captured nothing), or a
+           cancelled-before-start run runs the idempotent run-owned cleanup
+           (``_cleanup_run_owned``). Either path holds the gate — no
+           replacement run can start before the run is undone and finalized.
         3. Finalize the ``walk_run`` row (``_finalize_run``) and mirror the
            status into the in-memory ``_status`` dict. Finalizing the row out of
            ``running`` is what releases the global gate (the next admission sees
@@ -1154,9 +1288,53 @@ class WalkRunner:
         if emit_terminal:
             self._terminal_and_close(run_id, status, payload)
         if status != "completed":
-            self._cleanup_run_owned(run_id)
+            # Plan S rollback policy (CONTRACTS.md): a cancelled/interrupted run
+            # with a journal is UNDONE by replaying its durable undo journal in
+            # reverse seq (per-entry auto-commit, after-image/key-free guards)
+            # — NOT by blanket-deleting run-owned tables. The journal replay
+            # runs while the global gate is still held (the row is still
+            # ``running`` until ``_finalize_run`` flips it terminal), so no
+            # replacement writer can start mid-replay. Only a failed run without
+            # a safely-available journal (or a cancelled-before-start run that
+            # captured nothing) retains Plan R's idempotent ``_cleanup_run_owned``
+            # delete-based cleanup.
+            journal = self._storage.list_undo_entries(run_id)
+            if status in ("cancelled", "interrupted") and journal:
+                self._replay_and_clear(run_id)
+            elif status == "failed" and journal:
+                # Failed-run policy: a journal is safely available, so replay
+                # supersedes blanket deletes for the entries it covers.
+                self._replay_and_clear(run_id)
+            else:
+                # cancelled-before-start (no journal) or failed pre-journal run:
+                # retain Plan R's idempotent cleanup (no-op on the common path).
+                self._cleanup_run_owned(run_id)
         self._finalize_run(run_id, status, error=error, result=result)
         self._set_status(book_id, walk_name, status)
+
+    def _replay_and_clear(self, run_id: str) -> None:
+        """Replay this run's undo journal and clear it, holding the global gate.
+
+        Used by ``_finish_run`` for cancelled/interrupted (and journal-backed
+        failed) runs, and by ``reconcile_and_replay`` at startup. The global gate
+        is still held here (the run's row remains ``running`` until ``_finalize``
+        flips it terminal), so no replacement writer can start while entries are
+        restored. ``replay_run`` auto-commits per entry (never one blanket
+        transaction — P5-S2 resumability), so a crash mid-replay restarts safely
+        and already-restored entries replay as idempotent no-ops. The journal is
+        cleared only after replay returns, so a terminal run does not accumulate
+        retired journal rows. Logs the auditable replay result.
+        """
+        result = self._storage.replay_run(run_id)
+        self._storage.clear_undo_journal(run_id)
+        logger.info(
+            "Replayed undo journal for run %s before finalization: "
+            "replayed=%d skipped=%d conflicts=%d",
+            run_id,
+            result.get("replayed"),
+            result.get("skipped"),
+            result.get("conflicts"),
+        )
 
     def get_walk_status(self, book_id: str, walk_name: str) -> str:
         """Return the current status of a walk for a book.
@@ -1177,6 +1355,10 @@ class WalkRunner:
            (pending/running) ``walk_run`` rows,
         3. drops a stop-file per active run so the cancel intent survives
            a process restart.
+
+        Cancellation is a REQUEST honored at safe checkpoints. Once the active
+        run stops, its terminalizer replays the run's durable undo journal
+        (gate held) before finalizing the row — see ``_finish_run``.
         """
         self._cancelled[book_id] = True
         rows = self._storage.execute_query(

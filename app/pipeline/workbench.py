@@ -18,7 +18,10 @@ Design invariants (registered in CONTRACTS.md):
   and treats an active absence tombstone as authoritative; a manual/generated
   disagreement is surfaced as a conflict, never a duplicate insert.
 * Human decisions and absence tombstones are append-only / tombstone-based and
-  are never deleted by a rerun or by this service.
+  are never deleted by a rerun or by this service. Automatic cancelled-run
+  replay and human undo/override are distinct paths: a cancelled decision is
+  marked ``undone`` (never deleted), and the decision/merge audit history stays
+  append-only and queryable.
 
 All methods validate book scope and use parameterized SQL.  Callers map the
 raised exceptions to HTTP status codes (StaleRevisionError/ConflictError ->
@@ -246,6 +249,9 @@ class Workbench:
 
         Decisions are append-only durable history (never rewritten).  ``status``
         starts ``active`` and transitions to ``undone``/``superseded``/``conflict``.
+        A cancelled-run undo never deletes a decision — it marks it ``undone`` —
+        and a HUMAN undo/override (e.g. unmerge) also marks ``undone``; both are
+        distinct paths that leave the decision audit queryable and preserved.
         """
         if target_kind not in _DECISION_KINDS:
             raise ValidationError(f"unsupported target_kind: {target_kind}")
@@ -565,7 +571,9 @@ class Workbench:
         )
         return {r["scene_id"] for r in rows}
 
-    def _affected_rows(self, book_id: str, member_ids: list[str]) -> list[dict[str, Any]]:
+    def _affected_rows(
+        self, book_id: str, member_ids: list[str]
+    ) -> list[dict[str, Any]]:
         """Enumerate every junction/span/scene row touched by the members.
 
         Each row carries ``table``, ``character_id``, ``entity_id`` and, where
@@ -704,7 +712,9 @@ class Workbench:
         known = {
             r["id"]
             for r in self._storage.execute_query(
-                "SELECT id FROM character WHERE id IN ({})".format(", ".join("?" for _ in [canonical_id, *member_ids])),
+                "SELECT id FROM character WHERE id IN ({})".format(
+                    ", ".join("?" for _ in [canonical_id, *member_ids])
+                ),
                 (canonical_id, *member_ids),
             )
         }
@@ -730,7 +740,9 @@ class Workbench:
         review_items = self._storage.execute_query(
             "SELECT id, kind, target_table, target_id, prior_value, status"
             " FROM walk_review_item WHERE book_id = ? AND status = 'pending'"
-            " AND (target_id IN ({}) OR kind = 'alias_merge')".format(", ".join("?" for _ in member_ids)),
+            " AND (target_id IN ({}) OR kind = 'alias_merge')".format(
+                ", ".join("?" for _ in member_ids)
+            ),
             (book_id, *member_ids),
         )
         downstream_scenes = sorted(self._member_scene_keys(book_id, member_ids))
@@ -738,9 +750,7 @@ class Workbench:
             {"walk_name": "walk_2d_scene_presence", "scenes": downstream_scenes}
         ]
         conflicts = [
-            c
-            for c in self.get_conflicts(book_id)
-            if c["character_id"] in member_ids
+            c for c in self.get_conflicts(book_id) if c["character_id"] in member_ids
         ]
 
         token = f"ap-{secrets.token_urlsafe(18)}"
@@ -751,8 +761,7 @@ class Workbench:
             "base_revision": base_revision,
             "expires_ms": _now_ms() + _PREVIEW_TTL_MS,
             "affected_keys": {
-                (r["table"], r["character_id"], r["entity_id"])
-                for r in affected_rows
+                (r["table"], r["character_id"], r["entity_id"]) for r in affected_rows
             },
         }
         with self._previews_lock:
@@ -879,7 +888,9 @@ class Workbench:
             # the actionable queue no longer offers stale member targets.
             for row in self._storage.execute_query(
                 "SELECT id FROM walk_review_item WHERE book_id = ?"
-                " AND status = 'pending' AND target_id IN ({})".format(", ".join("?" for _ in member_ids)),
+                " AND status = 'pending' AND target_id IN ({})".format(
+                    ", ".join("?" for _ in member_ids)
+                ),
                 (book_id, *member_ids),
             ):
                 self._storage.execute_update(
@@ -908,8 +919,7 @@ class Workbench:
         self.require_book(book_id)
         self.check_revision(book_id, base_revision)
         row = self._storage.execute_query(
-            "SELECT * FROM character_alias_merge"
-            " WHERE book_id = ? AND merge_id = ?",
+            "SELECT * FROM character_alias_merge WHERE book_id = ? AND merge_id = ?",
             (book_id, merge_id),
         )
         if not row:
@@ -987,8 +997,7 @@ class Workbench:
                 "anchor must provide at least one of chapter_id, scene_id, paragraph_id"
             )
         if chapter_id and not self._storage.execute_query(
-            "SELECT child_id FROM book_chapter"
-            " WHERE parent_id = ? AND child_id = ?",
+            "SELECT child_id FROM book_chapter WHERE parent_id = ? AND child_id = ?",
             (book_id, chapter_id),
         ):
             raise ValidationError(
@@ -1000,9 +1009,7 @@ class Workbench:
             " WHERE bc.parent_id = ? AND chs.child_id = ?",
             (book_id, scene_id),
         ):
-            raise ValidationError(
-                f"scene {scene_id} not reachable from book {book_id}"
-            )
+            raise ValidationError(f"scene {scene_id} not reachable from book {book_id}")
         if paragraph_id and not self._storage.execute_query(
             "SELECT child_id FROM scene_paragraph scp"
             " JOIN chapter_scene chs ON scp.parent_id = chs.child_id"
@@ -1029,7 +1036,9 @@ class Workbench:
         offsets = payload.get("boundary_offsets")
         if not isinstance(offsets, list) or not offsets:
             raise ValidationError("boundary_offsets must be a non-empty list of ints")
-        if not all(isinstance(o, int) and not isinstance(o, bool) and o >= 0 for o in offsets):
+        if not all(
+            isinstance(o, int) and not isinstance(o, bool) and o >= 0 for o in offsets
+        ):
             raise ValidationError("boundary_offsets must be non-negative integers")
 
     def get_boundary_overrides(self, book_id: str) -> list[dict[str, Any]]:
@@ -1298,9 +1307,7 @@ class Workbench:
             if not isinstance(value, str):
                 raise ValidationError("prompt must be a string")
             if len(value) > _MAX_PROMPT_LEN:
-                raise ValidationError(
-                    f"prompt exceeds {_MAX_PROMPT_LEN} characters"
-                )
+                raise ValidationError(f"prompt exceeds {_MAX_PROMPT_LEN} characters")
             return value
         raise ValidationError(f"unsupported override key: {key}")
 
@@ -1448,9 +1455,7 @@ class Workbench:
             return "global"
         return "fallback"
 
-    def resolve_effective_config(
-        self, book_id: str, walk_name: str
-    ) -> dict[str, Any]:
+    def resolve_effective_config(self, book_id: str, walk_name: str) -> dict[str, Any]:
         """Return the effective config for *walk_name* plus per-field sources.
 
         Values reuse ``resolve_task_config`` so the workbench display always
@@ -1462,4 +1467,9 @@ class Workbench:
             field: self._source_for(field, walk_name, book_id)
             for field in ("model_name", "reasoning_effort", "temperature", "prompt")
         }
-        return {"book_id": book_id, "walk_name": walk_name, "values": values, "sources": sources}
+        return {
+            "book_id": book_id,
+            "walk_name": walk_name,
+            "values": values,
+            "sources": sources,
+        }

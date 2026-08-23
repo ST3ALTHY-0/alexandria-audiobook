@@ -164,28 +164,107 @@ def _now_ms():
     return int(time.time() * 1000)
 
 
+def _journal_capture(storage, run_id, table, op, row_pk=None, before=None, after=None):
+    """Append one walk_undo_entry capture, guarded on an active run.
+
+    Joins the caller's open ``savepoint()`` (capture_undo never commits inside a
+    transaction), so the entry is atomic with the accompanying write.  ``run_id``
+    is ``None`` outside a reserved run (direct unit calls), in which case no
+    journal entry is written.
+    """
+    if run_id is None:
+        return
+    storage.capture_undo(
+        run_id,
+        table,
+        op,
+        row_pk=str(row_pk) if row_pk is not None else None,
+        before_json=json.dumps(before) if before is not None else None,
+        after_json=json.dumps(after) if after is not None else None,
+    )
+
+
 def _record_provenance(storage, book_id, target_key, generation_revision, run_id):
     """Append a provenance row for a generated presence target."""
+    provenance_id = f"prov-{uuid.uuid4().hex}"
+    created_ms = _now_ms()
+    _journal_capture(
+        storage,
+        run_id,
+        "workbench_provenance",
+        "insert",
+        row_pk=provenance_id,
+        after={
+            "provenance_id": provenance_id,
+            "book_id": book_id,
+            "target_kind": "presence",
+            "target_key": target_key,
+            "run_id": run_id,
+            "generation_revision": generation_revision,
+            "source": "walk",
+            "created_ms": created_ms,
+        },
+    )
     storage.execute_insert(
         "INSERT INTO workbench_provenance "
         "(provenance_id, book_id, target_kind, target_key, run_id, "
         " generation_revision, source, created_ms) "
         "VALUES (?, ?, 'presence', ?, ?, ?, 'walk', ?)",
         (
-            f"prov-{uuid.uuid4().hex}",
+            provenance_id,
             book_id,
             target_key,
             run_id,
             generation_revision,
-            _now_ms(),
+            created_ms,
         ),
     )
 
 
 def _upsert_generated_presence(storage, book_id, character_id, scene_id, confidence):
-    """Upsert the generated presence projection by stable target key."""
+    """Upsert the generated presence projection by stable target key.
+
+    Pre-SELECTs the existing row by its stable target key to classify the upsert
+    as insert (row absent) vs update (row present), then journals the branch's
+    before/after image so the durable journal records the true mutation.
+    """
     run_id = getattr(storage, "run_id", None)
     generation_revision = _generation_revision(storage, book_id)
+    existing = storage.execute_query(
+        "SELECT * FROM character_scene_generated "
+        "WHERE book_id = ? AND character_id = ? AND scene_id = ? "
+        "AND relation_type = 'present'",
+        (book_id, character_id, scene_id),
+    )
+    after = {
+        "id": (existing[0]["id"] if existing else f"csg-{uuid.uuid4().hex}"),
+        "book_id": book_id,
+        "character_id": character_id,
+        "scene_id": scene_id,
+        "relation_type": "present",
+        "confidence": confidence,
+        "generation_revision": generation_revision,
+        "source_run_id": run_id,
+    }
+    if existing:
+        _journal_capture(
+            storage,
+            run_id,
+            "character_scene_generated",
+            "update",
+            row_pk=existing[0]["id"],
+            before=dict(existing[0]),
+            after=after,
+        )
+    else:
+        _journal_capture(
+            storage,
+            run_id,
+            "character_scene_generated",
+            "insert",
+            row_pk=after["id"],
+            after=after,
+        )
     storage.execute_insert(
         "INSERT INTO character_scene_generated "
         "(id, book_id, character_id, scene_id, relation_type, confidence, "
@@ -196,7 +275,7 @@ def _upsert_generated_presence(storage, book_id, character_id, scene_id, confide
         "              generation_revision = excluded.generation_revision, "
         "              source_run_id = excluded.source_run_id",
         (
-            f"csg-{uuid.uuid4().hex}",
+            after["id"],
             book_id,
             character_id,
             scene_id,
@@ -215,15 +294,37 @@ def _invalidate_downstream(storage, book_id):
 
     Idempotent and safe on every execution: only pending walk_review_item rows
     whose run belongs to a downstream walk are touched.  Manual rows are never
-    modified.
+    modified.  Pre-SELECTs the affected rows, journals each stale flip (before
+    status='pending', after status='stale') and performs the multi-row UPDATE
+    inside one atomic ``savepoint`` so the journal entry and the write commit
+    together (the old autocommit write left these flips outside the capture
+    seam).
     """
+    run_id = getattr(storage, "run_id", None)
     placeholders = ",".join("?" for _ in _DOWNSTREAM_WALKS)
-    storage.execute_update(
-        f"UPDATE walk_review_item SET status = 'stale' "
-        f"WHERE book_id = ? AND status = 'pending' AND run_id IN "
-        f"(SELECT run_id FROM walk_run WHERE walk_name IN ({placeholders}))",
+    where = (
+        "WHERE book_id = ? AND status = 'pending' AND run_id IN "
+        f"(SELECT run_id FROM walk_run WHERE walk_name IN ({placeholders}))"
+    )
+    rows = storage.execute_query(
+        f"SELECT * FROM walk_review_item {where}",
         (book_id, *_DOWNSTREAM_WALKS),
     )
+    with storage.savepoint("walk_2b_invalidate"):
+        for item in rows:
+            _journal_capture(
+                storage,
+                run_id,
+                "walk_review_item",
+                "update",
+                row_pk=item["id"],
+                before=dict(item),
+                after={**item, "status": "stale"},
+            )
+        storage.execute_update(
+            f"UPDATE walk_review_item SET status = 'stale' {where}",
+            (book_id, *_DOWNSTREAM_WALKS),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -365,25 +466,62 @@ def _process_character(
 
     is_review = 0.5 <= confidence < 0.7
 
+    run_id = getattr(storage, "run_id", None)
     # Get or create character
     character_id = name_to_id.get(name)
     if character_id is None:
         character_id = str(uuid.uuid4())
+        _journal_capture(
+            storage,
+            run_id,
+            "character",
+            "insert",
+            row_pk=character_id,
+            after={"id": character_id, "name": name, "aliases": aliases_json},
+        )
         storage.execute_insert(
             "INSERT INTO character (id, name, aliases) VALUES (?, ?, ?)",
             (character_id, name, aliases_json),
         )
         # character_book junction
-        storage.execute_insert(
+        cb_rowid = storage.execute_insert(
             "INSERT INTO character_book (character_id, book_id, source, confidence, human_override) "
             "VALUES (?, ?, 'walk', ?, 0)",
             (character_id, book_id, confidence),
         )
+        _journal_capture(
+            storage,
+            run_id,
+            "character_book",
+            "insert",
+            row_pk=cb_rowid,
+            after={
+                "character_id": character_id,
+                "book_id": book_id,
+                "source": "walk",
+                "confidence": confidence,
+                "human_override": 0,
+            },
+        )
         # character_series junction
-        storage.execute_insert(
+        cs_rowid = storage.execute_insert(
             "INSERT INTO character_series (character_id, series_id, source, confidence, human_override) "
             "VALUES (?, ?, 'walk', ?, 0)",
             (character_id, series_id, confidence),
+        )
+        _journal_capture(
+            storage,
+            run_id,
+            "character_series",
+            "insert",
+            row_pk=cs_rowid,
+            after={
+                "character_id": character_id,
+                "series_id": series_id,
+                "source": "walk",
+                "confidence": confidence,
+                "human_override": 0,
+            },
         )
         name_to_id[name] = character_id
         result["characters_created"] += 1
@@ -406,11 +544,26 @@ def _process_character(
         (character_id, scene_id),
     )
     if not existing:
-        storage.execute_insert(
+        cscene_rowid = storage.execute_insert(
             "INSERT INTO character_scene "
             "(character_id, scene_id, relation_type, source, confidence, human_override) "
             "VALUES (?, ?, 'present', 'walk', ?, 0)",
             (character_id, scene_id, confidence),
+        )
+        _journal_capture(
+            storage,
+            run_id,
+            "character_scene",
+            "insert",
+            row_pk=cscene_rowid,
+            after={
+                "character_id": character_id,
+                "scene_id": scene_id,
+                "relation_type": "present",
+                "source": "walk",
+                "confidence": confidence,
+                "human_override": 0,
+            },
         )
     _upsert_generated_presence(storage, book_id, character_id, scene_id, confidence)
 
@@ -427,11 +580,26 @@ def _process_character(
         )
         if existing_span:
             continue
-        storage.execute_insert(
+        cspan_rowid = storage.execute_insert(
             "INSERT INTO character_span "
             "(character_id, span_id, relation_type, source, confidence, human_override) "
             "VALUES (?, ?, ?, 'walk', ?, 0)",
             (character_id, span_id, span_relation_type, confidence),
+        )
+        _journal_capture(
+            storage,
+            run_id,
+            "character_span",
+            "insert",
+            row_pk=cspan_rowid,
+            after={
+                "character_id": character_id,
+                "span_id": span_id,
+                "relation_type": span_relation_type,
+                "source": "walk",
+                "confidence": confidence,
+                "human_override": 0,
+            },
         )
 
 
