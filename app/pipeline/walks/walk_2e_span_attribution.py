@@ -11,13 +11,17 @@ For each quotation span, the walk:
 4. Parses the response (character UUID with confidence).
 5. Creates ``character_span`` junction with ``relation_type='speaker'``.
 
-If the LLM cannot determine the speaker (returns null character_id), or returns
-an ID that is not associated with the current book, no junction is created.
+If the LLM cannot determine the speaker (returns null, empty, or whitespace-only
+character_id), or returns
+an ID that is not associated with the current book, any generated speaker
+junction for that span is retracted; human overrides are preserved. Malformed
+responses are recorded as errors and leave existing generated attributions
+unchanged.
 UNKNOWN speakers are handled at TTS boundary later.
 
 Confidence filter:
 - ≥0.7: auto-accept (junction created)
-- <0.5: auto-reject (junction skipped)
+- <0.5: auto-reject (generated junction retracted and counted as unknown)
 - 0.5–0.7: flagged for user review (junction created but tracked)
 
 LLM configuration is resolved via ``resolve_task_config('span_attribution', storage, book_id)``
@@ -201,6 +205,31 @@ def _span_image(row) -> dict:
     }
 
 
+def _remove_generated_speaker_attribution(
+    span_id: str, storage: PipelineStorage
+) -> None:
+    """Retract generated speaker rows for a span while preserving overrides."""
+    run_id = getattr(storage, "run_id", None)
+    rows = storage.execute_query(
+        "SELECT rowid, character_id, span_id, relation_type, source, confidence, "
+        "human_override FROM character_span WHERE span_id = ? "
+        "AND relation_type = 'speaker' AND human_override = 0",
+        (span_id,),
+    )
+    for row in rows:
+        _journal_capture(
+            storage,
+            run_id,
+            "character_span",
+            "delete",
+            row_pk=row["rowid"],
+            before=_span_image(row),
+        )
+        storage.execute_update(
+            "DELETE FROM character_span WHERE rowid = ?", (row["rowid"],)
+        )
+
+
 def _get_surrounding_context(
     paragraph_id: str, span_id: str, storage: PipelineStorage
 ) -> dict[str, list[str]]:
@@ -280,6 +309,11 @@ def _process_span(
 
     # Parse response
     attribution_data = _parse_llm_response(response_text)
+    if not attribution_data:
+        result["errors"].append(
+            {"span_id": span_id, "error": "Failed to parse LLM attribution response"}
+        )
+        return
 
     # Process attribution
     with storage.savepoint("walk_2e_span"):
@@ -311,6 +345,7 @@ def _process_attribution(
     character_id = attribution_data.get("character_id")
     if not character_id or (isinstance(character_id, str) and not character_id.strip()):
         # Unknown speaker
+        _remove_generated_speaker_attribution(span_id, storage)
         result["speakers_unknown"] += 1
         return
 
@@ -319,33 +354,11 @@ def _process_attribution(
     run_id = getattr(storage, "run_id", None)
 
     if character_id not in existing_character_ids:
-        # Reject IDs that are not associated with the current book. Also remove
-        # any stale generated foreign attribution left by an earlier run while
-        # preserving human decisions.  Each row-level delete is pre-captured
+        # Reject IDs that are not associated with the current book. Also retract
+        # any stale generated attribution left by an earlier run while
+        # preserving human decisions. Each row-level delete is pre-captured
         # (before image + rowid identity) so a cancelled run can restore it.
-        stale_rows = storage.execute_query(
-            "SELECT rowid, character_id, span_id, relation_type, "
-            "       source, confidence, human_override "
-            "FROM character_span "
-            "WHERE span_id = ? AND relation_type = 'speaker' "
-            "AND human_override = 0",
-            (span_id,),
-        )
-        for stale_row in stale_rows:
-            if stale_row["character_id"] in existing_character_ids:
-                continue
-            _journal_capture(
-                storage,
-                run_id,
-                "character_span",
-                "delete",
-                row_pk=stale_row["rowid"],
-                before=_span_image(stale_row),
-            )
-            storage.execute_update(
-                "DELETE FROM character_span WHERE rowid = ?",
-                (stale_row["rowid"],),
-            )
+        _remove_generated_speaker_attribution(span_id, storage)
         result["speakers_unknown"] += 1
         return
 
@@ -358,6 +371,8 @@ def _process_attribution(
     # Confidence filter
     if confidence < 0.5:
         # Auto-reject
+        _remove_generated_speaker_attribution(span_id, storage)
+        result["speakers_unknown"] += 1
         return
 
     is_review = 0.5 <= confidence < 0.7
@@ -506,8 +521,9 @@ If you cannot determine the speaker:
 def _parse_llm_response(response_text: str) -> dict:
     """Parse the LLM response into an attribution dict.
 
-    Returns a dict with character_id and confidence. If parsing fails or
-    character_id is null/empty, returns empty dict.
+    Returns a dict with character_id and confidence. If parsing fails or the
+    response omits character_id, returns an empty dict; explicit null and empty
+    character IDs are returned as unknown attribution values.
     """
     attribution = extract_json_from_llm_response(response_text, expected_type="dict")
     if attribution is None:
@@ -519,6 +535,9 @@ def _parse_llm_response(response_text: str) -> dict:
         return {}
 
     # Extract and validate fields
+    if "character_id" not in attribution:
+        logger.error("LLM response is missing character_id")
+        return {}
     character_id = attribution.get("character_id")
     confidence = attribution.get("confidence", 0.8)
 
