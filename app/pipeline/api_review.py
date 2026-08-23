@@ -217,22 +217,24 @@ def _resolve_decision_action(
     (else 409).  A superseding human ``review`` decision is recorded in one
     transaction and the referenced decision is marked superseded.
     """
-    rows = storage.execute_query(
-        "SELECT * FROM workbench_decision WHERE decision_id = ?", (decision_id,)
-    )
-    if not rows:
-        raise HTTPException(status_code=404, detail=f"Unknown decision: {decision_id}")
-    decision = rows[0]
-    if decision["status"] != "active":
-        raise HTTPException(
-            status_code=409,
-            detail=f"Decision '{decision_id}' is already {decision['status']}",
-        )
-    book_id = decision["book_id"]
-    _guard(workbench.require_book, book_id)
-    if base_revision is not None:
-        _guard(workbench.check_revision, book_id, base_revision)
     with storage.transaction():
+        rows = storage.execute_query(
+            "SELECT * FROM workbench_decision WHERE decision_id = ?", (decision_id,)
+        )
+        if not rows:
+            raise HTTPException(
+                status_code=404, detail=f"Unknown decision: {decision_id}"
+            )
+        decision = rows[0]
+        if decision["status"] != "active":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Decision '{decision_id}' is already {decision['status']}",
+            )
+        book_id = decision["book_id"]
+        _guard(workbench.require_book, book_id)
+        if base_revision is not None:
+            _guard(workbench.check_revision, book_id, base_revision)
         revision = _guard(workbench.allocate_revision, book_id)
         new_decision_id = _guard(
             workbench.record_decision,
@@ -291,16 +293,16 @@ def _resolve_junction_action(
             status_code=404,
             detail=f"Junction target '{item_id}' does not resolve to a book",
         )
-    _guard(workbench.require_book, book_id)
-    if base_revision is not None:
-        _guard(workbench.check_revision, book_id, base_revision)
-    try:
-        manager.resolve_review_action(action, stripped, new_value)
-    except ReviewItemNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
     with storage.transaction():
+        _guard(workbench.require_book, book_id)
+        if base_revision is not None:
+            _guard(workbench.check_revision, book_id, base_revision)
+        try:
+            manager.resolve_review_action(action, stripped, new_value)
+        except ReviewItemNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         revision = _guard(workbench.allocate_revision, book_id)
         new_decision_id = _guard(
             workbench.record_decision,
@@ -466,47 +468,49 @@ async def undo_decision(
     cross-book decision.  Alias-merge decisions delegate to the domain's
     reversible ``unmerge_alias``.
     """
-    _guard(workbench.require_book, book_id)
-    _guard(workbench.check_revision, book_id, request.base_revision)
-    rows = storage.execute_query(
-        "SELECT * FROM workbench_decision WHERE decision_id = ? AND book_id = ?",
-        (decision_id, book_id),
-    )
-    if not rows:
-        raise HTTPException(status_code=404, detail=f"Unknown decision: {decision_id}")
-    decision = rows[0]
-    if decision["status"] != "active":
-        raise HTTPException(
-            status_code=409,
-            detail=f"Decision '{decision_id}' is already {decision['status']}",
-        )
-    # Alias merges are reversibly undone by the domain (restores projection and
-    # prior voice assignments; reactivates review items).
-    if decision["decision_type"] == "alias_merge:merge":
-        merges = storage.execute_query(
-            "SELECT merge_id FROM character_alias_merge "
-            "WHERE decision_id = ? AND book_id = ? AND status = 'active'",
+    with storage.transaction():
+        _guard(workbench.require_book, book_id)
+        _guard(workbench.check_revision, book_id, request.base_revision)
+        rows = storage.execute_query(
+            "SELECT * FROM workbench_decision WHERE decision_id = ? AND book_id = ?",
             (decision_id, book_id),
         )
-        if not merges:
+        if not rows:
+            raise HTTPException(
+                status_code=404, detail=f"Unknown decision: {decision_id}"
+            )
+        decision = rows[0]
+        if decision["status"] != "active":
             raise HTTPException(
                 status_code=409,
-                detail=f"Active merge for decision '{decision_id}' not found",
+                detail=f"Decision '{decision_id}' is already {decision['status']}",
             )
-        result = _guard(
-            workbench.unmerge_alias,
-            book_id=book_id,
-            merge_id=merges[0]["merge_id"],
-            base_revision=request.base_revision,
-        )
-        return _result_action_dto(
-            item_id=f"decision:{decision_id}",
-            decision_id=result["decision_id"],
-            status=result["status"],
-            generation_revision=result["generation_revision"],
-            conflict=result.get("conflict"),
-        )
-    with storage.transaction():
+        # Alias merges are reversibly undone by the domain (restores projection and
+        # prior voice assignments; reactivates review items).
+        if decision["decision_type"] == "alias_merge:merge":
+            merges = storage.execute_query(
+                "SELECT merge_id FROM character_alias_merge "
+                "WHERE decision_id = ? AND book_id = ? AND status = 'active'",
+                (decision_id, book_id),
+            )
+            if not merges:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Active merge for decision '{decision_id}' not found",
+                )
+            result = _guard(
+                workbench.unmerge_alias,
+                book_id=book_id,
+                merge_id=merges[0]["merge_id"],
+                base_revision=request.base_revision,
+            )
+            return _result_action_dto(
+                item_id=f"decision:{decision_id}",
+                decision_id=result["decision_id"],
+                status=result["status"],
+                generation_revision=result["generation_revision"],
+                conflict=result.get("conflict"),
+            )
         revision = _guard(workbench.allocate_revision, book_id)
         inverse_id = _guard(
             workbench.record_decision,
