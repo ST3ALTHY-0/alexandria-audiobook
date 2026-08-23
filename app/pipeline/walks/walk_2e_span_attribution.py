@@ -11,8 +11,9 @@ For each quotation span, the walk:
 4. Parses the response (character UUID with confidence).
 5. Creates ``character_span`` junction with ``relation_type='speaker'``.
 
-If the LLM cannot determine the speaker (returns null character_id), no junction
-is created. UNKNOWN speakers are handled at TTS boundary later.
+If the LLM cannot determine the speaker (returns null character_id), or returns
+an ID that is not associated with the current book, no junction is created.
+UNKNOWN speakers are handled at TTS boundary later.
 
 Confidence filter:
 - ≥0.7: auto-accept (junction created)
@@ -252,6 +253,9 @@ def _process_span(
             span_id=span_id,
             storage=storage,
             result=result,
+            existing_character_ids={
+                character["id"] for character in existing_characters
+            },
         )
 
 
@@ -260,10 +264,14 @@ def _process_attribution(
     span_id: str,
     storage: PipelineStorage,
     result: dict,
+    existing_character_ids: set[str],
 ) -> None:
     """Process a single speaker attribution from the LLM response.
 
-    Applies confidence filter and creates character_span junction if needed.
+    Applies the current-book membership and confidence filters, then creates a
+    ``character_span`` junction if needed. ``existing_character_ids`` is the
+    already-loaded set of characters associated with the current book; foreign
+    IDs are treated as unknown and cannot be written.
     """
     character_id = attribution_data.get("character_id")
     if not character_id or (isinstance(character_id, str) and not character_id.strip()):
@@ -272,6 +280,27 @@ def _process_attribution(
         return
 
     character_id = character_id.strip()
+
+    if character_id not in existing_character_ids:
+        # Reject IDs that are not associated with the current book. Also remove
+        # any stale generated foreign attribution left by an earlier run while
+        # preserving human decisions.
+        stale_rows = storage.execute_query(
+            "SELECT character_id FROM character_span "
+            "WHERE span_id = ? AND relation_type = 'speaker' "
+            "AND human_override = 0",
+            (span_id,),
+        )
+        for stale_row in stale_rows:
+            if stale_row["character_id"] not in existing_character_ids:
+                storage.execute_update(
+                    "DELETE FROM character_span WHERE span_id = ? "
+                    "AND relation_type = 'speaker' AND character_id = ? "
+                    "AND human_override = 0",
+                    (span_id, stale_row["character_id"]),
+                )
+        result["speakers_unknown"] += 1
+        return
 
     confidence = attribution_data.get("confidence", 0.8)
     if not isinstance(confidence, (int, float)):

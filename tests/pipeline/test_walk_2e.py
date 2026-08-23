@@ -328,6 +328,99 @@ class TestExecute:
         )
         assert rows[0]["cnt"] == 0
 
+    def test_speaker_from_another_book_is_unknown(
+        self, seeded_storage, mock_llm_client, monkeypatch
+    ):
+        """An LLM UUID not associated with the current book is rejected."""
+        seeded_storage.execute_insert(
+            "INSERT INTO book (id, series_id) VALUES (?, ?)",
+            ("book-2", "series-1"),
+        )
+        seeded_storage.execute_insert(
+            "INSERT INTO character (id, name, aliases) VALUES (?, ?, ?)",
+            ("char-other-book", "Other Book Character", "[]"),
+        )
+        seeded_storage.execute_insert(
+            "INSERT INTO character_book (character_id, book_id, source, confidence, human_override) "
+            "VALUES (?, ?, 'walk', 0.9, 0)",
+            ("char-other-book", "book-2"),
+        )
+        response = json.dumps({"character_id": "char-other-book", "confidence": 0.9})
+        _patch_llm(monkeypatch, mock_llm_client, response)
+
+        result = execute("book-1", seeded_storage, {})
+
+        assert result["speakers_unknown"] == 3
+        assert result["speakers_attributed"] == 0
+        rows = seeded_storage.execute_query(
+            "SELECT COUNT(*) AS cnt FROM character_span"
+        )
+        assert rows[0]["cnt"] == 0
+
+    def test_foreign_speaker_removes_stale_generated_attribution(
+        self, seeded_storage, mock_llm_client, monkeypatch
+    ):
+        """A foreign response does not preserve a stale generated speaker row."""
+        seeded_storage.execute_insert(
+            "INSERT INTO book (id, series_id) VALUES (?, ?)",
+            ("book-2", "series-1"),
+        )
+        seeded_storage.execute_insert(
+            "INSERT INTO character (id, name, aliases) VALUES (?, ?, ?)",
+            ("char-not-in-book", "Other Book Character", "[]"),
+        )
+        seeded_storage.execute_insert(
+            "INSERT INTO character_book (character_id, book_id, source, confidence, human_override) "
+            "VALUES (?, ?, 'walk', 0.9, 0)",
+            ("char-not-in-book", "book-2"),
+        )
+        seeded_storage.execute_insert(
+            """INSERT INTO character_span
+               (character_id, span_id, relation_type, source, confidence, human_override)
+               VALUES (?, ?, 'speaker', 'walk', 0.9, 0)""",
+            ("char-not-in-book", "span-1b"),
+        )
+        response = json.dumps({"character_id": "char-not-in-book", "confidence": 0.9})
+        _patch_llm(monkeypatch, mock_llm_client, response)
+
+        result = execute("book-1", seeded_storage, {})
+
+        assert result["speakers_unknown"] == 3
+        rows = seeded_storage.execute_query(
+            "SELECT character_id FROM character_span WHERE span_id = ?",
+            ("span-1b",),
+        )
+        assert rows == []
+
+    def test_foreign_speaker_preserves_human_override(
+        self, seeded_storage, mock_llm_client, monkeypatch
+    ):
+        """Rejecting a foreign UUID never removes a human speaker decision."""
+        seeded_storage.execute_insert(
+            "INSERT INTO character (id, name, aliases) VALUES (?, ?, ?)",
+            ("char-not-in-book", "Other Book Character", "[]"),
+        )
+        seeded_storage.execute_insert(
+            """INSERT INTO character_span
+               (character_id, span_id, relation_type, source, confidence, human_override)
+               VALUES (?, ?, 'speaker', 'human', 1.0, 1)""",
+            ("char-not-in-book", "span-1b"),
+        )
+        response = json.dumps({"character_id": "char-not-in-book", "confidence": 0.9})
+        _patch_llm(monkeypatch, mock_llm_client, response)
+
+        result = execute("book-1", seeded_storage, {})
+
+        assert result["speakers_unknown"] == 3
+        row = seeded_storage.execute_query(
+            "SELECT character_id, source, human_override FROM character_span "
+            "WHERE span_id = ?",
+            ("span-1b",),
+        )[0]
+        assert row["character_id"] == "char-not-in-book"
+        assert row["source"] == "human"
+        assert row["human_override"] == 1
+
     def test_confidence_filter_high_accepted(
         self, seeded_storage, mock_llm_client, monkeypatch
     ):
