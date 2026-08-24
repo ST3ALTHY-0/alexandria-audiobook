@@ -10,6 +10,7 @@ from app.pipeline.populate import populate_initial_spine
 from app.pipeline.walks.runner import HeartbeatStorage
 from app.pipeline.walks.walk_2g_voice_audition import (
     _build_voice_audition_prompt,
+    _collect_dialogue_spans,
     _parse_llm_response,
     _sample_spans,
     execute,
@@ -192,6 +193,15 @@ def _insert_character_span(storage, character_id, span_id, relation_type):
     )
 
 
+def _insert_book2_character_membership(storage, character_id):
+    """Share a character with the second book for scope tests."""
+    storage.execute_insert(
+        "INSERT INTO character_book (character_id, book_id, source, confidence, human_override) "
+        "VALUES (?, 'book-2', 'walk', 0.9, 0)",
+        (character_id,),
+    )
+
+
 def _make_voice_profile_response(voice_profile=None, confidence=0.9):
     """Create a mock LLM response JSON for voice audition."""
     if voice_profile is None:
@@ -252,6 +262,52 @@ class TestExecute:
         assert "profiles_for_review" in result
         assert "errors" in result
         assert result["book_id"] == "book-1"
+
+    def test_dialogue_spans_are_book_scoped_and_spine_ordered(self, populated_storage):
+        """Shared-character evidence excludes other books and follows the spine."""
+        _insert_character(populated_storage, "char-1", "John")
+
+        # Put a later-position span in book 1 whose ID sorts before the first
+        # speaker span. UUID ordering must not determine the sample order.
+        populated_storage.execute_insert(
+            "INSERT INTO span (id, span_type, text) VALUES (?, 'quotation', ?)",
+            ("a-later", "Book one later"),
+        )
+        populated_storage.execute_insert(
+            "INSERT INTO paragraph_span (child_id, parent_id, position) "
+            "VALUES ('a-later', 'para-2', 2)"
+        )
+
+        populate_initial_spine(
+            "series-1",
+            "book-2",
+            [
+                {
+                    "id": "chapter-b",
+                    "paragraphs": [
+                        {
+                            "id": "para-b",
+                            "spans": [
+                                {
+                                    "id": "book-2-first",
+                                    "span_type": "quotation",
+                                    "text": "Book two",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+            populated_storage,
+        )
+        _insert_book2_character_membership(populated_storage, "char-1")
+        _insert_character_span(populated_storage, "char-1", "span-1b", "speaker")
+        _insert_character_span(populated_storage, "char-1", "a-later", "speaker")
+        _insert_character_span(populated_storage, "char-1", "book-2-first", "speaker")
+
+        rows = _collect_dialogue_spans("char-1", "book-1", populated_storage)
+
+        assert [row["span_id"] for row in rows] == ["span-1b", "a-later"]
 
     def test_voice_profile_stored_in_metadata(
         self, populated_storage, mock_llm_client, monkeypatch

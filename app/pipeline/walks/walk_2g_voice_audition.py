@@ -12,7 +12,12 @@ For each character, the walk:
 2. Collects up to 5 representative dialogue spans (``relation_type='speaker'``).
 3. Sends character name, description, and sampled dialogue to the LLM.
 4. Parses the response (voice profile dict + confidence).
-5. Stores the voice profile in ``character_metadata`` (UPSERT).
+5. Stores the voice profile in global ``character_metadata`` (UPSERT).
+
+    ``book_id`` scopes the evidence supplied to the audition.  The resulting
+    ``voice_profile`` remains intentionally global per character, matching the
+    character identity graph and the consumers in later walks; a book-specific
+    run may replace it, but only with evidence from that book.
 
 Confidence filter:
 - ≥0.7: auto-accept (voice profile stored)
@@ -202,22 +207,30 @@ def _get_character_description(
 
 
 def _collect_dialogue_spans(
-    character_id: str, storage: PipelineStorage
+    character_id: str, book_id: str, storage: PipelineStorage
 ) -> list[dict[str, str]]:
-    """Collect dialogue spans where the character is the speaker.
+    """Collect this book's dialogue spans where the character is the speaker.
 
-    Returns a list of dicts with span_id and text.
+    The character graph is shared across books, so the structural spine joins
+    are required to keep evidence for a shared character within ``book_id``.
+    Results follow spine order (with span ID only as a deterministic tie-break)
+    so sampling is spread across the actual book rather than UUID order.
     """
     rows = storage.execute_query(
         """
         SELECT s.id AS span_id, s.text
         FROM character_span cs
         JOIN span s ON cs.span_id = s.id
+        JOIN paragraph_span ps ON ps.child_id = s.id
+        JOIN scene_paragraph sp ON sp.child_id = ps.parent_id
+        JOIN chapter_scene sc ON sc.child_id = sp.parent_id
+        JOIN book_chapter bc ON bc.child_id = sc.parent_id
         WHERE cs.character_id = ?
+          AND bc.parent_id = ?
           AND cs.relation_type = 'speaker'
-        ORDER BY s.id
+        ORDER BY bc.position, sc.position, sp.position, ps.position, s.id
         """,
-        (character_id,),
+        (character_id, book_id),
     )
     return [
         {
@@ -263,7 +276,7 @@ def _process_character(
 ) -> None:
     """Process a single character: collect description + dialogue, call LLM, store profile."""
     # Collect dialogue spans for this character
-    dialogue_spans = _collect_dialogue_spans(character_id, storage)
+    dialogue_spans = _collect_dialogue_spans(character_id, book_id, storage)
 
     if not dialogue_spans:
         logger.warning(
