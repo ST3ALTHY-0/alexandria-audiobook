@@ -690,6 +690,51 @@ async def list_project_snapshots(
     ]
 
 
+@router.get("/books")
+async def list_books_projects(
+    storage: PipelineStorage = Depends(get_storage),
+) -> list[dict]:
+    """List every persisted book with its owned project snapshots.
+
+    Each item is the BookProjects DTO ``{id, series_id, book_number,
+    version, position, projects}`` where ``projects`` is the array of that
+    book's Plan I ProjectSnapshot DTOs ``{name, book_id, created_ms,
+    size_bytes}`` — empty when the book has no snapshots.  Books are
+    returned in deterministic adapter order (``series_id``,
+    ``book_number``, ``position``, ``id``).
+
+    ``projects`` arrays are grouped by exact snapshot ``book_id``
+    ownership; orphan/unowned snapshot rows (whose ``book_id`` matches no
+    persisted book) are omitted, never reassigned.  Read-only: no
+    book/series mutation and no active-walk coordination (mirrors the
+    ``GET /projects`` listing surface; save/load/delete/rename semantics
+    are unchanged).
+    """
+    books = storage.list_books()
+    snapshots = storage.list_project_snapshots()
+    by_book: dict[str, list[dict]] = {}
+    for snap in snapshots:
+        by_book.setdefault(snap["book_id"], []).append(
+            {
+                "name": snap["name"],
+                "book_id": snap["book_id"],
+                "created_ms": snap["created_ms"],
+                "size_bytes": len(snap["snapshot_json"].encode("utf-8")),
+            }
+        )
+    return [
+        {
+            "id": book["id"],
+            "series_id": book["series_id"],
+            "book_number": book["book_number"],
+            "version": book["version"],
+            "position": book["position"],
+            "projects": by_book.get(book["id"], []),
+        }
+        for book in books
+    ]
+
+
 @router.delete("/projects/{name}")
 async def delete_project_snapshot(
     name: str,

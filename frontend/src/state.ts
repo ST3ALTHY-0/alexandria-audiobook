@@ -182,6 +182,22 @@ export function clearPipelineRenderJob(): void {
 }
 
 /**
+ * Clear state that is scoped to the currently selected book, without
+ * changing pipelineBookId and without writing any persistence key.
+ *
+ * `setPipelineBookId(bookId)` remains the sole canonical state/localStorage
+ * write path for the selected book; this helper only drops book-specific
+ * shared caches (the render job handle plus the loaded workbench and its
+ * config) so a later book switch starts from a clean slate.  It must NOT
+ * touch global, book-agnostic state (e.g. shared characters).
+ */
+export function clearBookScopedState(): void {
+  clearPipelineRenderJob();
+  state.workbench = null;
+  state.workbenchConfig = null;
+}
+
+/**
  * Restore persisted pipeline state from localStorage.
  * Call once on page load before any tab init runs.
  */

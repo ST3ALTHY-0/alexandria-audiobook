@@ -29,9 +29,11 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   ProjectSnapshot,
+  BookProjects,
   formatSnapshotSize,
   formatSnapshotDate,
   renderProjectsList,
+  renderBooksList,
   loadProjects,
   saveProject,
   loadProject,
@@ -97,6 +99,26 @@ const MOCK_SNAPSHOTS: ProjectSnapshot[] = [
     book_id: 'book-123',
     created_ms: 1749999999000,
     size_bytes: 1024,
+  },
+];
+
+/** BookProjects fixtures for the multi-book listing tests. */
+const MOCK_BOOKS: BookProjects[] = [
+  {
+    id: 'book-123',
+    series_id: 'series-1',
+    book_number: 1,
+    version: 3,
+    position: 1,
+    projects: [...MOCK_SNAPSHOTS],
+  },
+  {
+    id: 'book-456',
+    series_id: 'series-1',
+    book_number: 2,
+    version: 1,
+    position: 2,
+    projects: [],
   },
 ];
 
@@ -172,12 +194,67 @@ describe('renderProjectsList', () => {
   });
 });
 
+describe('renderBooksList', () => {
+  it('renders every book with its identity metadata and owned snapshots', () => {
+    state.pipelineBookId = 'book-123';
+    const html = renderBooksList(MOCK_BOOKS);
+
+    expect(html).toContain('Series series-1');
+    expect(html).toContain('Book 1');
+    expect(html).toContain('v3');
+    expect(html).toContain('book-123');
+    expect(html).toContain('book-456');
+    // Each book's owned snapshots are rendered beneath its header.
+    expect(html).toContain('Project 2026-08-07 03:13');
+    expect(html).toContain('data-action="project-open"');
+    state.pipelineBookId = null;
+  });
+
+  it('marks the currently selected book as current (no Open control)', () => {
+    state.pipelineBookId = 'book-123';
+    const html = renderBooksList(MOCK_BOOKS);
+
+    expect(html).toContain('Current');
+    // The current book renders a badge; any other book still gets Open.
+    expect(html).toContain('data-action="project-open"');
+    state.pipelineBookId = 'book-456';
+    const html2 = renderBooksList(MOCK_BOOKS);
+    // The other book (book-123) now offers Open; book-456 is Current.
+    expect(html2).toContain('data-book-id="book-123"');
+    expect(html2.match(/data-action="project-open"/g)?.length).toBe(1);
+    state.pipelineBookId = null;
+  });
+
+  it('escapes server-supplied book identity metadata', () => {
+    const hostile: BookProjects[] = [
+      {
+        id: '<script>alert(2)</script>',
+        series_id: 's<div>',
+        book_number: 1,
+        version: 2,
+        position: 1,
+        projects: [],
+      },
+    ];
+    const html = renderBooksList(hostile);
+    expect(html).not.toContain('<script>');
+    expect(html).toContain('&lt;script&gt;alert(2)&lt;/script&gt;');
+    expect(html).not.toContain('<div>');
+    expect(html).toContain('s&lt;div&gt;');
+  });
+
+  it('renders an empty state when there are no books', () => {
+    const html = renderBooksList([]);
+    expect(html).toContain('No books onboarded');
+  });
+});
+
 describe('loadProjects', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     state.pipelineBookId = 'book-123';
     document.body.innerHTML = '<div id="projects-list"></div>';
-    vi.mocked(API.get).mockResolvedValue(MOCK_SNAPSHOTS);
+    vi.mocked(API.get).mockResolvedValue(MOCK_BOOKS);
   });
 
   afterEach(() => {
@@ -185,22 +262,23 @@ describe('loadProjects', () => {
     document.body.innerHTML = '';
   });
 
-  it('GETs /api/pipeline/projects filtered by the active book_id and renders the list', async () => {
+  it('GETs /api/pipeline/books and renders the multi-book list', async () => {
     await loadProjects();
 
-    expect(API.get).toHaveBeenCalledWith('/api/pipeline/projects?book_id=book-123');
+    expect(API.get).toHaveBeenCalledWith('/api/pipeline/books');
     const list = document.getElementById('projects-list');
+    expect(list?.textContent).toContain('book-123');
+    expect(list?.textContent).toContain('book-456');
     expect(list?.textContent).toContain('Project 2026-08-07 03:13');
-    expect(list?.textContent).toContain('Project 2026-08-07 03:12');
   });
 
-  it('renders an empty state when the server returns no snapshots', async () => {
+  it('renders an empty state when the server returns no books', async () => {
     vi.mocked(API.get).mockResolvedValue([]);
 
     await loadProjects();
 
     const list = document.getElementById('projects-list');
-    expect(list?.textContent).toContain('No saved projects');
+    expect(list?.textContent).toContain('No books onboarded');
   });
 
   it('shows an error toast when the GET fails', async () => {
@@ -235,7 +313,7 @@ describe('saveProject', () => {
     await saveProject();
 
     expect(API.post).toHaveBeenCalledWith('/api/pipeline/projects', { book_id: 'book-123' });
-    expect(API.get).toHaveBeenCalledWith('/api/pipeline/projects?book_id=book-123');
+    expect(API.get).toHaveBeenCalledWith('/api/pipeline/books');
   });
 
   it('toasts the server-generated auto name on success', async () => {
@@ -309,7 +387,7 @@ describe('loadProject', () => {
       'warning',
     );
     // List refreshed + editor spans reloaded via the cross-tab refresh hook.
-    expect(API.get).toHaveBeenCalledWith('/api/pipeline/projects?book_id=book-123');
+    expect(API.get).toHaveBeenCalledWith('/api/pipeline/books');
     expect(loadSpans).toHaveBeenCalled();
   });
 
@@ -328,7 +406,7 @@ describe('loadProject', () => {
       expect.stringContaining('Project 2026-08-07 03:12'),
       'success',
     );
-    expect(API.get).toHaveBeenCalledWith('/api/pipeline/projects?book_id=book-123');
+    expect(API.get).toHaveBeenCalledWith('/api/pipeline/books');
     expect(loadSpans).toHaveBeenCalled();
   });
 
@@ -431,7 +509,7 @@ describe('deleteProject', () => {
       '/api/pipeline/projects/' + encodeURIComponent('Project 2026-08-07 03:13'),
     );
     expect(showToast).toHaveBeenCalledWith(expect.stringContaining('deleted'), 'success');
-    expect(API.get).toHaveBeenCalledWith('/api/pipeline/projects?book_id=book-123');
+    expect(API.get).toHaveBeenCalledWith('/api/pipeline/books');
   });
 
   it('does not DELETE when the user cancels the confirmation', async () => {
@@ -477,7 +555,7 @@ describe('renameProject', () => {
       { new_name: 'Project 2026-08-07 09:00' },
     );
     expect(showToast).toHaveBeenCalledWith(expect.stringContaining('Project 2026-08-07 09:00'), 'success');
-    expect(API.get).toHaveBeenCalledWith('/api/pipeline/projects?book_id=book-123');
+    expect(API.get).toHaveBeenCalledWith('/api/pipeline/books');
   });
 
   it('does not PATCH when the user cancels the prompt', async () => {
@@ -538,7 +616,7 @@ describe('initProjects', () => {
     document.dispatchEvent(new Event('DOMContentLoaded'));
 
     // Initial list load on init.
-    expect(API.get).toHaveBeenCalledWith('/api/pipeline/projects?book_id=book-123');
+    expect(API.get).toHaveBeenCalledWith('/api/pipeline/books');
 
     // Save button → POST /projects.
     const saveBtn = document.getElementById('btn-project-save') as HTMLButtonElement;

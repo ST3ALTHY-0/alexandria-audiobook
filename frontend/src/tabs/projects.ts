@@ -1,14 +1,14 @@
 /**
- * Projects tab (Plan I, Phase 3) — snapshot projects UI.
+ * Projects tab — snapshot projects + multi-book navigation (Plan M).
  *
- * Saves the current book as an auto-named snapshot, and lists / loads /
- * deletes / renames saved snapshots against the /api/pipeline/projects/*
- * endpoints (api_operations.py). This is a net-new surface wired ONLY to
- * the pipeline snapshot API — no legacy /api/scripts/* UI.
+ * Lists every persisted book (GET /api/pipeline/books) grouped with its
+ * owned snapshots, lets the user OPEN a book (canonical setPipelineBookId +
+ * book-scoped invalidation), and saves / loads / deletes / renames snapshots
+ * for the currently selected book against /api/pipeline/projects/*.
  *
  * Endpoints used:
+ *   - GET    /api/pipeline/books                          → BookProjects list
  *   - POST   /api/pipeline/projects {book_id}          → auto-named snapshot
- *   - GET    /api/pipeline/projects?book_id=           → newest-first list
  *   - POST   /api/pipeline/projects/load {name, book_id} → restore (409 +
  *     Retry-After while a walk/render is active — retried exactly once)
  *   - DELETE /api/pipeline/projects/{name}
@@ -19,9 +19,19 @@
  */
 
 import * as API from '../api';
-import { state } from '../state';
+import { state, setPipelineBookId, clearBookScopedState } from '../state';
 import { showToast, showConfirm, escapeHtml } from '../utils';
-import { clearUndoStack, loadSpans, loadSingleSpeakerToggle } from './editor-pipeline';
+import {
+  clearUndoStack,
+  loadSpans,
+  loadSingleSpeakerToggle,
+  resetRenderStateForBookReplacement,
+} from './editor-pipeline';
+import {
+  loadWorkbench,
+  loadWorkbenchConfig,
+  clearUndoStack as clearWorkbenchUndoStack,
+} from './workbench';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -33,6 +43,20 @@ export interface ProjectSnapshot {
   book_id: string;
   created_ms: number;
   size_bytes: number;
+}
+
+/**
+ * A persisted book and its owned snapshots (BookProjects DTO, GET
+ * /api/pipeline/books). Identity metadata is read-only — the frontend never
+ * mutates book/series identity or position.
+ */
+export interface BookProjects {
+  id: string;
+  series_id: string | null;
+  book_number: number | null;
+  version: number;
+  position: number | null;
+  projects: ProjectSnapshot[];
 }
 
 /** Response of POST /api/pipeline/projects/load. */
@@ -99,22 +123,122 @@ export function renderProjectsList(snapshots: ProjectSnapshot[]): string {
 }
 
 // ---------------------------------------------------------------------------
-// List / Save / Load / Delete / Rename
+// List / Save / Load / Delete / Rename / Open
 // ---------------------------------------------------------------------------
 
-/** Load and render the snapshot list for the active book. */
+/**
+ * Human-readable label for a book's identity metadata (series / number /
+ * position / version). Returns a fallback when the book has no usable
+ * identity metadata. Only ever used for display — escaped by callers.
+ */
+export function formatBookLabel(book: BookProjects): string {
+  const parts: string[] = [];
+  if (book.series_id) parts.push(`Series ${book.series_id}`);
+  if (book.book_number != null) parts.push(`Book ${book.book_number}`);
+  if (book.position != null) parts.push(`Pos ${book.position}`);
+  if (book.version != null) parts.push(`v${book.version}`);
+  return parts.length > 0 ? parts.join(' \u00b7 ') : 'Unnamed book';
+}
+
+/**
+ * Render every persisted book, each grouped with its owned snapshots and an
+ * Open control (or a "Current" badge when it is the selected book). All
+ * server-supplied content (book id, series, position) is escaped — no raw
+ * innerHTML injection.
+ */
+export function renderBooksList(books: BookProjects[]): string {
+  if (books.length === 0) {
+    return '<p class="text-muted mb-0">No books onboarded yet. Import an EPUB on the Script tab to create a book project.</p>';
+  }
+
+  return books
+    .map((book) => {
+      const safeId = escapeHtml(book.id);
+      const isCurrent = book.id === state.pipelineBookId;
+      const activeClass = isCurrent ? ' border-primary' : '';
+      const label = escapeHtml(formatBookLabel(book));
+      const openControl = isCurrent
+        ? '<span class="badge bg-primary flex-shrink-0">Current</span>'
+        : `<button type="button" class="btn btn-sm btn-outline-primary flex-shrink-0" data-action="project-open" data-book-id="${safeId}" title="Open this book as the current project"><i class="fas fa-folder-open me-1"></i>Open</button>`;
+      return `
+        <div class="book-project mb-3 border rounded p-2${activeClass}">
+          <div class="d-flex justify-content-between align-items-center mb-2">
+            <div class="me-2 overflow-hidden">
+              <div class="fw-semibold text-truncate" title="${safeId}">${label}</div>
+              <code class="small text-muted">${safeId}</code>
+            </div>
+            ${openControl}
+          </div>
+          ${renderProjectsList(book.projects)}
+        </div>`;
+    })
+    .join('');
+}
+
+/** Load and render the book/project list for multi-book navigation. */
 export async function loadProjects(): Promise<void> {
   const listEl = document.getElementById('projects-list');
   if (!listEl) return;
 
-  const qs = state.pipelineBookId ? `?book_id=${encodeURIComponent(state.pipelineBookId)}` : '';
   try {
-    const snapshots = await API.get<ProjectSnapshot[]>(`/api/pipeline/projects${qs}`);
-    listEl.innerHTML = renderProjectsList(snapshots);
+    const books = await API.get<BookProjects[]>('/api/pipeline/books');
+    listEl.innerHTML = renderBooksList(books);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     showToast('Failed to load projects: ' + msg, 'error');
     listEl.innerHTML = '<p class="text-muted mb-0">Failed to load projects.</p>';
+  }
+}
+
+/**
+ * Open a persisted book as the current project.
+ *
+ * Non-destructive ordered transition (Plan M): validate the DTO identity,
+ * invalidate the OLD book's render/editor/audio surfaces via the existing
+ * comprehensive render reset primitive, clear workbench undo + book-scoped
+ * shared state, then call the canonical `setPipelineBookId` exactly once and
+ * load the selected book's data.
+ *
+ * Never calls onboard / replace / re-onboard and never loads a snapshot into
+ * a different owner. If invalidation fails before the switch is committed,
+ * the prior canonical book remains selected.
+ */
+export async function openBook(bookId: string): Promise<void> {
+  if (!bookId) return;
+  // Same-book no-op: keep the current selection and avoid a redundant reset.
+  if (state.pipelineBookId === bookId) return;
+
+  try {
+    // 1) Invalidate the OLD book's render/editor/audio surfaces (includes
+    //    render job cancellation, caches, undo stack, and playback).
+    await resetRenderStateForBookReplacement();
+    // 2) Clear the old book's workbench undo records + book-scoped shared
+    //    state (render job handle, workbench, workbench config) WITHOUT
+    //    touching pipelineBookId and without a second persistence key.
+    clearWorkbenchUndoStack();
+    clearBookScopedState();
+    // 3) Commit the switch through the single canonical setter.
+    setPipelineBookId(bookId);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    showToast('Failed to switch book: ' + msg, 'error');
+    return;
+  }
+
+  showToast(`Opened book ${bookId}`, 'success');
+  // Refresh the list so the new book is highlighted as current.
+  await loadProjects();
+
+  // Load the newly-selected book's data into the existing tab surfaces.
+  try {
+    await loadSpans();
+    await loadSingleSpeakerToggle();
+    await loadWorkbench(true);
+    await loadWorkbenchConfig();
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error('Failed to load selected book data', e);
+    showToast('Book switched, but some data failed to load: ' + msg, 'warning');
   }
 }
 
@@ -268,14 +392,16 @@ export function initProjects(): void {
 
         const action = btn.dataset.action;
         const name = btn.dataset.name;
-        if (!action || !name) return;
+        const bookId = btn.dataset.bookId;
 
-        if (action === 'project-load') {
-          loadProject(name);
+        if (action === 'project-open') {
+          if (bookId) openBook(bookId);
+        } else if (action === 'project-load') {
+          if (name) loadProject(name);
         } else if (action === 'project-delete') {
-          deleteProject(name);
+          if (name) deleteProject(name);
         } else if (action === 'project-rename') {
-          renameProject(name);
+          if (name) renameProject(name);
         }
       });
     }

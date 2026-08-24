@@ -186,6 +186,18 @@ class PipelineStorage(ABC):
         """
 
     @abstractmethod
+    def list_books(self) -> list[dict]:
+        """Return every persisted ``book`` row's identity metadata.
+
+        Each dict is ``{"id", "series_id", "book_number", "version",
+        "position"}`` — only existing ``book`` columns, never a mutation.
+        Read-only and unparameterized (no input).  Ordering is
+        ``series_id``, ``book_number``, ``position``, then ``id`` as a
+        deterministic tiebreak.  Implemented identically by
+        ``SQLiteAdapter`` and ``InMemorySQLiteAdapter``.
+        """
+
+    @abstractmethod
     def get_project_snapshot(self, name: str) -> dict | None:
         """Return the ``project_snapshot`` row for *name*, or ``None``."""
 
@@ -1620,6 +1632,20 @@ class SQLiteAdapter(PipelineStorage):
             (book_id,),
         )
 
+    def list_books(self) -> list[dict]:
+        """Return every ``book`` row's identity metadata for the adapter.
+
+        Each dict is ``{"id", "series_id", "book_number", "version",
+        "position"}`` — only existing ``book`` columns (no series
+        mutation).  Read-only and unparameterized.  Ordering is
+        ``series_id``, ``book_number``, ``position``, then ``id`` as a
+        deterministic tiebreak.
+        """
+        return self.execute_query(
+            "SELECT id, series_id, book_number, version, position"
+            " FROM book ORDER BY series_id, book_number, position, id"
+        )
+
     def get_project_snapshot(self, name: str) -> dict | None:
         """Return the ``project_snapshot`` row for *name*, or ``None``."""
         rows = self.execute_query(
@@ -2227,6 +2253,20 @@ class InMemorySQLiteAdapter(PipelineStorage):
             " FROM project_snapshot WHERE book_id = ?"
             " ORDER BY created_ms DESC, name ASC",
             (book_id,),
+        )
+
+    def list_books(self) -> list[dict]:
+        """Return every ``book`` row's identity metadata for the adapter.
+
+        Each dict is ``{"id", "series_id", "book_number", "version",
+        "position"}`` — only existing ``book`` columns (no series
+        mutation).  Read-only and unparameterized.  Ordering is
+        ``series_id``, ``book_number``, ``position``, then ``id`` as a
+        deterministic tiebreak.
+        """
+        return self.execute_query(
+            "SELECT id, series_id, book_number, version, position"
+            " FROM book ORDER BY series_id, book_number, position, id"
         )
 
     def get_project_snapshot(self, name: str) -> dict | None:
