@@ -687,15 +687,32 @@ def create_schema(connection: sqlite3.Connection) -> None:
         + _VOICE_PERSONA_PROMPT_DDL
     )
     # Remove legacy duplicate speaker rows before enforcing rerun idempotency.
+    # Prefer authoritative data over insertion order so a later human decision
+    # cannot be discarded in favor of an older generated guess.
     connection.execute(
         """DELETE FROM character_span
            WHERE relation_type = 'speaker'
              AND rowid NOT IN (
-                 SELECT MIN(rowid)
-                 FROM character_span
-                 WHERE relation_type = 'speaker'
-                 GROUP BY span_id
-             )"""
+                 SELECT (
+                     SELECT cs.rowid
+                     FROM character_span AS cs
+                     WHERE cs.span_id = grouped.span_id
+                       AND cs.relation_type = 'speaker'
+                     ORDER BY cs.human_override DESC,
+                              CASE cs.source
+                                  WHEN 'human' THEN 3
+                                  WHEN 'walk' THEN 2
+                                  WHEN 'derived' THEN 1
+                                  ELSE 0
+                              END DESC,
+                              cs.confidence DESC,
+                              cs.rowid DESC
+                     LIMIT 1
+                 )
+                 FROM character_span AS grouped
+                 WHERE grouped.relation_type = 'speaker'
+                 GROUP BY grouped.span_id
+              )"""
     )
     connection.executescript(_SPEAKER_UNIQUE_INDEX)
     connection.executescript(_RUN_OWNERSHIP_INDEXES)

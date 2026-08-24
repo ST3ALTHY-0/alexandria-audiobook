@@ -40,7 +40,7 @@ Transform any book or novel into a fully-voiced audiobook using AI-powered scrip
 - **Natural Pauses** - Configurable pause between speakers (default 500 ms) and same-speaker segments (default 250 ms), with per-book overrides and per-span pause editing. The resolved pause values are inserted into the merged audio during M4B export.
 
 ### Web UI Editor
-- **Streamlined Interface** - Core pipeline tabs (Setup, Script, Voices, Editor) plus advanced tools (Designer, Preparer, Dataset, Training)
+- **Streamlined Interface** - Core pipeline tabs (Projects, Setup, Script, Voices, Editor) plus advanced tools (Designer, Preparer, Dataset Builder, Training) and workflow tabs (Persona, Prompt Config, Workbench)
 - **Span Editor** - Edit speaker, text, and instruct for any line
 - **Structural Operations** - Split, merge, move, and delete spans directly in the editor
 - **Batch Processing** - Optimized batch rendering with sub-batching for efficient GPU utilization
@@ -84,9 +84,25 @@ Transform any book or novel into a fully-voiced audiobook using AI-powered scrip
 
 ## Running Alexandria
 
-This fork is currently intended to run locally or in Docker. The legacy
-Pinokio and Google Colab workflows are not maintained deployment paths for this
-repository.
+Alexandria can run locally, in Docker, through Pinokio, or in Google Colab.
+Docker is recommended for reproducible deployments; Pinokio and Colab are
+convenience installers for users who prefer a guided setup.
+
+### Pinokio
+
+Install this repository from Pinokio using its GitHub URL, then click
+**Install** and **Start**. Pinokio creates the application environment,
+installs the dependencies and Qwen3-TTS, selects the appropriate PyTorch build
+for the host, and opens the web UI at the reported local URL.
+
+### Google Colab
+
+Open [`alexandria_colab.ipynb`](alexandria_colab.ipynb) in Colab and select a
+GPU runtime before running the cells. The notebook clones the current
+repository, persists files and Hugging Face model weights in Google Drive, and
+exposes the web UI through Colab port forwarding. An LLM API is still required
+for script annotation; the optional Ollama cells can provide a local LLM, but
+Ollama should be stopped before TTS generation to free GPU memory.
 
 ### Docker Compose (recommended)
 
@@ -226,6 +242,11 @@ These tabs are for power users who want more control over voice creation:
 - **Preparer** — Batch-prepare voice datasets from uploaded audio (used as LoRA training data)
 - **Dataset** — Build LoRA training datasets interactively, one sample at a time with audio preview
 - **Training** — Train LoRA adapters on voice datasets to create persistent voice identities that follow instruct directions
+- **Persona / Prompt Config / Workbench** — Refine character personas, validate prompt configuration, and inspect intermediate pipeline work products.
+
+### Projects Tab
+
+Projects is the entry point for managing multiple books. Use it to open an existing project, create a new project by onboarding an EPUB, replace a book's source EPUB while retaining its identity, or re-onboard a book from scratch.
 
 ## Web Interface
 
@@ -337,6 +358,13 @@ Upload an EPUB file and run the annotation walks. Onboarding is EPUB-only — th
 - **Cancel Walks** - Stop a running walk cycle (the request retries once automatically on 503 contention)
 - **Re-onboard** - Reload the book and reset the pipeline state (clears generated output, bumps progression; the run/walk history is preserved — distinct from Replace)
 - **Replace** - Swap the current book's document with a new EPUB while retaining its book ID, series number, and position. All book-owned generated output (walks, renders, workbench, persist) is cleared and re-run; any still-active walk is cancelled/awaited first (the API returns HTTP 503 + `Retry-After` on contention). Replace never reorders or renumbers the series and exposes no export-visibility control by design — Import-as-new (Onboard) is the only way a differently-seriesed book is introduced
+
+### Persona, Prompt Config, and Workbench Tabs
+
+These workflow tabs expose intermediate pipeline state without requiring direct database access:
+- **Persona** - Review and rerun generated character persona data.
+- **Prompt Config** - Validate and revise walk prompt configuration before rerunning affected walks.
+- **Workbench** - Review project-level working configuration and intermediate outputs.
 
 ### Voices Tab
 The pipeline assigns a voice to every character during walk 2h. The Voices tab lets you review and adjust those assignments:
@@ -561,6 +589,13 @@ curl -X POST http://127.0.0.1:4200/api/pipeline/cancel_walks \
 
 # Walk run history for a book (created/finished times + status per run)
 curl http://127.0.0.1:4200/api/pipeline/walks/<book_id>/runs
+
+# Read walk prompt configuration
+curl http://127.0.0.1:4200/api/pipeline/walks/<book_id>/config
+
+# Read or rerun a character persona
+curl http://127.0.0.1:4200/api/pipeline/characters/<character_id>/persona
+curl -X POST http://127.0.0.1:4200/api/pipeline/characters/<character_id>/persona/rerun
 ```
 
 ### Voice Catalog
@@ -601,7 +636,7 @@ curl -X POST http://127.0.0.1:4200/api/voice_design/save \
 curl http://127.0.0.1:4200/api/voice_design/list
 
 # Delete a designed voice
-curl -X DELETE http://127.0.0.1:4200/api/voice_design/delete/voice_id_here
+curl -X DELETE http://127.0.0.1:4200/api/voice_design/voice_id_here
 ```
 
 ### LoRA Training
@@ -671,7 +706,7 @@ curl -X POST http://127.0.0.1:4200/api/dataset_builder/update_rows \
 # Generate a single sample preview
 curl -X POST http://127.0.0.1:4200/api/dataset_builder/generate_sample \
   -H "Content-Type: application/json" \
-  -d '{"name": "my_voice_dataset", "description": "A warm male voice", "sample_index": 0, "samples": [{"text": "Hello.", "emotion": "cheerful"}]}'
+  -d '{"dataset_name": "my_voice_dataset", "description": "A warm male voice", "text": "Hello.", "sample_index": 0, "seed": 42}'
 
 # Batch generate all samples
 curl -X POST http://127.0.0.1:4200/api/dataset_builder/generate_batch \
@@ -689,7 +724,7 @@ curl -X POST http://127.0.0.1:4200/api/dataset_builder/cancel \
 # Save project as a training dataset
 curl -X POST http://127.0.0.1:4200/api/dataset_builder/save \
   -H "Content-Type: application/json" \
-  -d '{"name": "my_voice_dataset", "ref_sample_index": 0}'
+  -d '{"name": "my_voice_dataset", "ref_index": 0}'
 
 # Delete a project
 curl -X DELETE http://127.0.0.1:4200/api/dataset_builder/my_voice_dataset
@@ -854,12 +889,12 @@ For script generation, non-thinking models work best:
 - TTS models (~3.5 GB each) are downloaded from Hugging Face on first use
 - If downloads are slow or fail due to network restrictions (common in mainland China), set a Hugging Face mirror before launching:
   - Set the environment variable `HF_ENDPOINT=https://hf-mirror.com` before starting the app
-  - Or in Pinokio, add it to start.js `env` field: `env: { HF_ENDPOINT: "https://hf-mirror.com" }`
+- For another launcher, set `HF_ENDPOINT=https://hf-mirror.com` in its environment before starting Alexandria.
 - If you hit rate limits, create a free [Hugging Face account](https://huggingface.co/join) and set `HF_TOKEN` to your access token
 - Downloads resume automatically if interrupted — just restart the app
 
 ### TTS generation fails
-- Check the Pinokio terminal for model loading errors
+- Check the terminal running Alexandria for model loading errors
 - Ensure sufficient VRAM (16+ GB recommended for bfloat16)
 - For external mode, ensure the Gradio TTS server is running at the configured URL
 - Verify every character has a valid voice assigned in the Voices tab (voice configs are stored in the pipeline's voice_config table)
@@ -909,9 +944,8 @@ Frontend (in `frontend/`):
 npm run build    # production build (outputs to ../app/static/dist)
 npx tsc --noEmit # TypeScript type check
 
-# Frontend unit tests — require vitest (installed in the pipeline-only
-# cutover's final phase; not yet enabled if the install step was skipped)
-npx vitest run
+# Frontend unit tests
+npm test
 ```
 
 ## Project Structure

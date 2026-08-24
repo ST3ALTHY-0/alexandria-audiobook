@@ -301,6 +301,40 @@ class TestCreateSchemaMigrationForUniversalUpgrade:
         conn.close()
 
 
+class TestCreateSchemaSpeakerDeduplication:
+    """Legacy speaker deduplication must preserve the most authoritative row."""
+
+    def test_later_human_override_survives_generated_guess(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            """CREATE TABLE character_span (
+                   character_id TEXT NOT NULL,
+                   span_id TEXT NOT NULL,
+                   relation_type TEXT NOT NULL,
+                   source TEXT NOT NULL,
+                   confidence REAL NOT NULL,
+                   human_override INTEGER DEFAULT 0
+               )"""
+        )
+        conn.execute(
+            """INSERT INTO character_span
+               (character_id, span_id, relation_type, source, confidence, human_override)
+               VALUES ('generated-alice', 'span-1', 'speaker', 'walk', 0.99, 0)"""
+        )
+        conn.execute(
+            """INSERT INTO character_span
+               (character_id, span_id, relation_type, source, confidence, human_override)
+               VALUES ('human-bob', 'span-1', 'speaker', 'human', 0.1, 1)"""
+        )
+
+        create_schema(conn)
+
+        assert conn.execute(
+            "SELECT character_id FROM character_span WHERE span_id = 'span-1'"
+        ).fetchone() == ("human-bob",)
+        conn.close()
+
+
 class TestCreateSchemaPauseColumns:
     """create_schema adds nullable Plan L pause columns idempotently."""
 

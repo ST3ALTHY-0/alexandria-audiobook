@@ -37,8 +37,9 @@ body:
     attributes:
       label: Terminal / log output
       description: |
-        Copy the relevant output from the **Pinokio terminal** (click Terminal in the sidebar).
-        This is the most important part for diagnosing issues.
+        Copy the relevant output from the application terminal, Docker logs, or
+        the **Pinokio terminal** (click Terminal in the sidebar). This is the
+        most important part for diagnosing issues.
       render: shell
     validations:
       required: false

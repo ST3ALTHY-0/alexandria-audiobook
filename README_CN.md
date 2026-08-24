@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/screenshots/banner.png" alt="Alexandria Audiobook Generator" width="60%">
+  <img width="475" height="467" alt="Alexandria Logo" src="https://github.com/user-attachments/assets/fa2c36d3-a5f3-49ab-9dfe-30933359dfbd" />
 </p>
 
 <h1 align="center">Alexandria 有声书生成器</h1>
@@ -12,15 +12,15 @@
 
 利用 AI 驱动的脚本标注和文本转语音技术，将任何书籍或小说转化为全配音有声书。内置 Qwen3-TTS 引擎，支持批量处理，并提供浏览器端编辑器，可逐行精调后导出。
 
-[🎧 试听音频](docs/sample.mp3)
+[🎧 试听音频](https://github.com/user-attachments/files/25276110/sample.mp3)
 
 ## 截图
 
 <p align="center">
-  <img src="docs/screenshots/1.png" width="45%">
-  <img src="docs/screenshots/2.png" width="45%">
-  <img src="docs/screenshots/3.png" width="45%">
-  <img src="docs/screenshots/4.png" width="45%">
+  <img src="https://github.com/user-attachments/assets/874b5e30-56d2-4292-b754-4408fc53f5d6" width="30%">
+  <img src="https://github.com/user-attachments/assets/488cde02-6b93-47fa-874b-97a618ae482c" width="30%">
+  <img src="https://github.com/user-attachments/assets/4c0805a6-bb9d-42c1-a9ff-79bb29d0613c" width="30%">
+  <img src="https://github.com/user-attachments/assets/8e58a5bf-ed8f-4864-8545-1e3d9681b0cf" width="30%">
 </p>
 
 ## 主要功能
@@ -46,19 +46,21 @@
 - **自然停顿** - 可配置的说话人切换暂停（默认 500 ms）与同说话人继续时的暂停（默认 250 ms），支持按书覆盖与按 span 编辑。解析后的暂停值会在 M4B 导出时插入合并音频。
 
 ### Web UI 编辑器
-- **简洁界面** - 核心流水线标签页（设置、脚本、声音、编辑器）加高级工具（设计器、预处理、数据集、训练）
+- **简洁界面** - 核心流水线标签页（项目、设置、脚本、声音、编辑器）加高级工具（设计器、预处理、数据集构建器、训练）及工作流标签页（角色人设、提示配置、Workbench）
 - **跨度编辑器** - 编辑任意行的说话人、文本和指令
 - **结构操作** - 在流水线编辑器中拆分、合并、移动或删除跨度
 - **批量处理** - 优化批量渲染，子批处理充分利用 GPU
-- **实时进度** - 所有操作的实时日志和状态跟踪
+- **实时进度** - 行走和渲染的实时进度；单块渲染显示完成/总数及失败标记，批量渲染显示作业级进度
 
 ### 导出选项
 - **M4B 有声书** - 带章节标记的 M4B（AAC），支持自动检测或逐块章节，适用于有声书播放器（Audiobookshelf、Apple Books、VLC 等）
-- **原始语音块** - 以 ZIP 形式下载每行的 WAV/MP3 语音块
+- **MP3** - 当后端 ffmpeg 支持 MP3（libmp3lame）时生成，否则明确降级为仅 M4B
+- **Audacity 压缩包** - 与 M4B 一起生成的 `ZIP_STORED` 音频包，适用于 Audacity 等 DAW
+- **原始语音块** - 以 ZIP 形式下载每行的 WAV 语音块
 
 ## 系统要求
 
-- **Pinokio**（推荐）或手动安装
+- Docker Compose，或本地 Python 环境
 - **LLM 服务器** - 任意 OpenAI 兼容 API（LM Studio、Ollama、OpenAI、Together、Groq、DeepSeek 等）
 - **GPU** - 最低 8GB 显存；推荐 16GB+（每个 TTS 模型约 3.4GB）
 - **内存** - 推荐 16GB，最低 8GB
@@ -76,21 +78,50 @@
 
 > 无需外部 TTS 服务器。Qwen3-TTS 内置，首次生成时自动下载权重（约 3.5 GB/变体）。
 
-## 安装
+## 运行 Alexandria
 
-### 方式 A：Pinokio（推荐）
+当前仓库支持 Docker Compose、本地 Python、Pinokio 和 Google Colab。Docker
+适合可复现部署；Pinokio 和 Colab 适合希望使用向导式安装的用户。
 
-1. 安装 [Pinokio](https://pinokio.computer)
-2. 进入 **Discover** 并搜索 "alexandria"
-3. 点击 **Install** 并等待完成
+### Pinokio
 
-### 方式 B：Google Colab
+在 Pinokio 中使用本仓库的 GitHub 地址安装，然后点击 **Install** 和
+**Start**。Pinokio 会创建运行环境、安装依赖和 Qwen3-TTS，并根据主机选择
+合适的 PyTorch 构建，最后打开本地 Web UI。
 
-免费 T4 GPU，无需安装：
+### Google Colab
 
-1. 打开 [Alexandria 有声书生成器 - Colab](https://colab.research.google.com/github/lazdavila/alexandria-audiobook/blob/main/colab.ipynb)
-2. 点击 **Connect** → **Runtime Type** → **T4 GPU**
-3. 点击 **Run All** 并按照笔记本中的说明设置 ngrok 公共 URL
+在 Colab 中打开 [`alexandria_colab.ipynb`](alexandria_colab.ipynb)，先选择
+GPU 运行时再按顺序运行单元格。笔记本会克隆当前仓库，将文件和 Hugging Face
+模型缓存持久化到 Google Drive，并通过 Colab 端口转发打开 Web UI。脚本标注
+仍需要 LLM API；可选的 Ollama 单元格可提供本地 LLM，但生成 TTS 前应停止
+Ollama 以释放显存。
+
+### Docker Compose（推荐）
+
+NVIDIA GPU 用户：
+
+```bash
+git clone https://github.com/xiaden/alexandria-audiobook.git
+cd alexandria-audiobook
+docker compose up --build
+```
+
+需要安装 [Docker](https://docs.docker.com/get-docker/) 和 [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)。浏览器打开 `http://localhost:4200`。模型首次使用时下载，并缓存到 Docker 卷；上传文件、声音配置、LoRA 和音频输出保存在项目目录中。
+
+### 本地开发
+
+```bash
+git clone https://github.com/xiaden/alexandria-audiobook.git
+cd alexandria-audiobook
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+pip install -r app/requirements.txt
+pip install qwen-tts==0.1.1
+python app/app.py
+```
+
+浏览器打开 `http://localhost:4200`。
 
 ## 首次启动 — 预期情况
 
@@ -108,7 +139,7 @@ Alexandria 需要运行中的 LLM 服务器来生成脚本。默认端点：
 
 ### 2. 首次 TTS 下载
 
-首次生成音频时会自动下载 TTS 模型权重（每个变体约 3.5 GB），并在后台缓存。下载速度取决于网速。可通过 Pinokio 终端查看进度。
+首次生成音频时会自动下载 TTS 模型权重（每个变体约 3.5 GB），并在后台缓存。下载速度取决于网速。可通过运行 Alexandria 的终端查看进度。
 
 > **中国大陆用户：** 如 HuggingFace 下载缓慢，设置环境变量 `HF_ENDPOINT=https://hf-mirror.com`（可选 `HF_TOKEN`）后重新启动。
 
@@ -130,7 +161,7 @@ Alexandria 需要运行中的 LLM 服务器来生成脚本。默认端点：
 
 ### 5. 出问题去哪看
 
-所有日志（TTS、LLM 调用、错误）都打印到 **Pinokio 终端**。
+所有日志（TTS、LLM 调用、错误）都打印到运行 Alexandria 的终端（`python app/app.py` 或 `docker compose up`）。
 
 ## 快速入门
 
@@ -167,7 +198,7 @@ Alexandria 需要运行中的 LLM 服务器来生成脚本。默认端点：
 | TTS Mode | `local`（内置）或 `external`（远程 Gradio 服务器） |
 | Device | `auto`、`cuda`、`cpu`、`mps` |
 | Language | 语音语言（`auto` 检测或指定） |
-| Parallel Workers | 并行合成的工作线程数（1-10） |
+| Parallel Workers | 并行合成的工作线程数；上限取决于显存 |
 | Batch Seed | 批处理的随机种子（-1 = 随机） |
 | Compile Codec | 使用 torch.compile 编译解码器（3-4 倍速度提升） |
 | Batch Group by Type | 按声音类型分组批处理 |
@@ -251,6 +282,13 @@ Alexandria 需要运行中的 LLM 服务器来生成脚本。默认端点：
 - 置信度审校：接受/拒绝/覆盖低置信度项
 - **Merge** - 将渲染的音频块合并为单个 M4B 文件
 - **Download** - 下载合并的 M4B 有声书
+
+### 项目、角色人设、提示配置与 Workbench
+
+- **项目** - 管理多个书籍项目，打开已有项目，或通过 EPUB 创建新项目。
+- **角色人设** - 查看并重新生成角色人设数据。
+- **提示配置** - 校验和修改行走提示配置，再重新运行受影响的行走。
+- **Workbench** - 查看项目级工作配置和中间产物。
 
 ## 性能
 
@@ -367,6 +405,13 @@ curl -X POST http://127.0.0.1:4200/api/pipeline/run_all_walks \
 # 检查行走进度
 curl http://127.0.0.1:4200/api/pipeline/walk_status/123
 
+# 获取行走提示配置
+curl http://127.0.0.1:4200/api/pipeline/walks/123/config
+
+# 获取或重新生成角色人设
+curl http://127.0.0.1:4200/api/pipeline/characters/<character_id>/persona
+curl -X POST http://127.0.0.1:4200/api/pipeline/characters/<character_id>/persona/rerun
+
 # 获取审校项
 curl http://127.0.0.1:4200/api/pipeline/review/123
 
@@ -455,7 +500,7 @@ curl -X POST http://127.0.0.1:4200/api/lora/upload_dataset \
 # 生成数据集
 curl -X POST http://127.0.0.1:4200/api/lora/generate_dataset \
   -H "Content-Type: application/json" \
-  -d '{"voice_id": "...", "lines": ["..."], "name": "my_dataset"}'
+  -d '{"name": "my_dataset", "description": "A warm male voice", "texts": ["Hello."]}'
 
 # 启动训练
 curl -X POST http://127.0.0.1:4200/api/lora/train \
@@ -475,23 +520,24 @@ curl http://127.0.0.1:4200/api/dataset_builder/list
 # 创建项目
 curl -X POST http://127.0.0.1:4200/api/dataset_builder/create \
   -H "Content-Type: application/json" \
-  -d '{"name": "marcus-dataset", "description": "...", "seed": -1}'
+  -d '{"name": "marcus-dataset"}'
 
 # 生成样本
 curl -X POST http://127.0.0.1:4200/api/dataset_builder/generate_sample \
   -H "Content-Type: application/json" \
-  -d '{"project_id": "...", "rows": [{"text": "Hello world"}]}'
+  -d '{"dataset_name": "marcus-dataset", "description": "A warm male voice", "text": "Hello world", "sample_index": 0, "seed": -1}'
 
 # 保存项目为数据集
 curl -X POST http://127.0.0.1:4200/api/dataset_builder/save \
   -H "Content-Type: application/json" \
-  -d '{"project_id": "..."}'
+  -d '{"name": "marcus-dataset", "ref_index": 0}'
 ```
 
 ## Python 集成
 
 ```python
 import requests
+import time
 
 BASE = "http://127.0.0.1:4200"
 

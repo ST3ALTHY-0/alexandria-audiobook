@@ -16,7 +16,6 @@ module.exports = {
       venv: "env",
       path: "app",
       message: [
-        "uv pip uninstall google-genai",
         "uv pip install -r requirements.txt",
         "uv pip install qwen-tts==0.1.1"
       ]
@@ -28,7 +27,6 @@ module.exports = {
       params: {
         path: "app",
         venv: "env",
-        flashattention: true
       }
     }
   }, {

@@ -329,10 +329,22 @@ class TestExecute:
         assert result["speakers_attributed"] == 2
         assert result["attributions_for_review"] == 0
 
-    def test_unknown_speaker_no_junction(
+    def test_unknown_speaker_retracts_generated_preserves_override(
         self, seeded_storage, mock_llm_client, monkeypatch
     ):
-        """When LLM returns null character_id, no junction is created."""
+        """Unknown reruns retract generated speakers but preserve overrides."""
+        seeded_storage.execute_insert(
+            """INSERT INTO character_span
+               (character_id, span_id, relation_type, source, confidence, human_override)
+               VALUES (?, ?, 'speaker', 'walk', 0.9, 0)""",
+            ("char-john", "span-1b"),
+        )
+        seeded_storage.execute_insert(
+            """INSERT INTO character_span
+               (character_id, span_id, relation_type, source, confidence, human_override)
+               VALUES (?, ?, 'speaker', 'human', 1.0, 1)""",
+            ("char-mary", "span-3a"),
+        )
         response = json.dumps({"character_id": None, "confidence": 0.3})
         _patch_llm(monkeypatch, mock_llm_client, response)
 
@@ -341,12 +353,16 @@ class TestExecute:
         # All spans should be unknown
         assert result["speakers_unknown"] == 3
         assert result["speakers_attributed"] == 0
+        assert result["speakers_unknown"] == 3
 
-        # Verify no junctions were created
+        # Generated attribution is retracted, while human overrides remain.
         rows = seeded_storage.execute_query(
-            "SELECT COUNT(*) AS cnt FROM character_span"
+            "SELECT character_id, human_override FROM character_span "
+            "WHERE relation_type = 'speaker' ORDER BY span_id"
         )
-        assert rows[0]["cnt"] == 0
+        assert [(row["character_id"], row["human_override"]) for row in rows] == [
+            ("char-mary", 1)
+        ]
 
     def test_speaker_from_another_book_is_unknown(
         self, seeded_storage, mock_llm_client, monkeypatch
@@ -412,6 +428,33 @@ class TestExecute:
         )
         assert rows == []
 
+    def test_foreign_speaker_retracts_valid_generated_attribution(
+        self, seeded_storage, mock_llm_client, monkeypatch
+    ):
+        seeded_storage.execute_insert(
+            "INSERT INTO character_span (character_id, span_id, relation_type,"
+            " source, confidence, human_override)"
+            " VALUES (?, ?, 'speaker', 'walk', 0.9, 0)",
+            ("char-john", "span-1b"),
+        )
+        _patch_llm(
+            monkeypatch,
+            mock_llm_client,
+            json.dumps({"character_id": "foreign", "confidence": 0.9}),
+        )
+
+        result = execute("book-1", seeded_storage, {})
+
+        assert result["speakers_unknown"] == 3
+        assert (
+            seeded_storage.execute_query(
+                "SELECT 1 FROM character_span WHERE span_id = ? "
+                "AND relation_type = 'speaker' AND human_override = 0",
+                ("span-1b",),
+            )
+            == []
+        )
+
     def test_foreign_speaker_preserves_human_override(
         self, seeded_storage, mock_llm_client, monkeypatch
     ):
@@ -456,16 +499,24 @@ class TestExecute:
     def test_confidence_filter_low_rejected(
         self, seeded_storage, mock_llm_client, monkeypatch
     ):
-        """Spans with confidence < 0.5 are auto-rejected (no junction created)."""
+        """Low-confidence reruns retract existing generated speakers."""
+        seeded_storage.execute_insert(
+            """INSERT INTO character_span
+               (character_id, span_id, relation_type, source, confidence, human_override)
+               VALUES (?, ?, 'speaker', 'walk', 0.9, 0)""",
+            ("char-john", "span-1b"),
+        )
         response = json.dumps({"character_id": "char-john", "confidence": 0.3})
         _patch_llm(monkeypatch, mock_llm_client, response)
 
         result = execute("book-1", seeded_storage, {})
 
         assert result["speakers_attributed"] == 0
-        # Verify no junction was created
+        # Verify the previous generated junction was retracted.
         rows = seeded_storage.execute_query(
-            "SELECT COUNT(*) AS cnt FROM character_span"
+            "SELECT COUNT(*) AS cnt FROM character_span "
+            "WHERE span_id = ? AND relation_type = 'speaker'",
+            ("span-1b",),
         )
         assert rows[0]["cnt"] == 0
 
@@ -735,6 +786,10 @@ class TestParseResponse:
 
         assert attribution == {}
 
+    def test_parse_empty_object_returns_empty(self):
+        """An empty JSON object is treated as a parse failure."""
+        assert _parse_llm_response("{}") == {}
+
     def test_parse_null_character_id(self):
         """Parse null character_id (unknown speaker)."""
         response = json.dumps({"character_id": None, "confidence": 0.3})
@@ -853,3 +908,56 @@ class TestJournalCoverage:
         # delete or update — at least one of the correction ops must appear.
         assert "insert" in changed
         assert changed & {"delete", "update"}
+
+    def test_retraction_delete_is_journaled(
+        self, seeded_storage, mock_llm_client, monkeypatch
+    ):
+        seeded_storage.execute_insert(
+            "INSERT INTO character_span (character_id, span_id, relation_type,"
+            " source, confidence, human_override)"
+            " VALUES (?, ?, 'speaker', 'walk', 0.9, 0)",
+            ("char-john", "span-1b"),
+        )
+        _patch_llm(
+            monkeypatch,
+            mock_llm_client,
+            json.dumps({"character_id": None, "confidence": 0.3}),
+        )
+
+        execute("book-1", _heartbeat(seeded_storage, "run-1"), {})
+
+        assert ("character_span", "delete") in self._captured(seeded_storage, "run-1")
+        assert (
+            seeded_storage.execute_query(
+                "SELECT 1 FROM character_span WHERE span_id = ? "
+                "AND relation_type = 'speaker' AND human_override = 0",
+                ("span-1b",),
+            )
+            == []
+        )
+
+    def test_parse_failure_preserves_generated_attribution(
+        self, seeded_storage, mock_llm_client, monkeypatch
+    ):
+        seeded_storage.execute_insert(
+            "INSERT INTO character_span (character_id, span_id, relation_type,"
+            " source, confidence, human_override)"
+            " VALUES (?, ?, 'speaker', 'walk', 0.9, 0)",
+            ("char-john", "span-1b"),
+        )
+        _patch_llm(monkeypatch, mock_llm_client, "not valid json")
+
+        result = execute("book-1", seeded_storage, {})
+
+        assert len(result["errors"]) == 3
+        assert all(
+            error["error"] == "Failed to parse LLM attribution response"
+            for error in result["errors"]
+        )
+        assert (
+            seeded_storage.execute_query(
+                "SELECT character_id FROM character_span WHERE span_id = ?",
+                ("span-1b",),
+            )[0]["character_id"]
+            == "char-john"
+        )
