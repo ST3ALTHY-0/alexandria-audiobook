@@ -168,12 +168,15 @@ async def run_walk(
     ``{status: 'started', started: true, walk_name: ..., run_id: ...}``; poll
     ``GET /walk_status/{book_id}`` and ``GET /walks/{book_id}/runs`` for progress.
 
-    Global single-active-walk gate (CONTRACTS.md "Critical Walk Concurrency
-    and Cancellation Override"): the response returns immediately even when a
-    walk on ANY book is already running. The blocked reservation is NOT
+    Global single-processing-writer gate (CONTRACTS.md "Critical Walk
+    Concurrency and Cancellation Override" + the combined active-writer
+    invariant): the response returns immediately even when a walk OR render on
+    ANY book is already active. The blocked reservation is NOT
     rejected here — instead ``run_walk_reserved`` deterministically terminalizes
     this run's own pending row to ``failed`` (error ``"Another walk is already
-    running (global single-active-walk gate)"``) WITHOUT executing the walk.
+    running (global single-active-walk gate)"`` when an active walk blocks it,
+    or ``"A render is already active (process-wide active-writer gate)"`` when
+    an active render blocks it) WITHOUT executing the walk.
     That terminal ``failed`` row surfaces to the frontend through
     ``GET /walks/{book_id}/runs`` (walk_run rows = truth) and the status/SSE
     surfaces, so global contention is observably reported rather than hanging.
@@ -250,12 +253,15 @@ async def run_all_walks(
     ``{status: 'started', started: true, batch_id: ..., run_ids: [...], runs: [...]}``;
     poll ``GET /walk_status/{book_id}`` and ``GET /walks/{book_id}/runs`` for progress.
 
-    Global single-active-walk gate (CONTRACTS.md "Critical Walk Concurrency
-    and Cancellation Override"): the response returns immediately even when a
-    walk on ANY book is already running. The child reservations are NOT
+    Global single-processing-writer gate (CONTRACTS.md "Critical Walk
+    Concurrency and Cancellation Override" + the combined active-writer
+    invariant): the response returns immediately even when a walk OR render on
+    ANY book is already active. The child reservations are NOT
     rejected here — instead the reserved runner deterministically terminalizes
-    the blocked child's own pending row to ``failed`` (error ``"Another walk is
-    already running (global single-active-walk gate)"``) WITHOUT executing it,
+    the blocked child's own pending row to ``failed`` WITHOUT executing it (an
+    active walk blocks with ``"Another walk is already running (global
+    single-active-walk gate)"``; an active render blocks with ``"A render is
+    already active (process-wide active-writer gate)"``),
     and then terminalizes every remaining child. Those terminal ``failed`` rows
     surface to the frontend through ``GET /walks/{book_id}/runs`` and the
     status/SSE surfaces, so global contention is observably reported rather

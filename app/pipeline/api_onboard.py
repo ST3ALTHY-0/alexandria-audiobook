@@ -25,9 +25,9 @@ from app.pipeline.adapter import (
     SQLiteAdapter,
 )
 from app.pipeline.assembly import (
-    ActiveWalkError,
+    ActiveProcessingWriterError,
     get_book_version,
-    has_active_run,
+    has_active_processing_writer,
     reonboard_book,
     replace_book_tree,
 )
@@ -43,20 +43,36 @@ def _write_bytes(path: str, content: bytes) -> None:
         f.write(content)
 
 
-# Retry-After advertized when re-onboard is blocked by an active walk
-# (CONTRACTS.md contention contract — consistent with the app-level 503 mapping).
+# Retry-After advertized when re-onboard is blocked by an active processing
+# writer (CONTRACTS.md contention contract — consistent with the app-level 503
+# mapping).
 _REONBOARD_CONTENTION_RETRY_AFTER_SECONDS = 5
 
 
-def _reject_if_walk_active(storage: PipelineStorage) -> None:
-    """Reject book replacement while any walk writer is pending or running."""
-    if has_active_run(storage):
+#: The process-wide contention detail shared by every destructive onboard
+#: endpoint (fast-reject and in-transaction paths).
+_CONTENTION_DETAIL = (
+    "A walk or render is still active — cancel it and retry "
+    f"after {_REONBOARD_CONTENTION_RETRY_AFTER_SECONDS}s"
+)
+
+
+def _reject_if_writer_active(storage: PipelineStorage) -> None:
+    """Fast-reject book replacement/creation while a processing writer is active.
+
+    This is an OPTIMIZATION only — it catches the common case before any
+    extraction or mutation work begins.  The authoritative check is always the
+    combined active-processing-writer query made INSIDE the same ``BEGIN
+    IMMEDIATE`` transaction that mutates (``has_active_processing_writer``
+    followed by ``ActiveProcessingWriterError``), so a writer that starts after
+    this early check is still rejected at the transaction boundary.  A
+    pending/running ``walk_run`` OR ``render_job`` row blocks (process-wide
+    invariant spans books).
+    """
+    if has_active_processing_writer(storage):
         raise HTTPException(
             status_code=503,
-            detail=(
-                "A walk is still active — cancel it and retry "
-                f"after {_REONBOARD_CONTENTION_RETRY_AFTER_SECONDS}s"
-            ),
+            detail=_CONTENTION_DETAIL,
             headers={"Retry-After": str(_REONBOARD_CONTENTION_RETRY_AFTER_SECONDS)},
         )
 
@@ -149,9 +165,11 @@ async def onboard_epub(
     if not file.filename or not file.filename.lower().endswith(".epub"):
         raise HTTPException(status_code=400, detail="File must be an EPUB (.epub)")
 
-    # The server-side global walk invariant is authoritative; do not begin
-    # extraction/population while any book has a writer in flight.
-    _reject_if_walk_active(storage)
+    # The server-side global active-processing-writer invariant is
+    # authoritative; do not begin extraction/population while any writer
+    # (walk or render) is in flight. This is only a fast reject — the
+    # authoritative check is inside the admitting transaction below.
+    _reject_if_writer_active(storage)
 
     # Save uploaded file to temp location
     tmp_dir = tempfile.mkdtemp(prefix="pipeline_onboard_")
@@ -177,22 +195,21 @@ async def onboard_epub(
         try:
             with storage.transaction():
                 # The final check and insertion share BEGIN IMMEDIATE.  The
-                # earlier API check is only a fast reject for the common case.
-                if has_active_run(storage):
-                    raise ActiveWalkError
+                # earlier API check is only a fast reject for the common case;
+                # this in-transaction combined active-processing-writer check
+                # (walk_run OR render_job pending/running) is authoritative.
+                if has_active_processing_writer(storage):
+                    raise ActiveProcessingWriterError
                 populate_spine(
                     result["series_id"],
                     result["book_id"],
                     result["chapters"],
                     storage,
                 )
-        except (ActiveWalkError, ConcurrentTransactionError):
+        except (ActiveProcessingWriterError, ConcurrentTransactionError):
             raise HTTPException(
                 status_code=503,
-                detail=(
-                    "A walk is still active — cancel it and retry "
-                    f"after {_REONBOARD_CONTENTION_RETRY_AFTER_SECONDS}s"
-                ),
+                detail=_CONTENTION_DETAIL,
                 headers={"Retry-After": str(_REONBOARD_CONTENTION_RETRY_AFTER_SECONDS)},
             )
         except Exception as exc:  # noqa: BLE001 — spine population may raise many types; mapped to HTTP 500
@@ -253,17 +270,14 @@ async def reonboard(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     # 503 + Retry-After contention (global replacement while a writer is active).
-    _reject_if_walk_active(storage)
+    _reject_if_writer_active(storage)
 
     try:
         new_version = reonboard_book(request.book_id, storage)
-    except (ActiveWalkError, ConcurrentTransactionError):
+    except (ActiveProcessingWriterError, ConcurrentTransactionError):
         raise HTTPException(
             status_code=503,
-            detail=(
-                "A walk is still active — cancel it and retry "
-                f"after {_REONBOARD_CONTENTION_RETRY_AFTER_SECONDS}s"
-            ),
+            detail=_CONTENTION_DETAIL,
             headers={"Retry-After": str(_REONBOARD_CONTENTION_RETRY_AFTER_SECONDS)},
         )
     except ValueError as exc:
@@ -345,18 +359,15 @@ async def replace_epub(
             )
 
         # 503 + Retry-After contention only after the staged extraction is safe.
-        _reject_if_walk_active(storage)
+        _reject_if_writer_active(storage)
 
         # Atomic replace: retains book identity/ordering, bumps version.
         try:
             outcome = replace_book_tree(book_id, result["chapters"], storage)
-        except (ActiveWalkError, ConcurrentTransactionError):
+        except (ActiveProcessingWriterError, ConcurrentTransactionError):
             raise HTTPException(
                 status_code=503,
-                detail=(
-                    "A walk is still active — cancel it and retry "
-                    f"after {_REONBOARD_CONTENTION_RETRY_AFTER_SECONDS}s"
-                ),
+                detail=_CONTENTION_DETAIL,
                 headers={"Retry-After": str(_REONBOARD_CONTENTION_RETRY_AFTER_SECONDS)},
             )
         except Exception as exc:  # noqa: BLE001 — spine population may raise many types; mapped to HTTP 500

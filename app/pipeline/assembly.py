@@ -186,8 +186,66 @@ def has_active_run(storage: PipelineStorage) -> bool:
     return bool(rows)
 
 
+def has_active_processing_writer(storage: PipelineStorage) -> bool:
+    """Return True if any persisted processing writer is active.
+
+    An active processing writer is any ``walk_run`` OR ``render_job`` row with
+    status ``pending`` or ``running`` — a writer that could still execute or is
+    currently executing. This is the single process-wide admission invariant:
+    at most one active processing writer may exist across ALL books and every
+    entry path (walks and renders contend with each other; renders also
+    contend with renders).
+
+    Rows are the authoritative source of truth — this reads the ``walk_run``
+    and ``render_job`` tables directly rather than any in-memory dictionary or
+    status cache. It is process-wide (never a per-book lock) because every
+    writer shares the same storage connection/write path.
+
+    Every authoritative admission check must call this (or an equivalent
+    per-class query) INSIDE the same ``BEGIN IMMEDIATE`` transaction that
+    admits or mutates the row, so the gate is acquired atomically with the
+    row write and concurrent racers serialize instead of both being admitted.
+
+    Parameters
+    ----------
+    storage:
+        An active ``PipelineStorage`` implementation.
+
+    Returns
+    -------
+    bool
+        True if at least one pending/running walk_run or render_job row exists.
+    """
+    rows = storage.execute_query(
+        "SELECT 1 FROM walk_run WHERE status IN ('pending', 'running') "
+        "UNION ALL "
+        "SELECT 1 FROM render_job WHERE status IN ('pending', 'running') "
+        "LIMIT 1",
+    )
+    return bool(rows)
+
+
 class ActiveWalkError(RuntimeError):
     """Raised when a destructive mutation meets an active walk transaction."""
+
+
+# The Retry-After delay advertised for process-wide active-writer contention.
+# Mirrors ``app.app``'s ``_CONCURRENT_WRITE_RETRY_AFTER_SECONDS`` contract: a
+# client that meets an active writer backs off this many seconds and retries.
+ACTIVE_WRITER_RETRY_AFTER_SECONDS = 5
+
+
+class ActiveProcessingWriterError(RuntimeError):
+    """Raised when render or destructive admission meets an active writer.
+
+    The process-wide single-active-writer invariant holds when a ``walk_run``
+    or ``render_job`` row is ``pending``/``running``. This exception is raised
+    ONLY from inside the ``BEGIN IMMEDIATE`` transaction that admits or
+    mutates the row (never from an in-memory dictionary and never from a
+    check performed outside the admitting transaction), and the API layer maps
+    it to HTTP ``503`` + ``Retry-After`` so the client backs off and retries
+    the idempotent admission write.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -470,9 +528,13 @@ def reonboard_book(book_id: str, storage: PipelineStorage) -> int:
     with storage.transaction():
         # The transaction itself is the admission gate: BEGIN IMMEDIATE makes
         # this check mutually exclusive with walk admission's pending->running
-        # transition.  The API's earlier check is only a fast reject.
-        if has_active_run(storage):
-            raise ActiveWalkError
+        # transition and render admission's active-writer check.  The API's
+        # earlier check is only a fast reject; this in-transaction check is
+        # the authoritative one (Plan U combined active-processing-writer
+        # invariant: onboard/re-onboard/replace cannot mutate while a
+        # walk_run OR render_job row is pending/running).
+        if has_active_processing_writer(storage):
+            raise ActiveProcessingWriterError
 
         # -- Snapshot IDs before destructive deletes ------------------------
         # character_ids: needed for metadata cleanup and voice_assignment reset.
@@ -521,65 +583,67 @@ def replace_book_tree(
 ) -> dict:
     """Atomically replace an existing book's document tree and generated outputs.
 
-    Destructively swaps the *book_id*'s document spine and all of its book-owned
-    generated DB/filesystem outputs for a freshly extracted spine, while
-    retaining the existing book's identity and ordering fields.
+     Destructively swaps the *book_id*'s document spine and all of its book-owned
+     generated DB/filesystem outputs for a freshly extracted spine, while
+     retaining the existing book's identity and ordering fields.
 
-    **Retained** on the existing ``book`` row (never recreated, never
-    renumbered): ``id``, ``series_id``, ``book_number``, and ``position``.  The
-    ``version`` is bumped as part of the replacement.  This method creates NO
-    new ``book`` row — the new tree is populated under the already-existing
-    retained ``book`` via the spine helpers in ``app/pipeline/populate.py`` —
-    and introduces no series-position or visibility controls.
+     **Retained** on the existing ``book`` row (never recreated, never
+     renumbered): ``id``, ``series_id``, ``book_number``, and ``position``.  The
+     ``version`` is bumped as part of the replacement.  This method creates NO
+     new ``book`` row — the new tree is populated under the already-existing
+     retained ``book`` via the spine helpers in ``app/pipeline/populate.py`` —
+     and introduces no series-position or visibility controls.
 
-    **Protected** (never touched): shared ``character`` identity rows,
-    shared ``character_metadata`` / ``character.voice_assignment_id`` (cleared
-    only under the ``NOT EXISTS``-another-``character_book`` guard shared with
-    ``reonboard_book``), ``voice_config`` / ``clone_reference``, global
-    ``persona_revision`` rows (``book_id IS NULL``), ``series``, and every
-    sibling-book row.  The complete ownership ALLOWLIST is
-    :data:`REPLACE_TABLE_SCOPE`.
+     **Protected** (never touched): shared ``character`` identity rows,
+     shared ``character_metadata`` / ``character.voice_assignment_id`` (cleared
+     only under the ``NOT EXISTS``-another-``character_book`` guard shared with
+     ``reonboard_book``), ``voice_config`` / ``clone_reference``, global
+     ``persona_revision`` rows (``book_id IS NULL``), ``series``, and every
+     sibling-book row.  The complete ownership ALLOWLIST is
+     :data:`REPLACE_TABLE_SCOPE`.
 
-    **Atomicity / ordering** (Plan T P1-S3): the whole DB replacement runs inside
-    one adapter-owned ``transaction()`` (``BEGIN IMMEDIATE`` — the same atomic
-    unit ``reonboard_book`` uses) so a failure anywhere — a missing dependency,
-    an FK ``NO ACTION``, a population error — rolls the complete replacement
-    back and leaves the prior tree and outputs intact.  Order: (1) snapshot the
-    retained ``{id, series_id, book_number, position, version}`` and the book's
-    chapter/scene/span IDs plus its ``character_book`` character set; (2) remove
-    the old book-owned tree/output references in FK-safe (deep-first) order,
-    deleting references to a node (``character_scene``, ``character_span``,
-    generated/manual presence, workbench/boundary rows, memberships) before the
-    node they reference; (3) populate the extracted tree under the retained
-    book; (4) reconcile/clear book-scoped generated outputs and the book's
-    render/walk records; (5) commit on transaction exit only after FK/ownership
-    checks pass.  Only on a successful commit is the book's durable render
-    directory ``RENDER_ROOT/book-<book_id>/`` removed.  The calling API layer
+     **Atomicity / ordering** (Plan T P1-S3): the whole DB replacement runs inside
+     one adapter-owned ``transaction()`` (``BEGIN IMMEDIATE`` — the same atomic
+     unit ``reonboard_book`` uses) so a failure anywhere — a missing dependency,
+     an FK ``NO ACTION``, a population error — rolls the complete replacement
+     back and leaves the prior tree and outputs intact.  Order: (1) snapshot the
+     retained ``{id, series_id, book_number, position, version}`` and the book's
+     chapter/scene/span IDs plus its ``character_book`` character set; (2) remove
+     the old book-owned tree/output references in FK-safe (deep-first) order,
+     deleting references to a node (``character_scene``, ``character_span``,
+     generated/manual presence, workbench/boundary rows, memberships) before the
+     node they reference; (3) populate the extracted tree under the retained
+     book; (4) reconcile/clear book-scoped generated outputs and the book's
+     render/walk records; (5) commit on transaction exit only after FK/ownership
+     checks pass.  Only on a successful commit is the book's durable render
+     directory ``RENDER_ROOT/book-<book_id>/`` removed.  The calling API layer
     enforces extraction-before-mutation, unknown-book ``404``, and ``503`` +
-    ``Retry-After`` while a process-wide walk is active (``has_active_run``).
+    ``Retry-After`` while a process-wide processing writer is active
+    (``has_active_processing_writer`` — a pending/running ``walk_run`` or
+    ``render_job`` row).
 
-    Parameters
-    ----------
-    book_id:
-        Primary key of the EXISTING book to replace (must already exist).
-    chapters_data:
-        Extracted spine data (same shape ``extract_epub_text`` returns):
-        ``[{id, paragraphs: [{id, spans: [{id, span_type, text}]}]}]``.
-    storage:
-        An active ``PipelineStorage`` implementation.
+     Parameters
+     ----------
+     book_id:
+         Primary key of the EXISTING book to replace (must already exist).
+     chapters_data:
+         Extracted spine data (same shape ``extract_epub_text`` returns):
+         ``[{id, paragraphs: [{id, spans: [{id, span_type, text}]}]}]``.
+     storage:
+         An active ``PipelineStorage`` implementation.
 
-    Returns
-    -------
-    dict
-        ``{book_id, series_id, book_number, position, version, chapters}`` —
-        the retained identity/ordering, the new ``version``, and the replaced
-        chapter count.
+     Returns
+     -------
+     dict
+         ``{book_id, series_id, book_number, position, version, chapters}`` —
+         the retained identity/ordering, the new ``version``, and the replaced
+         chapter count.
 
-    Raises
-    ------
-    ValueError
-        If no book with *book_id* exists (mapped to HTTP ``404``) or if
-        *chapters_data* is empty.
+     Raises
+     ------
+     ValueError
+         If no book with *book_id* exists (mapped to HTTP ``404``) or if
+         *chapters_data* is empty.
     """
     # Non-mutating seam validation: the retained book must exist and the staged
     # extraction must be non-empty before any transactional mutation begins.
@@ -596,9 +660,13 @@ def replace_book_tree(
     with storage.transaction():
         # The transaction itself is the admission gate: BEGIN IMMEDIATE makes
         # this check mutually exclusive with walk admission's pending->running
-        # transition.  The API's earlier check is only a fast reject.
-        if has_active_run(storage):
-            raise ActiveWalkError
+        # transition and render admission's active-writer check.  The API's
+        # earlier check is only a fast reject; this in-transaction check is
+        # the authoritative one (Plan U combined active-processing-writer
+        # invariant: replace cannot mutate while a walk_run OR render_job row
+        # is pending/running).
+        if has_active_processing_writer(storage):
+            raise ActiveProcessingWriterError
 
         # -- (1) Snapshot retained fields + book-owned ID sets --------------
         # The join chains below die with the tree, so snapshot BEFORE any

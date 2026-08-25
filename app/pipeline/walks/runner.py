@@ -822,12 +822,15 @@ class WalkRunner:
         serialization). The guard spans ALL books and every admission path
         (single walks, run-all reservations, synchronous reruns, background
         execution): it blocks on any ``walk_run`` row with ``status='running'``
-        anywhere, not just same-book rows. Only rows already ``running`` block
+        anywhere, not just same-book rows, and on any active
+        (``pending``/``running``) ``render_job`` row anywhere — walks and
+        renders contend with each other (the process-wide active-writer
+        invariant). Only walk rows already ``running`` block
         start, so the nine pre-reserved ``pending`` rows of a batch never block
-        sequential execution. When the guard is violated (an active walk is
-        already running), the attempted reservation is deterministically
-        terminalized to ``failed`` (pending row only) WITHOUT executing the
-        walk, and ``{status:'failed'}`` is returned.
+        sequential execution. When the guard is violated (an active walk or
+        render is already processing), the attempted reservation is
+        deterministically terminalized to ``failed`` (pending row only) WITHOUT
+        executing the walk, and ``{status:'failed'}`` is returned.
 
         Cancellation is observed at checkpoints: the run is checked once before
         start (a cancelled-before-start run finalizes ``cancelled`` and opens no
@@ -895,16 +898,21 @@ class WalkRunner:
                         "status": "failed",
                         "error": f"Reservation not pending for run '{run_id}'",
                     }
-                # GLOBAL single-active-walk gate (P3-S1): spans ALL books and every
-                # admission path. Any 'running' walk_run row anywhere blocks this
-                # start. The check lives inside the same BEGIN IMMEDIATE transaction
-                # as the pending->running transition, so the gate is acquired
-                # atomically with run admission and contention is visible across
-                # books. Only rows already 'running' block start — pending siblings
-                # of a batch never do. When blocked, this attempted reservation's
-                # own pending row is deterministically terminalized to 'failed'
-                # WITHOUT executing the walk (pending-sibling terminalization
-                # semantics preserved).
+                # GLOBAL single-processing-writer gate: spans ALL books and every
+                # admission path. Any 'running' walk_run row, OR any active
+                # (pending|running) render_job row anywhere, blocks this start. The
+                # check lives inside the same BEGIN IMMEDIATE transaction as the
+                # pending->running transition, so the gate is acquired atomically
+                # with run admission and contention is visible across books and
+                # across writer classes. Only walk rows already 'running' block
+                # start — pending walk siblings of a batch never do, so the nine
+                # pre-reserved rows of a run-all batch still execute sequentially.
+                # Renders count as active in both pending and running (a render is
+                # admitted as an active 'running' row, so effectively running
+                # blocks). When blocked, this attempted reservation's own pending
+                # row is deterministically terminalized to 'failed' WITHOUT
+                # executing the walk (pending-sibling terminalization semantics
+                # preserved).
                 blocked = self._storage.execute_query(
                     "SELECT 1 FROM walk_run WHERE status = 'running' LIMIT 1", ()
                 )
@@ -912,6 +920,28 @@ class WalkRunner:
                     error = (
                         "Another walk is already running "
                         "(global single-active-walk gate)"
+                    )
+                    self._storage.execute_update(
+                        "UPDATE walk_run SET status = 'failed', error = ?, "
+                        "finished_ms = ?, heartbeat_ms = ? "
+                        "WHERE run_id = ? AND status = 'pending'",
+                        (error, _now_ms(), _now_ms(), run_id),
+                    )
+                    logger.error(
+                        "Reserved walk '%s' blocked for book '%s': %s",
+                        walk_name,
+                        book_id,
+                        error,
+                    )
+                    return {"status": "failed", "error": error}
+                render_blocked = self._storage.execute_query(
+                    "SELECT 1 FROM render_job WHERE status IN ('pending', 'running')"
+                    " LIMIT 1",
+                    (),
+                )
+                if render_blocked:
+                    error = (
+                        "A render is already active (process-wide active-writer gate)"
                     )
                     self._storage.execute_update(
                         "UPDATE walk_run SET status = 'failed', error = ?, "

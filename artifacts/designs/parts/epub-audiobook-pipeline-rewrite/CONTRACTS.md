@@ -194,6 +194,69 @@ cleanup never deletes `walk_run` history, human/manual rows, shared identity
 or spine data, other-run writes, or unprovenanced rows.
 - **Run-output ownership matrix.** Cleanup may remove only rows it can prove are owned by the cancelled run, per the Run-Owned versus Protected Data matrix below. Everything else is protected.
 
+### Combined Processing-Writer Invariant (Plan U)
+Plan U extends the row-backed lifecycle to every processing writer without
+changing the TTS surface or the durable walk undo-journal policy. Renders are
+now first-class writers under the SAME process-wide gate as walks.
+
+- **Process-wide single-active-processing-writer invariant.** At most one
+  persisted processing writer may be active across ALL books and every entry
+  path:
+  * a walk cannot execute while any render is active;
+  * a render cannot be admitted while any walk OR render is active;
+  * onboard / re-onboard / replace / snapshot restore cannot mutate while
+    either writer class is active (see the Destructive Mutation Ledger).
+  A processing writer is active iff a `walk_run` OR `render_job` row has status
+  `pending` or `running`. The persisted row is the source of truth — never an
+  in-memory dictionary and never a status cache. The gate is process-level
+  (shared across all books), not a per-book lock, because every writer shares
+  the same storage connection/write path.
+- **Authoritative check is the admitting transaction.** The active-writer check
+  must be made BY the `BEGIN IMMEDIATE` transaction that admits or mutates the
+  row. For render admission, render admission + active-writer validation + the
+  initial `render_job` row insert commit in ONE `storage.transaction()`. For
+  walk admission, `run_walk_reserved` performs its existing pending→running
+  transition and the global no-running-row guard inside its single `BEGIN
+  IMMEDIATE` transaction, now also rejecting any active `render_job` row while
+  STILL allowing the `pending` sibling reservations of the same run-all batch
+  to execute sequentially (only walk rows already `running` — plus any active
+  render — block; walk `pending` siblings never do). A check performed outside
+  the admitting transaction is never authoritative.
+- **Atomic acquisition / release.** The gate is acquired atomically (admission
+  and the row write commit together so two racers cannot both be admitted) and
+  released only after the active writer reaches a TERMINAL state. Renders
+  release the gate via their background task's terminal row state: the
+  persisted `render_job` row transitions `pending`/`running` → terminal
+  (`completed|failed|cancelled`) on EVERY path — success, cancellation,
+  ordinary exception, and `BaseException` (`KeyboardInterrupt`/`SystemExit`) —
+  so no active render row is ever stranded and the gate is never held by a
+  dead job. The in-process `_render_jobs` dict is retained ONLY as the
+  render-cancellation signal (the `cancel_event`); it is never the source of
+  truth for admission, cleanup, or observability.
+- **Terminal-release ordering.** No gate is released before terminal render
+  cleanup or Plan S walk replay completes (the same `finally`-release
+  discipline the walk gate already uses). A `BaseException` escaping render
+  active execution routes through the same terminalizer and finalizes the row
+  `failed` before the gate can be reused.
+- **HTTP retry behavior.** A render admission that meets an active writer (any
+  active walk or render) returns HTTP `503` + `Retry-After: 5` and exposes NO
+  job ID — the admitting transaction rolls back and no `render_job` row is
+  inserted. Concurrent render requests cannot both insert an admitted active
+  row because `BEGIN IMMEDIATE` serializes the writers (the second sees the
+  first's `running` row and is rejected before a job ID is exposed). Walk
+  admission under active-writer contention keeps its existing observable
+  behavior: the blocked reservation's own pending row is deterministically
+  terminalized to `failed` WITHOUT executing (an active walk →
+  `"Another walk is already running (global single-active-walk gate)"`; an
+  active render → `"A render is already active (process-wide active-writer
+  gate)"`), and that terminal `failed` row surfaces through
+  `GET /walks/{book_id}/runs`.
+- **Startup-only reconciliation unchanged.** Startup reconciliation is a
+  startup-only recovery step (replay interrupted walks, flip stuck
+  `running` render rows to `interrupted`); it is never a per-request gate, and
+  render admission never depends on in-memory dictionaries.
+
+
 ### Explicit Cancellation Rollback Override (Plan S)
 - Cancelled or process-interrupted walks 2a–2i must not leave progress behind. Plan S supersedes Plan R's delete-only cancellation cleanup for these statuses with a durable writer-side `walk_undo_entry` journal; Plan R remains the predecessor for gate, checkpoint, savepoint, and API behavior.
 - `walk_undo_entry` is additive and idempotent: `(run_id FK walk_run, seq, table_name allowlisted, op IN (insert|update|delete), row_pk, before_json, after_json, created_ms, UNIQUE(run_id, seq))`, with an index on `run_id`. Journal entries are appended in the same adapter-owned savepoint as their data mutation.
@@ -1424,6 +1487,60 @@ New:
 - GC: retention ≥7 days post-completion (env-tunable), hourly sweep, never on hot request path; eligibility union includes `project_snapshot` artifact refs; rows tombstoned (`evicted`/`expired`) in the same sweep as file deletion.
 - Frontend: committed dist/ + CI `git diff --exit-code app/static/dist/`; starlette>=0.49.1 CI pin (Range DoS GHSA-7f5h-v6xp-fcq8).
 - New endpoints must land in the correct `api_*` module and be registered here (this section) — future DD updates append, never rewrite.
+
+### Render job lifecycle & admission (Plan U)
+
+Plan U makes renders first-class processing writers under the combined
+process-wide invariant (see "Combined Processing-Writer Invariant (Plan U)"
+in the Walk Runner section). The `render_job` row is the source of truth for
+render admission, cleanup, and observability.
+
+- **Transactional admission.** `POST /api/pipeline/render` performs render
+  admission, active-writer validation, and the initial `render_job` row insert
+  (`status='running'`) in ONE `storage.transaction()` (`BEGIN IMMEDIATE`).
+  The validator calls the canonical active-processing checker (equivalent to
+  `has_active_processing_writer` — any `walk_run` OR `render_job` row with
+  status `pending`/`running`) BEFORE inserting this job's row and raises
+  `ActiveProcessingWriterError`, which the endpoint maps to HTTP `503` +
+  `Retry-After: 5` with NO job ID exposed and NO row inserted. Two concurrent
+  render requests cannot both insert an admitted active row because `BEGIN
+  IMMEDIATE` serializes the writers: the second sees the first's `running`
+  row and is rejected. The check is authoritative ONLY because it executes
+  inside the admitting write lock — never from an in-memory dictionary.
+- **Terminal release on every path.** `_run_render_job` (the background
+  task) leaves the persisted `render_job` row terminal on success, ordinary
+  exception, cancellation, AND `BaseException` (`KeyboardInterrupt`/
+  `SystemExit`) — the `finally` finalizes a still-`pending`/`running` row to
+  `failed` when a `BaseException` escapes `render_audiobook`'s own
+  `except Exception` handlers, so no active render row is stranded and the
+  combined gate is always released. `_mark_job_row_terminal` is an idempotent
+  safety net mirroring terminal state back into the row (it never clobbers
+  `output_dir`/`output_artifact_path`).
+- **Cancellation is row-backed.** `POST /api/pipeline/cancel_render` uses the
+  terminated/non-`pending|running` `render_job` row status as the source of
+  whether the job is `already_finished`; the in-process `_render_jobs` dict is
+  retained ONLY as the `cancel_event` cancellation signal. A job is cancellable
+  iff its row is still `pending`/`running` AND a live in-process
+  `cancel_event` exists. The row reaches terminal `cancelled` when the
+  background task observes the event.
+- **HTTP retry behavior.** Render admission under active-writer contention is
+  retryable: the client honors `Retry-After` and re-posts once the active
+  writer reaches a terminal state. The persisted row, never the in-memory
+  registry, is consulted for cleanup and observability.
+- **Active-render listing surface.** `GET /api/pipeline/render_jobs/{book_id}`
+  lists every pending/running
+  `render_job` row for a book (`job_id`, `mode`, `status`, `error`,
+  `output_dir`, `created_ms`, `started_ms`, `finished_ms`; empty list when
+  none). It is pure row-backed — a `SELECT` over `render_job` for `status IN
+  ('pending','running')` — and NEVER consults the in-process `_render_jobs`
+  dict, so jobs that survived a crash/restart (rows present, dict entries
+  absent) are discoverable. Cancellation contract for the frontend: call
+  `POST /cancel_render`, then POLL `GET /render_status/{job_id}` (or re-list
+  this endpoint) until the row is terminal
+  (`completed`/`failed`/`cancelled`/`interrupted`/`expired`) before proceeding
+  with a destructive mutation — a job is safely gone only when its row is
+  terminal.
+
 
 ## Combined Walks 2b–2d Workbench (DD-combined-walks-2b-2d-workbench) — Schema & API Registration
 

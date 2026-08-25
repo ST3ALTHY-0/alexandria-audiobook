@@ -40,7 +40,7 @@ Transform any book or novel into a fully-voiced audiobook using AI-powered scrip
 - **Natural Pauses** - Configurable pause between speakers (default 500 ms) and same-speaker segments (default 250 ms), with per-book overrides and per-span pause editing. The resolved pause values are inserted into the merged audio during M4B export.
 
 ### Web UI Editor
-- **Streamlined Interface** - Core pipeline tabs (Projects, Setup, Script, Voices, Editor) plus advanced tools (Designer, Preparer, Dataset Builder, Training) and workflow tabs (Persona, Prompt Config, Workbench)
+- **Streamlined Interface** - Core pipeline tabs (Setup, Script, Voices, Editor, Projects, Workbench) plus advanced tools (Designer, Preparer, Dataset Builder, Training) and workflow tools (Persona, Prompt Config)
 - **Span Editor** - Edit speaker, text, and instruct for any line
 - **Structural Operations** - Split, merge, move, and delete spans directly in the editor
 - **Batch Processing** - Optimized batch rendering with sub-batching for efficient GPU utilization
@@ -625,12 +625,12 @@ curl http://127.0.0.1:4200/api/pipeline/characters/<book_id>
 # Preview a voice from text description
 curl -X POST http://127.0.0.1:4200/api/voice_design/preview \
   -H "Content-Type: application/json" \
-  -d '{"description": "A warm, deep male voice", "text": "Hello world."}'
+  -d '{"description": "A warm, deep male voice", "sample_text": "Hello world.", "language": "English"}'
 
 # Save a designed voice
 curl -X POST http://127.0.0.1:4200/api/voice_design/save \
   -H "Content-Type: application/json" \
-  -d '{"name": "warm_narrator", "description": "A warm, deep male voice", "text": "Hello world."}'
+  -d '{"name": "warm_narrator", "description": "A warm, deep male voice", "sample_text": "Hello world.", "preview_file": "preview.wav"}'
 
 # List saved designed voices
 curl http://127.0.0.1:4200/api/voice_design/list
@@ -659,7 +659,7 @@ curl -X DELETE http://127.0.0.1:4200/api/lora/datasets/dataset_id_here
 # Start LoRA training
 curl -X POST http://127.0.0.1:4200/api/lora/train \
   -H "Content-Type: application/json" \
-  -d '{"name": "narrator_warm", "dataset_id": "my_voice", "epochs": 25, "lr": "5e-6", "lora_r": 32, "lora_alpha": 64}'
+  -d '{"name": "narrator_warm", "dataset_id": "my_voice", "epochs": 25, "lr": 5e-6, "lora_r": 32, "lora_alpha": 64}'
 
 # List trained adapters
 curl http://127.0.0.1:4200/api/lora/models
@@ -783,7 +783,7 @@ requests.post(f"{BASE}/api/pipeline/run_all_walks", json={"book_id": book_id})
 # Poll until all walks complete
 while True:
     statuses = requests.get(f"{BASE}/api/pipeline/walk_status/{book_id}").json()
-    if all(s in ("completed", "error") for s in statuses.values()):
+    if all(s in ("completed", "failed", "cancelled") for s in statuses.values()):
         break
     time.sleep(2)
 
@@ -835,7 +835,7 @@ async function waitForWalks(bookId) {
   while (true) {
     const res = await fetch(`${BASE}/api/pipeline/walk_status/${bookId}`);
     const statuses = await res.json();
-    if (Object.values(statuses).every(s => s === "completed" || s === "error")) return statuses;
+    if (Object.values(statuses).every(s => ["completed", "failed", "cancelled"].includes(s))) return statuses;
     await new Promise(r => setTimeout(r, 2000));
   }
 }
@@ -992,18 +992,18 @@ Alexandria/
 │   ├── static/dist/           # Built frontend bundle (generated, never hand-edited)
 │   └── requirements.txt       # Python dependencies
 ├── frontend/                  # Frontend source (TypeScript, bundled to app/static/dist)
-│   └── src/tabs/              # script, voices, editor, setup, designer, preparer, dataset-builder, training
+│   └── src/tabs/              # setup, script, voices, editor, projects, workbench, persona, prompt-config, designer, preparer, dataset-builder, training
 ├── builtin_lora/              # Pre-trained LoRA voice presets
 ├── dataset_builder/           # Dataset builder project workspace (gitignored)
 ├── designed_voices/           # Saved Voice Designer outputs (gitignored)
 ├── lora_datasets/             # Uploaded/generated training datasets (gitignored)
 ├── lora_models/               # Trained LoRA adapters (gitignored)
 ├── data/                      # SQLite pipeline database (pipeline.db, gitignored)
-├── install.js                 # Pinokio installer
-├── start.js                   # Pinokio launcher
+├── install.js                 # Legacy Pinokio installer
+├── start.js                   # Legacy Pinokio launcher
 ├── reset.js                   # Reset script
-├── pinokio.js                 # Pinokio UI config
-├── pinokio.json               # Pinokio metadata
+├── pinokio.js                 # Legacy Pinokio UI config
+├── pinokio.json               # Legacy Pinokio metadata
 └── README.md
 ```
 

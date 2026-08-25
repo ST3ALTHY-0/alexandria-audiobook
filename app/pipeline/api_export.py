@@ -57,7 +57,12 @@ from starlette.responses import (
 
 from app.pipeline.adapter import PipelineStorage
 from app.pipeline.api_onboard import get_storage
-from app.pipeline.assembly import export_annotated_script
+from app.pipeline.assembly import (
+    ACTIVE_WRITER_RETRY_AFTER_SECONDS,
+    ActiveProcessingWriterError,
+    export_annotated_script,
+    has_active_processing_writer,
+)
 from app.pipeline.tts_integration import (
     PAUSE_BETWEEN_SPEAKERS_MS,
     PAUSE_SAME_SPEAKER_MS,
@@ -348,6 +353,11 @@ def _run_render_job(
         )
         job["output_dir"] = resolved_dir
         job["status"] = "completed"
+        # render_audiobook finalizes the row on its own success path; mirror the
+        # terminal state back into the row so every success path leaves the
+        # persisted row terminal (idempotent — re-writing the same terminal
+        # state is a no-op at the row level and never clobbers output fields).
+        _mark_job_row_terminal(storage, job_id, "completed")
     except CancelledError:
         job["status"] = "cancelled"
         _mark_job_row_terminal(storage, job_id, "cancelled")
@@ -356,6 +366,25 @@ def _run_render_job(
         job["error"] = str(exc)
         _mark_job_row_terminal(storage, job_id, "failed", error=str(exc))
     finally:
+        # BaseException guard (KeyboardInterrupt/SystemExit): render_audiobook's
+        # own ``except Exception`` does not catch these, so a BaseException
+        # would otherwise escape with the row left 'running' — stranding the
+        # combined gate. If the row is still active here (no terminal mirror
+        # ran), finalize it 'failed' so no active row is left behind and the
+        # gate is released on EVERY path. Idempotent with the mirrors above.
+        try:
+            active_rows = storage.execute_query(
+                "SELECT status FROM render_job WHERE job_id = ?", (job_id,)
+            )
+            if active_rows and active_rows[0]["status"] in ("pending", "running"):
+                _mark_job_row_terminal(
+                    storage,
+                    job_id,
+                    "failed",
+                    error="Render terminated by unexpected exception",
+                )
+        except Exception:  # noqa: S110, BLE001 — cleanup must not mask the original
+            pass
         # The persisted render_job row is authoritative after the background
         # task reaches a terminal state.  Keep only active jobs in the
         # in-process registry so completed renders cannot accumulate here.
@@ -389,6 +418,18 @@ async def render(
 
     Returns immediately with the job_id; clients poll
     ``GET /api/pipeline/render_status/{job_id}`` for progress.
+
+    The process-wide single-active-writer invariant is enforced at admission:
+    render admission, active-writer validation, and the initial ``render_job``
+    row insertion all happen in ONE ``storage.transaction()`` (``BEGIN
+    IMMEDIATE``). A render is rejected with HTTP ``503`` + ``Retry-After`` when
+    any ``walk_run`` OR ``render_job`` row is ``pending``/``running`` — walks
+    and renders contend with each other, and two concurrent render requests
+    cannot both insert an admitted active row because ``BEGIN IMMEDIATE``
+    serializes the writers (the second sees the first's ``running`` row and is
+    rejected before a job ID is ever exposed). The authoritative check is made
+    BY the admitting transaction, never by the in-memory ``_render_jobs``
+    dictionary. The persisted row is the source of truth.
     """
     if tts_engine is None:
         raise HTTPException(
@@ -397,17 +438,43 @@ async def render(
         )
 
     job_id = str(uuid.uuid4())
-    # Rows = truth: register the job row up front so the returned job_id
-    # matches a persisted row (status 'running') even before the background
-    # task starts.  render_audiobook reuses this row.
     mode = "batch" if request.use_batch else "individual"
     now = _now_ms()
-    storage.execute_insert(
-        "INSERT INTO render_job "
-        "(job_id, book_id, mode, status, output_dir, created_ms, started_ms) "
-        "VALUES (?, ?, ?, 'running', ?, ?, ?)",
-        (job_id, request.book_id, mode, request.output_dir, now, now),
-    )
+    try:
+        with storage.transaction():
+            # Rows = truth. Reject when ANY active processing writer exists —
+            # a pending/running walk OR render. The check runs inside the same
+            # BEGIN IMMEDIATE transaction that inserts this run's row, so the
+            # gate is acquired atomically with admission and two concurrent
+            # render requests serialize (the loser sees the winner's running
+            # row and is rejected before a job ID is exposed).
+            if has_active_processing_writer(storage):
+                raise ActiveProcessingWriterError(
+                    "A walk or render is already active "
+                    "(process-wide active-writer gate)"
+                )
+            # Register the job row with status 'running' inside the same
+            # transaction as the admission check so the returned job_id matches
+            # a persisted active row even before the background task starts.
+            # render_audiobook reuses this row.
+            storage.execute_insert(
+                "INSERT INTO render_job "
+                "(job_id, book_id, mode, status, output_dir, created_ms, started_ms) "
+                "VALUES (?, ?, ?, 'running', ?, ?, ?)",
+                (job_id, request.book_id, mode, request.output_dir, now, now),
+            )
+    except ActiveProcessingWriterError as exc:
+        # 503 + Retry-After: the idempotent render admission can be retried once
+        # the active writer reaches a terminal state. No job row was inserted
+        # and no job ID is surfaced on the rejection path.
+        raise HTTPException(
+            status_code=503,
+            detail=str(exc),
+            headers={
+                "Retry-After": str(ACTIVE_WRITER_RETRY_AFTER_SECONDS),
+            },
+        ) from exc
+    # Only an admitted job is tracked in-process (the cancel_event channel).
     _render_jobs[job_id] = {
         "mode": mode,
         "status": "running",
@@ -436,6 +503,48 @@ async def render(
     )
 
     return {"job_id": job_id, "status": "started"}
+
+
+# ---------------------------------------------------------------------------
+# GET /api/pipeline/render_jobs/{book_id}
+# ---------------------------------------------------------------------------
+
+
+@router.get("/render_jobs/{book_id}")
+async def list_active_render_jobs(
+    book_id: str,
+    storage: PipelineStorage = Depends(get_storage),
+) -> list[dict]:
+    """List all pending/running render jobs for *book_id* (rows = truth).
+
+    Pure row-backed listing: ``SELECT`` over the persisted ``render_job`` rows
+    for active statuses ``pending``/``running``.  It NEVER consults the
+    in-process ``_render_jobs`` dict, so jobs that survived a server crash or
+    restart — present as rows but absent from the dict — are discoverable here
+    (and reconcile_and_replay flips any stuck ``running`` row to
+    ``interrupted`` at startup).  Returns an empty list when no active render
+    job exists for the book.
+
+    Each entry carries a subset of the ``render_job`` columns: ``job_id``,
+    ``mode``, ``status``, ``error``, ``output_dir``, ``created_ms``,
+    ``started_ms``, ``finished_ms``.
+
+    Cancellation contract: to cancel an active job, call ``POST
+    /cancel_render`` with its ``job_id``, then POLL ``GET
+    /render_status/{job_id}`` (or re-list this endpoint) until the row reaches
+    a terminal status (``completed``/``failed``/``cancelled``/``interrupted``/
+    ``expired``) before proceeding with a destructive mutation.  A job is only
+    safely gone when its row is terminal — the persisted row is the source of
+    truth, never the in-process dict.
+    """
+    rows = storage.execute_query(
+        "SELECT job_id, mode, status, error, output_dir, created_ms, "
+        "started_ms, finished_ms FROM render_job"
+        " WHERE book_id = ? AND status IN ('pending', 'running')"
+        " ORDER BY created_ms",
+        (book_id,),
+    )
+    return [dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -682,24 +791,38 @@ async def cancel_render(
     NOT storable): the render_job.status CHECK constraint allows only
     ('pending','running','completed','failed','cancelled','interrupted',
     'expired') and render_job has no cancel flag column.  The cancel
-    intent is therefore carried by the in-process cancel_event; the row
+    intent is therefore carried by the in-process cancel_event — the only
+    remaining role of the ``_render_jobs`` dict — while the persisted row
+    is the SOURCE OF TRUTH for whether the job is still active/cancellable:
+    a job is cancellable iff its ``render_job`` row is still
+    ``pending``/``running`` (with a live in-process ``cancel_event`` to
+    signal); an already-terminal row is ``already_finished``.  The row
     reaches the terminal schema-valid status 'cancelled' when the
     background job task observes the event (the CancelledError path in
     ``_run_render_job`` / ``render_audiobook``).  Crash-survival of stuck
     'running' rows is handled by startup reconciliation (running ->
-    interrupted). If the in-memory entry is absent but a ``render_job`` row
-    exists (for example, after a server restart), the job is known but no
-    longer cancellable and the endpoint returns ``already_finished`` instead
-    of 404.
+    interrupted).
     """
     job = _render_jobs.get(request.job_id)
-    if job is None:
-        rows = storage.execute_query(
-            "SELECT 1 FROM render_job WHERE job_id = ?",
-            (request.job_id,),
-        )
-        if rows:
+    # Row status is the source of truth: only an active row is cancellable.
+    rows = storage.execute_query(
+        "SELECT status FROM render_job WHERE job_id = ?",
+        (request.job_id,),
+    )
+    if rows:
+        if rows[0]["status"] not in ("pending", "running"):
             return {"status": "already_finished", "job_id": request.job_id}
+        # Active row: signal the in-process cancel_event when a live holder
+        # exists. If no in-process entry is present (e.g. after a server
+        # restart), the job is known but no longer cancellable.
+        if job is not None:
+            job["cancel_event"].set()
+            return {"status": "cancelled", "job_id": request.job_id}
+        return {"status": "already_finished", "job_id": request.job_id}
+    # Row-less fallback: legacy/extraneous in-process entries (cancel_event
+    # holder only). Rows are truth, but preserve the historical in-process
+    # cancellation path for entries without a persisted row.
+    if job is None:
         raise HTTPException(status_code=404, detail=f"Unknown job_id: {request.job_id}")
     if job["status"] != "running":
         return {"status": "already_finished", "job_id": request.job_id}

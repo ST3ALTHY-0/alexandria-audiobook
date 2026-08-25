@@ -29,6 +29,7 @@ Restore the 8 pre-rewrite utilities (audio surface, real progress/cancellation, 
 | J | Single-Speaker, Undo & Iteration UX | D, I | tts_integration.py, editor-pipeline.ts, review.py, index.html, tests | ~17K |
 | K | Parity-Gap Closure (artifact serving routes, 503 retry mapping, pause disclosure) | F (gaps), J (pause decision) | api_export.py, app.py, editor-pipeline.ts, api.ts, index.html, setup.ts, tests, README.md | ~7K |
 | L | Pause Insertion & User-Tunable Pauses | K, J, I | schema.py, app.py, tts_integration.py, api_export.py, api_operations.py, setup.ts, script/editor UI, tests, docs | ~25K |
+| M | Multi-book Project Navigation | I, J | adapter.py, api_operations.py, state.ts, projects.ts, focused tests | ~16K |
 
 Total ≈ 161K weighted chars, ~42 unique files, matching the DD's LARGE estimate.
 
@@ -44,11 +45,13 @@ A (schema + transaction foundation)
     ├── D (review union + supersede) ────────────────────────────────┴── J (single-speaker, undo, iteration)
     └── G (overlay config)
         └── L (pause insertion + tuning; also consumes K export/disclosure surface)
+    I (snapshot projects) ──┐
+    J (single-speaker, undo) ─┴── M (multi-book project navigation)
 ```
 
 - **Max dependency depth:** 3 (J: A→B→D/I)
 - **Max dependencies per plan:** 2
-- **Contiguous letters in execution order:** A→B→C→D→E→F→G→H→I→J→K ✓ (K is a post-J follow-up closing gaps logged in Plan F)
+- **Contiguous letters in execution order:** A→B→C→D→E→F→G→H→I→J→K→L→M ✓ (L and M are documented follow-ups)
 
 ## Execution Rounds
 
@@ -61,7 +64,8 @@ A (schema + transaction foundation)
 | 5 | F, G, H, I | Ships 2-4 | F: progress/cancel + export UI. G: raw-JSON config merge + walk_override. H: voice edit form + alias picker. I: project_snapshot endpoints + projects tab |
 | 6 | J | Ship 4 | single-speaker render boundary + toggle, undo wiring (value-restore + snapshot restore), pause-after verification, doc-drift archive |
  | 7 | K | Ship 4 (follow-up) | parity-gap closure: GET /export/mp3/{job_id} + GET /export/audacity/{job_id} serving routes (rows=truth), ConcurrentTransactionError → 503 + Retry-After: 5 app exception handler, pause capability disclosure |
- | 8 | L | Ship 5 (pause behavior) | deterministic render-time silence insertion via existing app.tts helper, persisted validated project/config defaults, nullable per-span pause-after including zero, paused export artifacts, frontend controls, and negative-space verification |
+| 8 | L | Ship 5 (pause behavior) | deterministic render-time silence insertion via existing app.tts helper, persisted validated project/config defaults, nullable per-span pause-after including zero, paused export artifacts, frontend controls, and negative-space verification |
+| 9 | M | Ship 6 (multi-book navigation) | read-only book/project DTO, canonical book switch, book-scoped frontend invalidation, and Plan I snapshot continuity; no series visibility/reordering |
 
 ## Per-Part Scope
 
@@ -97,4 +101,4 @@ The DD is the source of truth; these adjustments come from verified codebase evi
 - `artifacts/designs/pending/DD-universal-upgrade.md` — source of truth
 - `artifacts/designs/parts/epub-audiobook-pipeline-rewrite/CONTRACTS.md` § Universal Upgrade — registered schema/API
 - `artifacts/plans/completed/TASK-epub-audiobook-pipeline-rewrite-{A..Q}-*.md` — prior feature history (Q terminal)
-- `artifacts/plans/pending/TASK-universal-upgrade-{A..K}-*.md` — this decomposition's plans (A-J executed + archived; K pending)
+- `artifacts/plans/pending/TASK-universal-upgrade-M-multi-book-project-navigation.md` — this follow-up plan

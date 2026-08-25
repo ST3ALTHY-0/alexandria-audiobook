@@ -32,7 +32,11 @@ from pydantic import BaseModel, Field, field_validator
 
 from app.pipeline.adapter import PipelineStorage
 from app.pipeline.api_onboard import get_storage
-from app.pipeline.assembly import export_annotated_script, get_book_version
+from app.pipeline.assembly import (
+    export_annotated_script,
+    get_book_version,
+    has_active_processing_writer,
+)
 from app.pipeline.operations import OperationExecutor, reconstruct_paragraph_text
 from app.pipeline.tts_integration import (
     get_render_root,
@@ -481,6 +485,21 @@ _ACTIVE_RUN_STATUSES = ("pending", "running")
 #: 503 mapping exists in the api layer yet, so we pick a reasonable value).
 _RETRY_AFTER_SECONDS = 5
 
+
+class ActiveProcessingWriterConflict(RuntimeError):
+    """Raised when snapshot restore meets an active writer mid-transaction.
+
+    The endpoint's early ``_book_has_active_runs`` check is only a fast reject
+    for the common case.  ``_apply_snapshot_merge`` re-checks the combined
+    active-processing query (``has_active_processing_writer`` — a
+    pending/running ``walk_run`` OR ``render_job`` row) INSIDE its ``BEGIN
+    IMMEDIATE`` transaction before any span/character mutation, closing the
+    time-of-check/time-of-use gap.  This exception maps to the same HTTP 409 +
+    ``Retry-After`` contract as the early check, so an in-transaction race
+    never commits a partial merge.
+    """
+
+
 #: Current snapshot manifest schema version.  Load refuses manifests whose
 #: ``schema_version`` does not match this — a future/unknown manifest shape
 #: must never be merged blindly (hard 400, never a guess).
@@ -879,6 +898,17 @@ def _apply_snapshot_merge(
     applied field by field — never evaluated.
     """
     with storage.transaction():
+        # The transaction itself is the admission gate: BEGIN IMMEDIATE makes
+        # this combined active-processing-writer check (a pending/running
+        # ``walk_run`` OR ``render_job`` row) mutually exclusive with walk and
+        # render admission.  The endpoint's earlier ``_book_has_active_runs``
+        # check is only a fast reject for the common case; THIS in-transaction
+        # check is the authoritative one — it runs before the first
+        # span/character mutation, so a writer that starts after the fast
+        # reject can never race a partially-applied merge (Plan U invariant:
+        # snapshot restore cannot mutate while either writer class is active).
+        if has_active_processing_writer(storage):
+            raise ActiveProcessingWriterConflict
         for span in manifest.get("spans", []):
             if not isinstance(span, dict) or not span.get("id"):
                 continue
@@ -1048,7 +1078,22 @@ async def load_project_snapshot(
             ),
         )
 
-    _apply_snapshot_merge(storage, manifest, row["book_id"])
+    try:
+        _apply_snapshot_merge(storage, manifest, row["book_id"])
+    except ActiveProcessingWriterConflict:
+        # A walk/render became active after the early fast reject (a race).
+        # The in-transaction check inside _apply_snapshot_merge rolled the
+        # whole transaction back, so nothing was mutated; map to the SAME 409 +
+        # Retry-After contract as the early check so the client retries
+        # uniformly and a race never commits a partial merge.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Cannot restore while a walk or render is active for this book; "
+                f"retry after {_RETRY_AFTER_SECONDS}s"
+            ),
+            headers={"Retry-After": str(_RETRY_AFTER_SECONDS)},
+        )
 
     re_render_required = _audio_reference_missing(manifest.get("audio_run_dir"))
     return {
