@@ -247,9 +247,23 @@ def _process_character(
         ),
         user_prompt=prompt,
     )
+    
+    logger.info(
+        "2f LLM response for %s (%s): %r",
+        character_id,
+        character_name,
+        response_text[:3000],
+    )
 
     # Parse response
     description_data = _parse_llm_response(response_text)
+
+    logger.info(
+        "2f parsed description for %s (%s): %r",
+        character_id,
+        character_name,
+        description_data,
+    )   
 
     if not description_data:
         logger.warning(f"Failed to parse description for character {character_id}")
@@ -266,12 +280,28 @@ def _process_character(
     # Clamp to [0, 1]
     confidence = max(0.0, min(1.0, float(confidence)))
 
-    # Confidence filter
+   # Confidence filter
+    # Low-confidence descriptions are preserved for review instead of silently
+    # discarded. Discarding every low-confidence result leaves the walk with
+    # zero stored descriptions and causes completion verification to fail.
     if confidence < 0.5:
-        # Auto-reject
-        return
+        logger.warning(
+            "Low-confidence description for %s (%s): confidence=%.3f; "
+            "storing as needs_review",
+            character_id,
+            character_name,
+            confidence,
+        )
 
     is_review = 0.5 <= confidence < 0.7
+    
+    logger.info(
+        "2f storing description for %s (%s): confidence=%.3f review=%s",
+        character_id,
+        character_name,
+        confidence,
+        is_review,
+    )
 
     # Store description in a book-scoped persona revision.
     with storage.savepoint("walk_2f_character"):
